@@ -1,0 +1,70 @@
+[package]
+name = "rs-matter-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rs-matter-server"
+path = "src/main.rs"
+
+[dependencies]
+
+# Async runtime
+async-std = { version = "1", features = ["attributes"] }
+async-io = "2"
+futures-lite = "2"
+embassy-futures = "0.1"
+# Use a self-contained timer queue; the default integrated queue expects an
+# executor-provided timer-queue symbol that a plain async-std binary does not define.
+embassy-time = { version = "0.5", features = ["std", "generic-queue-8"] }
+embassy-sync = "0.8"
+
+# WebSocket server
+async-tungstenite = "0.5"
+tungstenite = "0.24"
+futures-util = "0.3"
+
+# JSON for the matterjs-server protocol
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI / env-var config
+clap = { version = "4", features = ["derive", "env"] }
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# DCL (firmware update registry) lookups over HTTPS
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+
+# Utilities
+base64 = "0.22"
+# `all` is required for set_reuse_port, which the Linux mDNS socket needs to
+# share port 5353 with the host's own responder.
+socket2 = { version = "0.5", features = ["all"] }
+nix = { version = "0.30", features = ["net"] }
+anyhow = "1"
+rand_core = { version = "0.6", features = ["std"] }
+thiserror = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# For test server shutdown channel
+async-channel = "2"
+
+# rs-matter's mDNS backend is platform-specific. macOS routes mDNS through the
+# system Bonjour daemon (`astro-dnssd`); everywhere else — including the Pi 5
+# container — the built-in responder is used, and pulling in `astro-dnssd`
+# there would mean linking against Avahi's compatibility library for no reason.
+[target.'cfg(target_os = "macos")'.dependencies]
+rs-matter = { version = "0.3", features = ["std", "async-io", "astro-dnssd", "max-sessions-32", "max-fabrics-8"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+rs-matter = { version = "0.3", features = ["std", "async-io", "max-sessions-32", "max-fabrics-8"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+tempfile = "3"

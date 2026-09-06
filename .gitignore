@@ -1,0 +1,19 @@
+# Build output
+target/
+server/target/
+
+# Live controller state. This holds the fabric's ICAC private key, the
+# rs-matter KV store (fabric certificates and the controller's operational
+# key), and the commissioned node list. Publishing it would hand over control
+# of the fabric.
+.local-data/
+data/
+*.pid
+
+# Local run logs contain device and network addresses.
+*.log
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/

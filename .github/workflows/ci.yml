@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch makes the in-flight run irrelevant.
+# Keyed on the event as well as the ref: a manually triggered flake hunt must
+# not cancel the CI run for a push to the same branch.
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Nothing here needs a backtrace by default; failures print the assertion.
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Test
+    # Linux on purpose. The mDNS backend is platform-conditional — macOS uses
+    # the system Bonjour daemon, everything else the built-in responder — so
+    # only a Linux job compiles the code path the container actually ships.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+
+      - name: Formatting
+        run: cargo fmt --manifest-path server/Cargo.toml --all -- --check
+
+      - name: Lints
+        run: cargo clippy --manifest-path server/Cargo.toml --all-targets -- -D warnings
+
+      - name: Tests
+        # The ignored tests reach the CSA ledger over the network; they are run
+        # deliberately, not on every push.
+        run: cargo test --manifest-path server/Cargo.toml
+
+      - name: The generated cluster registry is up to date
+        # clusters.json is checked in but derived from rs-matter. If an upgrade
+        # changes it and the file is not regenerated, command ids would silently
+        # drift from the stack that sends them.
+        run: |
+          cargo build --manifest-path server/Cargo.toml --release
+          generated=$(ls -d server/target/release/build/rs-matter-*/out/clusters_generated | head -1)
+          python3 tools/build_registry.py "$generated" /tmp/clusters-check.json
+          if ! cmp -s /tmp/clusters-check.json server/src/matter/clusters.json; then
+            echo "::error file=server/src/matter/clusters.json::Out of date. Regenerate with tools/build_registry.py"
+            diff <(python3 -m json.tool /tmp/clusters-check.json) \
+                 <(python3 -m json.tool server/src/matter/clusters.json) | head -40
+            exit 1
+          fi
+          echo "clusters.json matches what rs-matter generates"
+
+  flake-hunt:
+    name: Flake hunt (x86_64)
+    # Not part of normal CI. Fabric creation failed once here with
+    # `InvalidData` and has never reproduced on aarch64, so this runs the
+    # creation path a few hundred times on the architecture that saw it.
+    # Trigger it by hand from the Actions tab.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+      - name: Create fabrics in a loop
+        env:
+          FABRIC_FLAKE_ITERATIONS: "3000"
+        run: |
+          cargo test --manifest-path server/Cargo.toml \
+            --test matter_controller -- --ignored --nocapture

@@ -1,0 +1,11 @@
+# Build output and local state must never enter the build context: the target
+# directory alone is larger than the entire source tree.
+server/target/
+spike/target/
+.local-data/
+.local-server.log
+.local-server.pid
+.git/
+.github/
+**/*.md
+!README.md

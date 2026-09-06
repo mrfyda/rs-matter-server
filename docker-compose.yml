@@ -1,0 +1,32 @@
+# rs-matter-server under Docker.
+#
+#   docker compose up -d
+#
+# Or paste this into Portainer as a stack.
+
+services:
+  rs-matter-server:
+    container_name: rs-matter-server
+    image: ghcr.io/mrfyda/rs-matter-server:latest
+    # Not optional. Matter reaches devices over IPv6 link-local addresses and
+    # finds them with mDNS multicast, neither of which survives Docker's bridge
+    # NAT. The server refuses to start without a usable interface.
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      # The Matter fabric, its certificates, the node list and the config.
+      # Losing this means re-commissioning every device.
+      - rs-matter-data:/data
+    # Everything below is optional; the image defaults to listening on
+    # 0.0.0.0:5580 with its state in /data.
+    # environment:
+    #   LOG_LEVEL: debug
+    #   # How often a reachable node is re-read for attribute changes. Lower is
+    #   # more responsive to changes made at the device, at the cost of radio
+    #   # traffic on every node.
+    #   POLL_INTERVAL_SECS: "30"
+    #   # Pin the fabric label, ignoring clients that try to set it.
+    #   DEFAULT_FABRIC_LABEL: Home
+
+volumes:
+  rs-matter-data:
