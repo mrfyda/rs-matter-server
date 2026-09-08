@@ -30,7 +30,9 @@ use rs_matter::Matter;
 use crate::protocol::error::{ApiError, ErrorCode};
 use crate::protocol::model::{AttributesData, CommissionableNodeData};
 
-use super::commissioning::commission_at_address;
+use futures_util::stream::{FuturesUnordered, StreamExt};
+
+use super::commissioning::{commission_at_address, CasePath, Completion, NetworkCredentials};
 use super::controller::persist_fabric;
 use super::interaction;
 use super::tlv_json::TlvNode;
@@ -65,6 +67,20 @@ pub enum CommissionTarget {
     Discovered {
         filter: CommissionableFilter,
         timeout_ms: u32,
+    },
+    /// Scan for the device over Bluetooth using the same filter mDNS would.
+    ///
+    /// The variant exists in every build so the protocol layer needs no
+    /// `cfg`; a build without Bluetooth answers with a specific error rather
+    /// than pretending the command is unknown.
+    Bluetooth {
+        filter: CommissionableFilter,
+        timeout_secs: u16,
+        /// The network the device is to be told to join. A device reached over
+        /// Bluetooth has none yet, so without these it can never be reached
+        /// over IP to finish. Resolved by the protocol layer, which owns
+        /// credential storage.
+        credentials: Option<NetworkCredentials>,
     },
 }
 
@@ -402,23 +418,68 @@ pub struct ActorContext<'a, C: Crypto> {
     pub crypto: C,
     pub icac_private_key: &'a CanonPkcSecretKey,
     pub storage_path: PathBuf,
+    /// The BTP state machine the transport is already chained to. Commissioning
+    /// needs it to pump the GATT connection while the flow runs.
+    #[cfg(all(feature = "bluetooth", target_os = "linux"))]
+    pub btp: &'a rs_matter::transport::network::btp::Btp,
+}
+
+/// Serve one request to completion.
+async fn serve<C: Crypto + Clone>(context: &ActorContext<'_, C>, request: Request) {
+    let name = request.op.name();
+    let outcome = execute(context, request.op).await;
+    if let Err(error) = &outcome {
+        log::debug!("Matter op '{}' failed: {}", name, error);
+    }
+    // A caller that timed out or disconnected has dropped its receiver; that
+    // is normal and must not stop the actor.
+    let _ = request.reply.send(outcome).await;
 }
 
 /// Run the actor until the channel closes.
 ///
 /// This future must be polled on the same executor thread as the Matter
 /// transport; it is never spawned onto a thread pool.
+///
+/// Requests are interleaved rather than run one after another. They used to be
+/// strictly sequential, which was fine while every operation took
+/// milliseconds, but Bluetooth commissioning holds the actor for the better
+/// part of a minute — long enough that a routine `set_default_fabric_label`
+/// queued behind it hit its own timeout and the server looked dead to its
+/// client. Interleaving is on one thread, so `Matter` is still only ever
+/// touched from here; rs-matter drives concurrent exchanges as a matter of
+/// course, and each operation's scratch state lives on its own stack frame.
 pub async fn run<C: Crypto + Clone>(context: ActorContext<'_, C>, rx: Receiver<Request>) {
-    while let Ok(request) = rx.recv().await {
-        let name = request.op.name();
-        let outcome = execute(&context, request.op).await;
-        if let Err(error) = &outcome {
-            log::debug!("Matter op '{}' failed: {}", name, error);
+    let mut in_flight = FuturesUnordered::new();
+
+    loop {
+        if in_flight.is_empty() {
+            // Nothing to make progress on, so block for work rather than
+            // spinning on an empty set.
+            let Ok(request) = rx.recv().await else { break };
+            in_flight.push(serve(&context, request));
+            continue;
         }
-        // A caller that timed out or disconnected has dropped its receiver;
-        // that is normal and must not stop the actor.
-        let _ = request.reply.send(outcome).await;
+
+        // Whichever comes first: another request, or an in-flight one
+        // finishing. `or` polls the receive side first, so an arriving request
+        // is picked up promptly even while long operations run.
+        let accepted = futures_lite::future::or(async { Some(rx.recv().await) }, async {
+            in_flight.next().await;
+            None
+        })
+        .await;
+
+        match accepted {
+            Some(Ok(request)) => in_flight.push(serve(&context, request)),
+            // The channel closed; finish what is already running first.
+            Some(Err(_)) => break,
+            None => {}
+        }
     }
+
+    while in_flight.next().await.is_some() {}
+
     log::info!("Matter controller stopped");
 }
 
@@ -632,6 +693,21 @@ async fn commission<C: Crypto + Clone>(
     node_id: u64,
 ) -> Result<MatterOutcome, ApiError> {
     let address = match target {
+        CommissionTarget::Bluetooth {
+            filter,
+            timeout_secs,
+            credentials,
+        } => {
+            return commission_over_ble(
+                context,
+                filter,
+                timeout_secs,
+                credentials,
+                passcode,
+                node_id,
+            )
+            .await
+        }
         CommissionTarget::Address { address } => parse_address(&address)?,
         CommissionTarget::Discovered { filter, timeout_ms } => {
             let (address, _) = context
@@ -655,6 +731,12 @@ async fn commission<C: Crypto + Clone>(
         address,
         passcode,
         node_id,
+        Completion {
+            // The device answered at this address over IP and still will.
+            case_path: CasePath::SameAddress,
+            // It is already on a network; nothing to provision.
+            credentials: None,
+        },
     )
     .await
     .map_err(|error| ApiError::commission_failed(format!("{}", error)))?;
@@ -668,6 +750,104 @@ async fn commission<C: Crypto + Clone>(
         address: format_address(&address),
         device_fabric_index: result.device_fabric_index,
     })
+}
+
+/// Commission a device found over Bluetooth.
+///
+/// Two futures have to run together. The commissioning flow's exchanges travel
+/// over `Btp`, and `Btp` only moves bytes while the pump holds the device's
+/// GATT connection open — so neither makes progress without the other. The
+/// first to finish decides the outcome: the pump returning means the link
+/// dropped before commissioning was done, which is a failure however it
+/// happened.
+///
+/// Phase 2 resolves the device over mDNS rather than reusing the Bluetooth
+/// address, because by then the device has joined its operational network and
+/// that is where it answers.
+#[cfg(all(feature = "bluetooth", target_os = "linux"))]
+async fn commission_over_ble<C: Crypto + Clone>(
+    context: &ActorContext<'_, C>,
+    filter: CommissionableFilter,
+    timeout_secs: u16,
+    credentials: Option<NetworkCredentials>,
+    passcode: u32,
+    node_id: u64,
+) -> Result<MatterOutcome, ApiError> {
+    use super::ble::BleAdapter;
+    use rs_matter::transport::network::BtAddr;
+
+    /// Which half of the race finished. The two futures have different output
+    /// types, so they are unified here rather than reached for with a select
+    /// combinator from another crate.
+    enum Finished {
+        Pump(Result<(), ApiError>),
+        Flow(Result<super::commissioning::CommissionOutcome, ApiError>),
+    }
+
+    let adapter = BleAdapter::open(None).await?;
+    let addr: BtAddr = adapter.scan(&filter, timeout_secs).await?;
+    log::info!("Commissioning the device at {} over Bluetooth", addr);
+
+    let pump = async { Finished::Pump(adapter.pump(addr, context.btp).await) };
+    let flow = async {
+        Finished::Flow(
+            commission_at_address(
+                context.matter,
+                &context.crypto,
+                context.icac_private_key,
+                Address::Btp(addr),
+                passcode,
+                node_id,
+                Completion {
+                    case_path: CasePath::Operational,
+                    credentials: credentials.as_ref(),
+                },
+            )
+            .await,
+        )
+    };
+
+    let result = match futures_lite::future::or(pump, flow).await {
+        Finished::Flow(result) => result?,
+        Finished::Pump(pump) => {
+            return Err(pump.err().unwrap_or_else(|| {
+                ApiError::commission_failed(
+                    "The Bluetooth connection closed before commissioning finished",
+                )
+            }))
+        }
+    };
+
+    persist_fabric(context.matter, &context.storage_path)
+        .map_err(|e| ApiError::sdk(format!("Failed to persist the fabric: {:?}", e)))?;
+
+    // No address is reported. The Bluetooth MAC is not an operational address,
+    // and the caller stores what it gets here as the node's `ip_addresses` —
+    // where `get_node_ip_addresses` and `ping_node` would then use it. The
+    // device's operational address is resolved inside rs-matter during
+    // `complete_via_case_operational` and not exposed, so an empty answer is
+    // the honest one until an operational mDNS lookup exists.
+    Ok(MatterOutcome::Commissioned {
+        node_id: result.node_id,
+        address: String::new(),
+        device_fabric_index: result.device_fabric_index,
+    })
+}
+
+/// Bluetooth compiled out: say so specifically rather than failing obscurely.
+#[cfg(not(all(feature = "bluetooth", target_os = "linux")))]
+async fn commission_over_ble<C: Crypto + Clone>(
+    _context: &ActorContext<'_, C>,
+    _filter: CommissionableFilter,
+    _timeout_secs: u16,
+    _credentials: Option<NetworkCredentials>,
+    _passcode: u32,
+    _node_id: u64,
+) -> Result<MatterOutcome, ApiError> {
+    Err(ApiError::commission_failed(
+        "This build has no Bluetooth support. It needs the `bluetooth` cargo \
+         feature, and rs-matter only backs BLE on Linux.",
+    ))
 }
 
 fn parse_address(address: &str) -> Result<Address, ApiError> {

@@ -10,12 +10,12 @@ the resource footprint: **11.4 MiB resident against the reference's 199.6 MiB**
 under the same workload, which matters on a small always-on host running Home
 Assistant alongside everything else.
 
-**Status:** running under Home Assistant against real devices.
-Commissioning, control, and the full command surface are implemented. Two
-things are not — Bluetooth commissioning and OTA image delivery — and both
-report a specific error rather than failing quietly. See [PARITY.md](PARITY.md)
-for the command-by-command matrix, the measured hardware results, and every
-known gap.
+**Status:** running under Home Assistant against real devices. Commissioning,
+control, and the full command surface are implemented. OTA image delivery is
+not, and reports a specific error rather than failing quietly. Bluetooth
+commissioning is implemented but has only ever been compiled, never run
+against a device. See [PARITY.md](PARITY.md) for the command-by-command
+matrix, the measured hardware results, and every known gap.
 
 ## Quick start
 
@@ -50,6 +50,13 @@ rs-matter's generated cluster code is large enough that a single `rustc` wants
 more than 2 GB on its own. `--build-arg CARGO_JOBS=1` reduces peak memory at
 the cost of build time. An arm64 host with that much memory builds it
 natively without trouble, so cross-building is optional.
+
+Bluetooth commissioning raises that bar sharply: rs-matter with the `zbus`
+feature needs well over 8 GB in a single `rustc`, which no `CARGO_JOBS` value
+avoids. It is in the default build because the published image is built by CI
+on a 16 GB runner. To build the image on a smaller machine, leave it out with
+`--build-arg CARGO_FEATURES=`; the result behaves exactly as a host with no
+adapter does.
 
 The image is built and published by CI on every push to `main`.
 
@@ -95,6 +102,7 @@ Every option is a flag or an environment variable.
 | `--default-fabric-label` | `DEFAULT_FABRIC_LABEL` | — | Pin the fabric label, ignoring clients |
 | `--disable-ota` | `DISABLE_OTA` | off | Turn off update checks and the upload endpoint |
 | `--disable-thread-diagnostics` | `DISABLE_THREAD_DIAGNOSTICS` | off | Turn off Thread discovery |
+| `--disable-bluetooth` | `DISABLE_BLUETOOTH` | off | Turn off Bluetooth commissioning where an adapter exists |
 | `--enable-test-net-dcl` | `ENABLE_TEST_NET_DCL` | off | Also query the CSA test ledger |
 | `--health-check` | — | — | Probe a running server and exit; used by the container health check |
 
@@ -124,9 +132,17 @@ back it up, and do not commit it.
 ## Development
 
 ```bash
-cargo test --manifest-path server/Cargo.toml            # 212 tests
+cargo test --manifest-path server/Cargo.toml               # 215 tests
 cargo test --manifest-path server/Cargo.toml -- --ignored  # + the 2 ignored
+tools/linux-check.sh                                       # Linux-only paths
+tools/linux-check.sh --features bluetooth                  # needs >8 GB
 ```
+
+`tools/linux-check.sh` runs `cargo check` in an arm64 Linux container, because
+a macOS build compiles nothing behind `cfg(not(target_os = "macos"))` — the
+built-in mDNS responder, interface selection, socket binding, and the whole
+Bluetooth transport. It needs Docker, and for the `bluetooth` feature a VM
+larger than Docker Desktop's default; CI is the fallback for that one.
 
 The layout and the reasoning behind it are in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Briefly: `protocol/` is the wire

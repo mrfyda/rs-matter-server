@@ -20,10 +20,14 @@ use futures_lite::future::block_on;
 use rand_core::OsRng;
 use rs_matter::crypto::{default_crypto, Crypto};
 use rs_matter::dm::devices::test::DAC_PRIVKEY;
+#[cfg(all(feature = "bluetooth", target_os = "linux"))]
+use rs_matter::transport::network::btp::Btp;
 #[cfg(target_os = "macos")]
 use rs_matter::transport::network::mdns::astro::AstroMdns;
 #[cfg(not(target_os = "macos"))]
 use rs_matter::transport::network::mdns::builtin::{BuiltinMdns, Host};
+#[cfg(all(feature = "bluetooth", target_os = "linux"))]
+use rs_matter::transport::network::{Address, ChainedNetwork};
 
 use crate::api::{RuntimeInfo, ServerContext};
 use crate::matter::actor::{self, ActorContext};
@@ -78,6 +82,10 @@ pub async fn run(
         thread::spawn(move || block_on(monitor::run(context, monitor_config)));
     }
 
+    // Prepared before the actor context, which borrows the BTP state machine
+    // out of it.
+    let ble = prepare_ble();
+
     let shutdown = Arc::new(AtomicBool::new(false));
     // rs-matter's crypto backend is not `Clone`, but `&C` implements `Crypto`
     // and is `Copy`, so the actor holds a reference and the transport keeps
@@ -87,6 +95,8 @@ pub async fn run(
         crypto: &crypto,
         icac_private_key: &icac_private_key,
         storage_path,
+        #[cfg(all(feature = "bluetooth", target_os = "linux"))]
+        btp: &ble.btp,
     };
 
     // mDNS is set up before the run loop rather than inside it. Matter cannot
@@ -99,7 +109,7 @@ pub async fn run(
     // mDNS, actor, and accept loops are all long-lived, so any of them exiting
     // ends the server — which is what should happen if the radio stops.
     let network = futures_lite::future::or(
-        run_transport(&matter, &crypto, &matter_socket),
+        run_transport(&matter, &crypto, &matter_socket, &ble),
         run_mdns(&matter, &crypto, &mdns),
     );
     let work = futures_lite::future::or(
@@ -115,14 +125,70 @@ pub async fn run(
     Ok(())
 }
 
+/// Run the Matter transport with BTP chained in next to UDP.
+///
+/// Chaining is what keeps commissioning transport-agnostic: a device reached
+/// over Bluetooth is just another `Address` to everything above the transport,
+/// so the flow in `matter::commissioning` does not care which it is.
+/// Multicast stays on the UDP socket alone — `Btp` has no `NetworkMulticast`
+/// impl, and mDNS has no business on a GATT link.
+#[cfg(all(feature = "bluetooth", target_os = "linux"))]
 async fn run_transport<C: Crypto>(
     matter: &rs_matter::Matter<'_>,
     crypto: &C,
     socket: &Async<UdpSocket>,
+    ble: &BleSetup,
+) {
+    // Two chains rather than one: `run` takes send and receive separately, and
+    // each needs its own value to borrow mutably.
+    let send = ChainedNetwork::new(Address::is_btp, &ble.btp, socket);
+    let recv = ChainedNetwork::new(Address::is_btp, &ble.btp, socket);
+
+    if let Err(error) = matter.run(crypto, send, recv, socket).await {
+        log::error!("Matter transport stopped: {:?}", error);
+    }
+}
+
+#[cfg(not(all(feature = "bluetooth", target_os = "linux")))]
+async fn run_transport<C: Crypto>(
+    matter: &rs_matter::Matter<'_>,
+    crypto: &C,
+    socket: &Async<UdpSocket>,
+    _ble: &BleSetup,
 ) {
     if let Err(error) = matter.run(crypto, socket, socket, socket).await {
         log::error!("Matter transport stopped: {:?}", error);
     }
+}
+
+/// What the Bluetooth transport needs before the run loop starts.
+///
+/// `Btp` is the protocol state machine, not a connection: it is chained into
+/// the transport once and lives for the process, while the per-device GATT
+/// connection comes and goes with each commissioning. It holds a single
+/// session, so one Bluetooth commissioning runs at a time.
+#[cfg(all(feature = "bluetooth", target_os = "linux"))]
+struct BleSetup {
+    btp: Btp,
+}
+
+/// Bluetooth compiled out: nothing to prepare, and `run_transport` ignores it.
+#[cfg(not(all(feature = "bluetooth", target_os = "linux")))]
+struct BleSetup;
+
+#[cfg(all(feature = "bluetooth", target_os = "linux"))]
+fn prepare_ble() -> BleSetup {
+    let btp = Btp::new();
+    // Central role: a controller reaches out to a device, rather than
+    // advertising and waiting to be found the way an accessory does.
+    btp.set_initiator(true);
+
+    BleSetup { btp }
+}
+
+#[cfg(not(all(feature = "bluetooth", target_os = "linux")))]
+fn prepare_ble() -> BleSetup {
+    BleSetup
 }
 
 /// What mDNS needs before the run loop starts. macOS delegates to the system

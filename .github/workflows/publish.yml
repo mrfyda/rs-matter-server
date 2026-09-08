@@ -55,6 +55,11 @@ jobs:
           context: .
           platforms: linux/arm64
           push: true
+          build-args: |
+            # The runner has 4 cores and 16 GB. rs-matter with the `zbus`
+            # feature needs well over 8 GB in a single rustc, so letting cargo
+            # start one per core gets the compiler OOM-killed. Two fits.
+            CARGO_JOBS=2
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

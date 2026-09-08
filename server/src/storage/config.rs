@@ -124,11 +124,8 @@ impl ConfigStore {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(data)?)
-            .with_context(|| format!("writing config {}", tmp.display()))?;
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("installing config {}", path.display()))?;
+        super::private::write_private(path, &serde_json::to_vec_pretty(data)?)
+            .with_context(|| format!("writing config {}", path.display()))?;
         Ok(())
     }
 

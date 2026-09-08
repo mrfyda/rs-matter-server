@@ -90,11 +90,8 @@ impl NodeStore {
         let snapshot = Snapshot {
             nodes: self.nodes.lock().unwrap().values().cloned().collect(),
         };
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&snapshot)?)
-            .with_context(|| format!("writing node state {}", tmp.display()))?;
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("installing node state {}", path.display()))?;
+        super::private::write_private(path, &serde_json::to_vec_pretty(&snapshot)?)
+            .with_context(|| format!("writing node state {}", path.display()))?;
         Ok(())
     }
 

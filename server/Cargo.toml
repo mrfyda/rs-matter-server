@@ -44,6 +44,9 @@ base64 = "0.22"
 # share port 5353 with the host's own responder.
 socket2 = { version = "0.5", features = ["all"] }
 nix = { version = "0.30", features = ["net"] }
+# `umask`, so every file the process creates — including the ones rs-matter
+# writes itself — is private without having to chmod each one after the fact.
+libc = "0.2"
 anyhow = "1"
 rand_core = { version = "0.6", features = ["std"] }
 thiserror = "1"
@@ -52,6 +55,13 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # For test server shutdown channel
 async-channel = "2"
+
+# Bluetooth commissioning. Linux only: rs-matter's BTP Central backends are
+# both `target_os = "linux"`, so enabling this elsewhere pulls the dependency
+# and compiles no BLE code. `zbus` is rs-matter's direct D-Bus backend, chosen
+# over `bluer` because it is pure Rust and a much smaller tree.
+[features]
+bluetooth = ["rs-matter/zbus"]
 
 # rs-matter's mDNS backend is platform-specific. macOS routes mDNS through the
 # system Bonjour daemon (`astro-dnssd`); everywhere else — including the Pi 5

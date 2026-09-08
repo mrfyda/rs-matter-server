@@ -37,6 +37,13 @@ struct Args {
     #[arg(long, env = "DISABLE_THREAD_DIAGNOSTICS", default_value_t = false)]
     disable_thread_diagnostics: bool,
 
+    /// Turn off Bluetooth commissioning, even where an adapter is available.
+    ///
+    /// Bluetooth is used on its own when the build has the `bluetooth`
+    /// feature and BlueZ offers an adapter, so this only exists to say no.
+    #[arg(long, env = "DISABLE_BLUETOOTH", default_value_t = false)]
+    disable_bluetooth: bool,
+
     /// How often, in seconds, a reachable node is re-read for attribute
     /// changes.
     #[arg(long, env = "POLL_INTERVAL_SECS", default_value_t = 30)]
@@ -93,6 +100,74 @@ fn health_check(listen: SocketAddr) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether Bluetooth commissioning can actually be offered.
+///
+/// Three things have to hold, and the answer is reported rather than assumed:
+/// the build has the feature, the host is Linux (rs-matter backs BLE nowhere
+/// else), and BlueZ is offering an adapter. A client reads this to decide
+/// whether to show Bluetooth commissioning at all.
+#[cfg(all(feature = "bluetooth", target_os = "linux"))]
+fn bluetooth_available(disabled: bool) -> bool {
+    use rs_matter_server::matter::ble::BleAdapter;
+
+    if disabled {
+        log::info!("Bluetooth commissioning is turned off by --disable-bluetooth");
+        return false;
+    }
+
+    let probe = async_std::task::block_on(async {
+        match BleAdapter::open(None).await {
+            Ok(adapter) => adapter.adapter_present().await,
+            Err(error) => {
+                log::info!("Bluetooth is unavailable: {}", error.details);
+                false
+            }
+        }
+    });
+
+    if probe {
+        log::info!("Bluetooth commissioning is available");
+    } else {
+        log::info!("No Bluetooth adapter is available; commissioning will use the network only");
+    }
+
+    probe
+}
+
+/// Without the feature, or off Linux, there is nothing to probe.
+#[cfg(not(all(feature = "bluetooth", target_os = "linux")))]
+fn bluetooth_available(_disabled: bool) -> bool {
+    false
+}
+
+/// Install the logger.
+///
+/// `set_loglevel` changes the level at runtime through `log::set_max_level`,
+/// which is a ceiling over whatever filter the logger was built with — so a
+/// logger built at `info` can never be widened to `debug`, however the client
+/// asks. Building it at `trace` and then lowering the ceiling to the requested
+/// level makes the runtime control work in both directions, at no cost:
+/// suppressed records are rejected by the ceiling before their arguments are
+/// evaluated.
+///
+/// `RUST_LOG` is honoured when set and left alone, since per-module filters
+/// are the reason to reach for it and clamping them would defeat that.
+fn init_logging(level: &str) {
+    let mut builder = env_logger::Builder::new();
+
+    match std::env::var("RUST_LOG") {
+        Ok(spec) => {
+            builder.parse_filters(&spec);
+            builder.init();
+        }
+        Err(_) => {
+            builder.filter_level(log::LevelFilter::Trace);
+            builder.init();
+            log::set_max_level(rs_matter_server::api::server_info::level_filter(level));
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
@@ -100,11 +175,16 @@ fn main() -> anyhow::Result<()> {
         return health_check(args.listen);
     }
 
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(&args.log_level))
-        .init();
+    init_logging(&args.log_level);
+
+    // Before anything writes: the storage directory holds the fabric's signing
+    // material and the Wi-Fi password in cleartext.
+    rs_matter_server::storage::private::restrict_new_files();
 
     log::info!("rs-matter-server starting on {}", args.listen);
     log::info!("Storage path: {}", args.storage_path);
+
+    rs_matter_server::storage::private::tighten_existing(std::path::Path::new(&args.storage_path));
 
     let controller =
         init_controller(&args.storage_path, &FabricConfig::default()).map_err(|e| {
@@ -135,9 +215,7 @@ fn main() -> anyhow::Result<()> {
     let server = ServerConfig {
         listen: args.listen,
         runtime: RuntimeInfo {
-            // rs-matter has no BLE transport, so commissioning finds devices
-            // over the IP network only.
-            bluetooth_enabled: false,
+            bluetooth_enabled: bluetooth_available(args.disable_bluetooth),
             ble_proxy_enabled: false,
             ota_enabled: !args.disable_ota,
             thread_diagnostics_enabled: !args.disable_thread_diagnostics,

@@ -68,6 +68,34 @@ jobs:
           fi
           echo "clusters.json matches what rs-matter generates"
 
+  bluetooth:
+    name: Typecheck Bluetooth (arm64)
+    # The BLE transport is `target_os = "linux"` only, so a macOS dev machine
+    # never compiles it, and it does not fit in a local container either: a
+    # single rustc on rs-matter with the `zbus` feature needs more than Docker
+    # Desktop's default 7.7 GiB VM. A 16 GiB runner is where it gets checked.
+    runs-on: ubuntu-24.04-arm
+    env:
+      # The runner has 4 cores, so cargo would start 4 rustc processes; the one
+      # compiling rs-matter with zbus wants the better part of 8 GiB on its own.
+      CARGO_BUILD_JOBS: 2
+      # A typecheck needs no debug info, and debug info is most of the memory.
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+          # Its own cache: the feature changes rs-matter's own compilation, so
+          # these artifacts cannot be shared with the default-feature job.
+          key: bluetooth
+
+      - name: Check
+        run: cargo check --manifest-path server/Cargo.toml --features bluetooth
+
   flake-hunt:
     name: Flake hunt (x86_64)
     # Not part of normal CI. Fabric creation failed once here with

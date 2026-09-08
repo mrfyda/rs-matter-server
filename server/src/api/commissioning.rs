@@ -11,7 +11,9 @@ use rs_matter::BasicCommData;
 use serde_json::Value;
 
 use crate::matter::actor::CommissionTarget;
-use crate::matter::commissioning::parse_pairing_code;
+use crate::matter::commissioning::{
+    parse_pairing_code, NetworkCredentials, ThreadCredentials, WifiCredentials,
+};
 use crate::matter::mdns_browser::{self, ServiceInstance};
 use crate::matter::spake2p_verifier::{DEFAULT_ITERATIONS, MAX_SALT_LEN};
 use crate::matter::tlv_json::TlvNode;
@@ -19,7 +21,7 @@ use crate::protocol::error::{ApiError, ApiResult};
 use crate::protocol::events::Event;
 use crate::protocol::message::Args;
 use crate::protocol::model::{CommissionableNodeData, CommissioningParameters, MatterNodeData};
-use crate::storage::StoredNode;
+use crate::storage::{thread_dataset, StoredNode};
 
 use super::{fabrics, nodes, now_iso, require_node, CallContext};
 
@@ -45,17 +47,20 @@ pub async fn commission_with_code(args: &Args, context: CallContext<'_>) -> ApiR
     let network_only = args.bool_or("network_only", false)?;
     let pairing = parse_pairing_code(code)?;
 
-    // Wireless devices that are not yet on the network are reached over
-    // Bluetooth, which this build does not have. Network discovery is
-    // attempted regardless — a device already on the network commissions
-    // either way — but the caller gets an accurate reason if it is not found.
-    if !network_only && !context.server.runtime.bluetooth_enabled {
+    // A device already on the network is found over mDNS, which is quicker
+    // and needs no radio, so that is always tried first. Bluetooth is the
+    // fallback for a factory-fresh wireless device, which has no network to
+    // be found on yet.
+    let bluetooth = !network_only && context.server.runtime.bluetooth_enabled;
+    if !bluetooth {
         log::info!(
             "Bluetooth is unavailable; commissioning will only find devices already on the network"
         );
     }
 
-    commission(
+    let credentials = network_credentials(&context);
+    let filter = pairing.filter.clone();
+    let over_network = commission(
         context,
         CommissionTarget::Discovered {
             filter: pairing.filter,
@@ -63,7 +68,53 @@ pub async fn commission_with_code(args: &Args, context: CallContext<'_>) -> ApiR
         },
         pairing.passcode,
     )
-    .await
+    .await;
+
+    match over_network {
+        Ok(result) => Ok(result),
+        Err(error) if bluetooth => {
+            log::info!("Not found on the network ({error}); scanning over Bluetooth");
+            commission(
+                context,
+                CommissionTarget::Bluetooth {
+                    filter,
+                    timeout_secs: BLUETOOTH_SCAN_TIMEOUT_SECS,
+                    credentials: Some(credentials),
+                },
+                pairing.passcode,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// How long to scan for a commissionable Bluetooth advertisement.
+///
+/// A factory-fresh device advertises for about fifteen minutes, so the limit
+/// here is the caller's patience rather than the device's window.
+const BLUETOOTH_SCAN_TIMEOUT_SECS: u16 = 30;
+
+/// The credentials a Bluetooth-commissioned device may need to join a network.
+///
+/// Both kinds are collected; the device's `NetworkCommissioning` feature map
+/// decides which one is actually sent.
+fn network_credentials(context: &CallContext<'_>) -> NetworkCredentials {
+    let store = &context.server.config;
+
+    let wifi = store
+        .wifi_credentials(None)
+        .map(|(ssid, password)| WifiCredentials { ssid, password });
+
+    let thread = store.thread_dataset(None).and_then(|hex| {
+        let decoded = thread_dataset::decode(&hex)?;
+        Some(ThreadCredentials {
+            dataset: thread_dataset::from_hex(&hex)?,
+            ext_pan_id: decoded.ext_pan_id_bytes()?,
+        })
+    });
+
+    NetworkCredentials { wifi, thread }
 }
 
 /// Commission a device already on the IP network.
@@ -106,7 +157,14 @@ async fn commission(
 
     let node = MatterNodeData::new(node_id, now_iso());
     let mut stored = StoredNode::new(node);
-    stored.ip_addresses = vec![address];
+    // Bluetooth commissioning reports no address: a BT MAC is not an
+    // operational address, and a wrong entry here would be permanent, since
+    // nothing re-resolves it later.
+    stored.ip_addresses = if address.is_empty() {
+        Vec::new()
+    } else {
+        vec![address]
+    };
     stored.device_fabric_index = Some(device_fabric_index);
     context.server.nodes.upsert(stored);
     context

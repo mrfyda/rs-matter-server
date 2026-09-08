@@ -20,6 +20,17 @@ ENV CARGO_BUILD_JOBS=${CARGO_JOBS}
 ARG CARGO_OPT_LEVEL=3
 ENV CARGO_PROFILE_RELEASE_OPT_LEVEL=${CARGO_OPT_LEVEL}
 
+# Cargo features to build with. Bluetooth commissioning is on by default and
+# costs nothing where it cannot be used: the server probes BlueZ at startup and
+# reports `bluetooth_enabled: false` when there is no adapter or no bus, which
+# is exactly how a build without it behaves.
+#
+# It does raise the bar for building. rs-matter with the `zbus` feature needs
+# well over 8 GiB in a single rustc, so a machine that can build the default
+# image may not manage this one. Pass `--build-arg CARGO_FEATURES=` to leave it
+# out.
+ARG CARGO_FEATURES=bluetooth
+
 WORKDIR /build/server
 
 # Dependencies are compiled against a stub crate first, so editing this
@@ -28,14 +39,14 @@ COPY server/Cargo.toml server/Cargo.lock ./
 RUN mkdir -p src \
     && echo 'fn main() {}' > src/main.rs \
     && : > src/lib.rs \
-    && cargo build --release \
+    && cargo build --release --features "${CARGO_FEATURES}" \
     && rm -rf src
 
 COPY server/src ./src
 # COPY preserves the context's timestamps, which can predate the stub build;
 # without this cargo may consider the stub artifacts still current.
 RUN touch src/main.rs src/lib.rs \
-    && cargo build --release \
+    && cargo build --release --features "${CARGO_FEATURES}" \
     && install -D target/release/rs-matter-server /out/rs-matter-server
 
 # The state directory is staged here because the runtime image has no shell to
@@ -56,6 +67,13 @@ COPY --from=builder /out/rs-matter-server /usr/local/bin/rs-matter-server
 # uid 65532 is distroless's `nonroot`. Nothing here needs privilege: the ports
 # are above 1024 and joining a multicast group does not require root.
 COPY --from=builder --chown=65532:65532 /out/data /data
+
+# zbus falls back to the D-Bus spec's default socket path,
+# /var/run/dbus/system_bus_socket, and this image has no /var/run at all —
+# distroless ships `run` and `var` but not Debian's `/var/run -> /run` symlink,
+# so that path can never resolve however the socket is mounted. Point it at
+# the real one instead of relying on a symlink that is not there.
+ENV DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket
 
 USER 65532:65532
 WORKDIR /

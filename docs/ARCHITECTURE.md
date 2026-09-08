@@ -96,48 +96,67 @@ in exec form precisely so it works without a shell.
 Image size does not affect resident memory, so none of this changes the
 footprint figures; it is disk and attack surface.
 
-## Extending: Bluetooth commissioning
+## Bluetooth commissioning
 
-Commissioning a factory-fresh wireless device normally happens over Bluetooth:
-the device has no network yet, so the controller reaches it over BLE, hands it
-Wi-Fi or Thread credentials, and only then talks to it over IP. This server
-cannot do that. Two separate pieces are missing, and only one of them is this
-project's.
+Commissioning a factory-fresh wireless device happens over Bluetooth: the
+device has no network yet, so the controller reaches it over BLE, hands it
+Wi-Fi or Thread credentials, and only then talks to it over IP. Linux only —
+rs-matter's BTP Central backends are `target_os = "linux"`, and macOS has no
+CoreBluetooth backend — and behind the `bluetooth` cargo feature.
 
-**1. Wire up the BLE transport (Linux only).** rs-matter already implements
-it, so this is integration rather than protocol work:
+**The transport is chained, not switched.** `Btp` is created at startup and
+joined to the Matter transport next to UDP with `ChainedNetwork`, keyed on
+`Address::is_btp`. A device reached over Bluetooth is then just another
+`Address` to everything above the transport, so the commissioning flow does not
+branch on which one it is. Multicast stays on the UDP socket alone: `Btp` has
+no `NetworkMulticast` impl, and mDNS has no business on a GATT link. This is
+the one place a controller differs from a device — a device switches from BLE
+to IP when commissioning ends, whereas a controller has to keep serving every
+existing node over IP while commissioning a new one over BLE.
 
-- `rs_matter::transport::network::btp` implements BTP over GATT and supports
-  the Central role via `Btp::set_initiator(true)`.
-- Two backends provide the OS half, both `target_os = "linux"`: `gatt::bluer`
-  (the `bluer` crate, feature `bluer`) and `gatt::bluez` (direct D-Bus, feature
-  `zbus`). Each exposes `scan` for discovery and
-  `run_central(adapter, addr, &btp)` for connect-and-pump.
-- The shape is: `scan` for a commissionable advertisement matching the pairing
-  code's discriminator, then `select` `run_central` against `matter.run` and
-  commission with `Address::Btp(addr)` instead of `Address::Udp(..)`.
-- macOS has no backend. rs-matter has no CoreBluetooth implementation, and a
-  plain CLI binary on macOS cannot use CoreBluetooth without an app bundle and
-  entitlements — so this is testable on Linux hardware, not on a development
-  Mac.
-- The container would need the host's D-Bus socket and the Bluetooth adapter,
-  so the compose file grows a mount and the image probably stops being able to
-  run unprivileged.
+`Btp` is 4616 bytes and holds a single session, so it costs nothing worth
+measuring and allows one Bluetooth commissioning at a time. rs-matter offers
+`max-btp-sessions-{1,2,4,8}` if that ever needs to change.
 
-**2. Provision the network.** rs-matter's commissioner runs ArmFailSafe →
-CSRRequest → AddTrustedRootCertificate → AddNOC → CASE → CommissioningComplete
-and never touches the NetworkCommissioning cluster. A device reached over BLE
-has no network, so between AddNOC and CASE it has to be sent
-`AddOrUpdateWiFiNetwork` (or `AddOrUpdateThreadNetwork`) followed by
-`ConnectNetwork`, over the existing PASE session, before it can be reached over
-IP to finish. The credentials are already stored and the cluster registry
-already knows those commands with their payload field names; what is missing is
-the invoke sequence and the plumbing to reuse the PASE exchange —
-`Exchange::initiate_pase` reuses an existing PASE session by peer address,
-which is the likely way in.
+**The pump and the flow are raced.** `bluez::run_central` holds the GATT
+connection to one device and moves bytes between the adapter and `Btp`; the
+commissioning flow's exchanges travel over `Btp`. Neither makes progress
+without the other, so they run as two futures with the first to finish
+deciding: the pump returning means the link dropped before commissioning was
+done. (The backends live at `btp::bluez` and `btp::bluer` — `btp::gatt` itself
+is private, and `btp` re-exports its public children.)
 
-Until both land, `server_info.bluetooth_enabled` stays `false` and
-`commission_with_code` finds only devices already on the IP network.
+**Network provisioning sits between AddNOC and CASE**, where the Matter spec
+puts it: the fail-safe is still armed and PASE is still the only way to talk.
+`Exchange::initiate_pase` reuses the session the commissioner established,
+keyed by peer address, so `AddOrUpdateWiFiNetwork` or
+`AddOrUpdateThreadNetwork` followed by `ConnectNetwork` are further exchanges
+on it rather than a second SPAKE2+ handshake. Which one is sent is decided by
+reading the device's `NetworkCommissioning` feature map, because a controller
+can hold both kinds of credentials and only the device knows which it can use.
 
-Testing it needs a device advertising over BLE, which means factory resetting
-one: it leaves the fabric and has to be re-added.
+**Phase 2 resolves over mDNS.** `Commissioner::complete_via_case_operational`
+rather than `complete_via_case`: by then the device has left the GATT link for
+its own network, and the address it will answer on is not known until it
+announces itself.
+
+**Finding the bus is the fiddly part in a container.** Two things bite. The
+image sets `DBUS_SYSTEM_BUS_ADDRESS` because zbus otherwise falls back to the
+spec's `/var/run/dbus/system_bus_socket`, and the distroless runtime has no
+`/var/run` — it ships `run` and `var` but not Debian's symlink between them.
+And under Docker-in-Docker, the bind source is resolved by the inner daemon
+inside the DinD container rather than on the machine, so the real host's
+`/run/dbus` is out of reach; Docker then creates an empty root-owned directory
+at the destination, and connecting to *that* fails with `EACCES` rather than
+`ENOENT`, because the kernel checks write permission before it checks the
+target is a socket. Nothing in this project's compose fixes that — the bus has
+to be passed into the DinD container itself, which on umbrelOS means editing
+the Portainer app's own compose and redoing it after every update. A host
+where the bus cannot be reached is the case BLE proxy mode exists for.
+
+**What is not proven.** All of it compiles and none of it has commissioned a
+real device. Testing needs a factory-reset device — which means removing one
+from the fabric — and a host whose D-Bus policy lets the server's uid drive the
+adapter, not merely read it. The container mounts the host's system bus and
+runs as uid 65532, which is normally enough to see an adapter and not enough to
+start discovery.

@@ -17,6 +17,39 @@ services:
       # The Matter fabric, its certificates, the node list and the config.
       # Losing this means re-commissioning every device.
       - rs-matter-data:/data
+      # Bluetooth commissioning talks to BlueZ over the host's system bus.
+      # Harmless to leave mounted on a host without Bluetooth: the server
+      # probes at startup and reports bluetooth_enabled false if there is no
+      # adapter.
+      #
+      # Not `:ro` — connecting to a Unix socket is a write operation, and a
+      # socket is never read or written as a file, so read-only buys nothing.
+      #
+      # The source path is resolved by the daemon creating this container,
+      # which under Docker-in-Docker is the inner one — so it sees the DinD
+      # container's /run, not the machine's. Docker then creates an empty
+      # root-owned directory where the socket should be, and connecting to
+      # that reports a permission error rather than a missing file, because
+      # the kernel checks write permission before it checks the target is a
+      # socket.
+      #
+      # There is no fix at this level: the bus has to be passed into the DinD
+      # container first. On umbrelOS that means adding this same mount to the
+      # `docker` service of the Portainer app's compose, which an app update
+      # reverts. Where the bus cannot be reached, BLE proxy mode is the way in
+      # — the radio lives elsewhere and the server needs no adapter at all.
+      - /run/dbus:/run/dbus
+    # There are two permission gates, and they are separate. Opening the bus
+    # socket above is plain file permissions — it is normally mode 0666, so any
+    # uid can connect. Sending to org.bluez is a D-Bus policy decision, and
+    # that one commonly does require root or the host's `bluetooth` group. If
+    # the server logs that Bluetooth is available but commissioning is then
+    # refused, that is the second gate:
+    #
+    #   getent group bluetooth     # on the host, to find the GID
+    #
+    # group_add:
+    #   - "113"                    # the GID that command printed
     # Everything below is optional; the image defaults to listening on
     # 0.0.0.0:5580 with its state in /data.
     # environment:

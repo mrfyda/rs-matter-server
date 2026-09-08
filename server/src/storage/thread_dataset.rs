@@ -29,6 +29,15 @@ impl OperationalDataset {
     pub fn supports_meshcop(&self) -> bool {
         self.has_pskc && self.has_network_key
     }
+
+    /// The extended PAN id as raw bytes.
+    ///
+    /// `ConnectNetwork` identifies a Thread network by these bytes, where a
+    /// Wi-Fi network is identified by its SSID. Kept here so hex handling
+    /// stays in one place.
+    pub fn ext_pan_id_bytes(&self) -> Option<Vec<u8>> {
+        self.ext_pan_id.as_deref().and_then(from_hex)
+    }
 }
 
 /// Parse a hex-encoded dataset. Returns `None` when the hex or the TLV framing
@@ -78,7 +87,9 @@ pub fn is_valid_hex(dataset: &str) -> bool {
         && dataset.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-fn from_hex(hex: &str) -> Option<Vec<u8>> {
+/// Decode a hex string. Public because commissioning needs the dataset as raw
+/// bytes to hand to `AddOrUpdateThreadNetwork`.
+pub fn from_hex(hex: &str) -> Option<Vec<u8>> {
     if !is_valid_hex(hex) {
         return None;
     }

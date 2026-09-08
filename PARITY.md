@@ -37,7 +37,7 @@ The `every_advertised_command_is_routed` contract test enforces that against
 | `get_all_credentials` | ✅ | `{ wifi: [{id, ssid}], thread: [{id, networkName, extPanId}] }`, `default` always present. |
 | `set_default_fabric_label` | ✅ | Per-connection ownership, `--default-fabric-label` pinning, null/blank resets to `HomeAssistant`, answers `null`. The label is pushed to commissioned nodes so other ecosystems display it. |
 | `get_fabric_label` | ✅ | `{ fabric_label }`. |
-| `commission_with_code` | ⚠️ | QR and manual codes, mDNS discovery, PASE → AddNOC → CASE → CommissioningComplete, first interview, `node_added`. Bluetooth commissioning is not wired up, so a device must already be on the IP network — see the Bluetooth gap below. |
+| `commission_with_code` | ⚠️ | QR and manual codes, mDNS discovery, PASE → AddNOC → CASE → CommissioningComplete, first interview, `node_added`. Bluetooth is tried when mDNS finds nothing, on a Linux build with the `bluetooth` feature and an adapter present; a Bluetooth-commissioned node records no IP address — see the gaps below. |
 | `commission_on_network` | ✅ | Explicit `ip_addr`, or `filter_type`/`filter` (none / short discriminator / long discriminator / vendor / device type). |
 | `open_commissioning_window` | ✅ | Enhanced window: a fresh passcode, a SPAKE2+ verifier computed here (validated against the Matter test vector), and manual + QR codes in the response. |
 | `discover` / `discover_commissionable_nodes` | ✅ | Browses `_matterc._udp` directly and reports the full TXT record: discriminator, vendor, product, device type and name, pairing hint and instruction, MRP intervals, TCP support, addresses. Filters are applied to the results. |
@@ -98,31 +98,41 @@ even when that command returns an error.
 
    `crate::monitor` and `api::interaction::refresh_endpoint` are the two places
    that change when a client-side subscription receiver exists.
-2. **Bluetooth commissioning.** Devices must already be on the IP network. Two
-   separate pieces are missing, and only one of them is ours:
+2. **Bluetooth commissioning is Linux-only, and has never run on hardware.**
+   `commission_with_code` scans over Bluetooth when mDNS finds nothing. The
+   device is reached over BTP, handed its Wi-Fi or Thread credentials over the
+   PASE session between AddNOC and CASE, and then resolved over mDNS once it
+   has joined its network. Which credentials are sent is decided by the
+   device's `NetworkCommissioning` feature map rather than by what happens to
+   be stored, and each refusal (`AuthFailure`, `NetworkNotFound`,
+   `UnsupportedSecurity`, `IPV6Failed`) is reported as itself.
 
-   - **Transport.** rs-matter *does* implement BTP over GATT in the Central
-     (commissioner) role, with `scan` / `run_central` backends for BlueZ —
-     either the `bluer` crate or a direct `zbus` one. Both are
-     `target_os = "linux"`, so this works on the Linux target but not on macOS,
-     which would need a CoreBluetooth backend rs-matter does not have. Wiring
-     the existing Linux support into the actor is a contained job.
-   - **Network provisioning.** rs-matter's commissioner runs ArmFailSafe →
-     CSRRequest → AddTrustedRootCertificate → AddNOC → CASE →
-     CommissioningComplete and never touches the NetworkCommissioning cluster.
-     A factory-fresh Wi-Fi or Thread device commissioned over Bluetooth has to
-     be handed credentials over the PASE session before it can join the network
-     and reach CASE. The credentials are already stored
-     (`set_wifi_credentials` / `set_thread_dataset`) and the cluster registry
-     already knows the commands; the invoke sequence between AddNOC and CASE is
-     what has to be written.
+   Three limits:
 
-   Until both land, `server_info.bluetooth_enabled` stays `false`, which is the
-   honest answer for this build.
-3. **Thread diagnostics.** Border Routers are discovered, but collecting
+   - **Linux only.** rs-matter's BTP Central backends are `target_os =
+     "linux"`. macOS would need a CoreBluetooth backend that does not exist,
+     and a plain CLI binary could not use one without an app bundle and
+     entitlements. `server_info.bluetooth_enabled` reports what the host can
+     actually do: feature compiled in, Linux, and BlueZ offering an adapter.
+   - **The probe does not prove permission.** It asks BlueZ for an adapter,
+     which is normally readable by anyone; starting discovery and connecting
+     usually are not. A container running as uid 65532 needs the host's
+     `bluetooth` group for those, so `bluetooth_enabled` can be `true` and
+     commissioning still be refused. The compose file says how.
+   - **No hardware run.** Every part of this is verified by compilation only.
+     It has never commissioned a real device.
+3. **A Bluetooth-commissioned node records no IP address.**
+   `get_node_ip_addresses` returns `[]` for it. rs-matter resolves the
+   operational address inside `complete_via_case_operational` and does not
+   expose it, and a Bluetooth MAC is not an operational address — storing one
+   would be wrong permanently, since nothing re-resolves that field after
+   commissioning. Closing this means browsing `_matter._tcp` for the node's
+   operational instance, which `matter::mdns_browser` is already equipped to
+   do.
+4. **Thread diagnostics.** Border Routers are discovered, but collecting
    per-node diagnostics from one needs a MeshCoP (CoAP/DTLS) or OTBR REST
    client.
-4. **OTA distribution.** Update *discovery* is complete — the ledger is queried
+5. **OTA distribution.** Update *discovery* is complete — the ledger is queried
    and local uploads are stored — but serving an image to a device needs an OTA
    Provider cluster server and a BDX transfer, which are not implemented. If the
    ledger offers an update, a client will show it and installing it will fail
@@ -131,11 +141,11 @@ even when that command returns an error.
    Note that a Matter update is not the same thing as a vendor update: a device
    can be current in the ledger while the vendor's own app offers newer
    firmware over its own channel, which Matter cannot see.
-5. **WebRTC.** Not supported by rs-matter.
-6. **Epoch-typed attributes.** matter.js converts `epoch-s`/`epoch-us`
+6. **WebRTC.** Not supported by rs-matter.
+7. **Epoch-typed attributes.** matter.js converts `epoch-s`/`epoch-us`
    attributes to Unix time using the cluster schema. Values here are reported as
    the device sent them (Matter epoch).
-7. **Nested command payload fields.** Top-level payload fields resolve by name;
+8. **Nested command payload fields.** Top-level payload fields resolve by name;
    fields inside a nested struct must be addressed by their numeric TLV tag.
 
 ## Hardware validation
@@ -170,7 +180,7 @@ it cannot map to one release.
 cargo test --manifest-path server/Cargo.toml
 ```
 
-212 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
+215 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
 wire-naming registry, the SPAKE2+ verifier against the Matter test vector, the
 mDNS browser's message parsing, the update-ledger rules, storage and restart
 recovery, every command handler, and 18 end-to-end contract tests over a real

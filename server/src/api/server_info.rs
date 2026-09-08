@@ -106,14 +106,21 @@ pub async fn set_loglevel(args: &Args, context: CallContext<'_>) -> ApiResult {
 /// The protocol has `critical` and `notice`, which `log` does not; they fold
 /// onto the nearest neighbour rather than being rejected.
 fn apply_console_log_level(level: &str) {
-    let filter = match level {
+    log::set_max_level(level_filter(level));
+}
+
+/// Map a protocol log level onto a `log` filter.
+///
+/// Shared with startup so the level named on the command line and the level a
+/// client sets mean the same thing.
+pub fn level_filter(level: &str) -> log::LevelFilter {
+    match level {
         "critical" | "error" => log::LevelFilter::Error,
         "warning" => log::LevelFilter::Warn,
         "notice" | "info" => log::LevelFilter::Info,
         "debug" => log::LevelFilter::Debug,
         _ => log::LevelFilter::Info,
-    };
-    log::set_max_level(filter);
+    }
 }
 
 pub async fn set_wifi_credentials(args: &Args, context: CallContext<'_>) -> ApiResult {
