@@ -26,9 +26,10 @@ docker compose up -d
 docker compose logs -f
 ```
 
-That pulls `ghcr.io/mrfyda/rs-matter-server:latest`, the newest release — see
-[Versions and releases](#versions-and-releases) to pin a series or a digest
-instead. To run your own build, `docker build --platform linux/arm64 -t
+That pulls `ghcr.io/mrfyda/rs-matter-server:latest`, the newest release, in
+the host's architecture — `linux/amd64` and `linux/arm64` are both published
+under every tag. See [Versions and releases](#versions-and-releases) to pin a
+series or a digest instead. To run your own build, `docker build -t
 rs-matter-server .` and point `image:` at that tag.
 
 State lives in a named volume, so there is nothing to create or chown first —
@@ -49,8 +50,9 @@ neither of which survives Docker's bridge NAT.
 Building needs a builder with roughly 4 GB of RAM and a few GB of free disk —
 rs-matter's generated cluster code is large enough that a single `rustc` wants
 more than 2 GB on its own. `--build-arg CARGO_JOBS=1` reduces peak memory at
-the cost of build time. An arm64 host with that much memory builds it
-natively without trouble, so cross-building is optional.
+the cost of build time. A host with that much memory builds its own
+architecture without trouble; building for the other one under QEMU is slow
+enough that pulling the published image is usually the better trade.
 
 Bluetooth commissioning raises that bar sharply: rs-matter with the `zbus`
 feature needs well over 8 GB in a single `rustc`, which no `CARGO_JOBS` value
@@ -233,6 +235,11 @@ compatibility, a patch is not meant to.
 | `latest`         | the newest release                           |
 | `main`           | the same, for anyone already pulling it      |
 | `sha-1a2b3c4`    | the build from that commit                   |
+
+Every tag covers `linux/amd64` and `linux/arm64`, so `docker pull` gets the
+host's architecture without being told which. Each is compiled on a runner of
+that architecture and the two are joined under one tag — emulated builds are
+slow enough to be impractical for a crate this size.
 
 No bare `0` tag is published. While the major is 0 a minor bump may break the
 API, so a tag moving across minors would promise a compatibility that does not

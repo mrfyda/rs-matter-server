@@ -1,5 +1,10 @@
-# Build for arm64 Linux with:
-#   docker build --platform linux/arm64 -t rs-matter-server .
+# Build for the host's architecture with:
+#   docker build -t rs-matter-server .
+#
+# The published image covers linux/amd64 and linux/arm64, each built natively.
+# A `--platform` other than the host's goes through QEMU, where rs-matter takes
+# long enough to compile that building on a machine of that architecture — or
+# pulling the published image — is almost always the better trade.
 #
 # The file deliberately avoids BuildKit-only syntax so it also builds with the
 # classic builder.

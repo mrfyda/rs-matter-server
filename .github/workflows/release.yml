@@ -10,6 +10,13 @@
 # whose tests fail is never released. Nothing downstream re-triggers this: an
 # event caused by GITHUB_TOKEN — the tag and the release below — does not start
 # a new workflow run, so there is no loop to guard against.
+#
+# Three jobs. `version` settles what is being released, `build` compiles the
+# image once per architecture on a runner of that architecture, and `release`
+# joins the two into one multi-platform tag. The split is what makes a second
+# architecture affordable: building either one under QEMU takes long enough to
+# be impractical — rs-matter is a large crate and emulated rustc is slow — and
+# two native runners cannot contribute to a single build.
 name: Release
 
 on:
@@ -29,33 +36,33 @@ concurrency:
   group: release
   cancel-in-progress: false
 
-permissions:
-  contents: write
-  packages: write
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  # A workflow_run event's own context points at the default branch, not at
+  # what CI actually tested, so the commit is taken from the event payload.
+  HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+  HEAD_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
 
 jobs:
-  release:
-    name: Publish and release (linux/arm64)
+  version:
+    name: Derive the version
     # Only a CI run that passed, and only one from a push: a CI run started by
-    # hand is a re-check of a commit that has already had its release.
+    # hand is a re-check of a commit that has already had its release. The
+    # guard lives here alone — a skipped job skips everything that needs it.
     if: |
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push')
-    # A native arm64 runner. Building this under QEMU takes long enough to be
-    # impractical: rs-matter is a large crate and emulated rustc is slow.
-    # These runners are free for public repositories.
-    #
-    # The image targets arm64 Linux, so only that platform is built. To add
-    # amd64, run this job as a matrix over both runners and merge the manifests.
-    runs-on: ubuntu-24.04-arm
-    env:
-      IMAGE: ghcr.io/${{ github.repository }}
-      # A workflow_run event's own context points at the default branch, not at
-      # what CI actually tested, so the commit is taken from the event payload.
-      HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
-      HEAD_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Derived once and handed down. Two build jobs each running the script
+    # could disagree — a tag landing between them is all it would take — and
+    # the version is baked into the binary, so they must agree.
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      image_tags: ${{ steps.version.outputs.image_tags }}
     steps:
       - name: Releases come from main
         run: |
@@ -83,6 +90,34 @@ jobs:
           cat "$RUNNER_TEMP/version"
           cat "$RUNNER_TEMP/version" >> "$GITHUB_OUTPUT"
 
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      # A release needs both architectures, so one failing does cost the run —
+      # but cancelling the other buys nothing. The cache is written when a
+      # build finishes, so a cancelled arm64 build would make the retry
+      # recompile rs-matter from scratch on top of whatever broke amd64.
+      fail-fast: false
+      matrix:
+        include:
+          # Native runners on both sides, each 4 cores and 16 GB, and both
+          # free for public repositories.
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.HEAD_SHA }}
+
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -93,10 +128,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v7
-        # CARGO_JOBS: the runner has 4 cores and 16 GB. rs-matter with the
+        # CARGO_JOBS: both runners have 4 cores and 16 GB. rs-matter with the
         # `zbus` feature needs well over 8 GB in a single rustc, so letting
         # cargo start one per core gets the compiler OOM-killed. Two fits.
         # VERSION: so the binary reports the version its image is tagged with.
@@ -109,34 +144,49 @@ jobs:
         # this workflow's own context — the default branch — instead of the
         # commit being released. No value may contain a comma: these lists are
         # newline-delimited, but not every one of the action's inputs is.
+        #
+        # No tags, and `push-by-digest`: each architecture is pushed as an
+        # image nothing yet points at, and the release job below is what gives
+        # the pair a name. Tagging here would instead have whichever job
+        # finished second quietly replace the other architecture's image.
+        #
+        # The cache is scoped per architecture. `type=gha` otherwise writes
+        # every build to one key, so the two jobs would spend their runs
+        # evicting each other's layers and neither would ever hit.
         with:
           context: .
-          platforms: linux/arm64
-          push: true
+          platforms: ${{ matrix.platform }}
           build-args: |
             CARGO_JOBS=2
-            VERSION=${{ steps.version.outputs.version }}
-          tags: ${{ steps.version.outputs.image_tags }}
+            VERSION=${{ needs.version.outputs.version }}
           labels: |
             org.opencontainers.image.title=rs-matter-server
             org.opencontainers.image.description=A Matter controller server in Rust speaking the matterjs-server API
-            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
             org.opencontainers.image.revision=${{ env.HEAD_SHA }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.licenses=Apache-2.0
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
 
       - name: Smoke test the image
         # Proves the binary in the image actually runs on this architecture,
         # rather than only that it compiled, and that the version it reports is
-        # the one the image is tagged with. `--health-check` against a port
-        # with nothing behind it must fail; `--help` must succeed.
+        # the one the image will be tagged with. `--health-check` against a
+        # port with nothing behind it must fail; `--help` must succeed.
+        #
+        # Addressed by digest, there being no tag yet. A digest names one
+        # architecture's image, and this runner is that architecture — which is
+        # the whole reason the build is split this way.
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
-          image="$IMAGE:${{ steps.version.outputs.version }}"
+          image="$IMAGE@$DIGEST"
           docker run --rm "$image" --help > /dev/null
           reported=$(docker run --rm "$image" --version)
-          expected="rs-matter-server ${{ steps.version.outputs.version }}"
+          expected="rs-matter-server $VERSION"
           if [ "$reported" != "$expected" ]; then
             echo "::error::image reports '$reported', expected '$expected'"
             exit 1
@@ -145,18 +195,122 @@ jobs:
             echo "::error::health check unexpectedly succeeded with no server running"
             exit 1
           fi
-          echo "image runs, reports $reported, and its health check fails correctly"
+          echo "${{ matrix.platform }} image runs, reports $reported, and its health check fails correctly"
+
+      - name: Export the digest
+        # An empty file named after the digest. The release job needs the two
+        # digests and nothing else, and a matrix job cannot return one through
+        # `outputs`: every leg writes the same key, so the last to finish would
+        # be the only one heard.
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - name: Upload the digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          # Scaffolding between two jobs of one run; it has no life after it.
+          retention-days: 1
+
+  release:
+    name: Publish and release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      # Multiline, so it is read out of the environment rather than pasted
+      # into the script, where the extra lines would become extra commands.
+      IMAGE_TAGS: ${{ needs.version.outputs.image_tags }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Download the digests
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Join the architectures under the release tags
+        id: merge
+        # No layer is pushed here: the images are already in the registry and
+        # this writes the index that points at both, once per tag.
+        #
+        # The annotations repeat the labels the build job set. A label lives in
+        # an image's config, which is per architecture, so the index created
+        # here would otherwise carry no metadata at all — and the source
+        # annotation is what links the GHCR package back to this repository.
+        #
+        # `shell: bash` for pipefail, which the default shell leaves off.
+        shell: bash
+        run: |
+          tags=()
+          while IFS= read -r tag; do
+            if [ -n "$tag" ]; then tags+=(--tag "$tag"); fi
+          done <<< "$IMAGE_TAGS"
+
+          sources=()
+          for digest in "$RUNNER_TEMP"/digests/*; do
+            sources+=("$IMAGE@sha256:$(basename "$digest")")
+          done
+          echo "joining ${sources[*]}"
+
+          docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.title=rs-matter-server" \
+            --annotation "index:org.opencontainers.image.description=A Matter controller server in Rust speaking the matterjs-server API" \
+            --annotation "index:org.opencontainers.image.version=$VERSION" \
+            --annotation "index:org.opencontainers.image.revision=$HEAD_SHA" \
+            --annotation "index:org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            --annotation "index:org.opencontainers.image.licenses=Apache-2.0" \
+            "${tags[@]}" "${sources[@]}"
+
+          digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{.Manifest.Digest}}')
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: The tag resolves to both architectures
+        # What the per-architecture smoke tests cannot see: that the index is
+        # complete. A half-merged tag pulls fine on the machine that happens to
+        # match and fails on every other one.
+        #
+        # Attestation descriptors ride in the same index under a platform of
+        # `unknown/unknown`; they are not architectures and are skipped.
+        shell: bash
+        run: |
+          platforms=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' \
+            | jq -r '.manifests[].platform | select(.os != "unknown") | .os + "/" + .architecture' \
+            | sort | paste -sd, -)
+          if [ "$platforms" != "linux/amd64,linux/arm64" ]; then
+            echo "::error::$IMAGE:$VERSION resolves to [$platforms], expected linux/amd64,linux/arm64"
+            exit 1
+          fi
+          echo "$IMAGE:$VERSION resolves to $platforms"
 
       - name: Cut the release
-        # Last, and only once the image is pushed and proven: a release that
-        # points at an image nobody can pull is worse than no release. The
-        # reverse gap is harmless — if this workflow dies before here, no tag
-        # exists, so the next run computes the same version and overwrites the
-        # image tags it had already pushed.
+        # Last, and only once the images are pushed, joined and proven: a
+        # release that points at an image nobody can pull is worse than no
+        # release. The reverse gap is harmless — if this workflow dies before
+        # here, no tag exists, so the next run computes the same version and
+        # overwrites the image tags it had already pushed.
         #
         # `gh` creates the tag itself, from the commit CI tested.
         run: |
-          version=${{ steps.version.outputs.version }}
           # printf rather than a heredoc: a heredoc body would carry this
           # file's indentation into the notes, where four leading spaces make
           # Markdown a code block.
@@ -164,15 +318,15 @@ jobs:
             '### Container image' \
             '' \
             '```' \
-            "docker pull $IMAGE:$version" \
+            "docker pull $IMAGE:$VERSION" \
             '```' \
             '' \
-            "\`linux/arm64\`, digest \`${{ steps.build.outputs.digest }}\`." \
-            "\`$IMAGE:${version%.*}\` follows this series and \`:latest\` follows every" \
+            "\`linux/amd64\` and \`linux/arm64\`, digest \`${{ steps.merge.outputs.digest }}\`." \
+            "\`$IMAGE:${VERSION%.*}\` follows this series and \`:latest\` follows every" \
             'release; pin the digest for a build that can never move.')
           # The commit list underneath these notes is generated by GitHub.
-          gh release create "${{ steps.version.outputs.tag }}" \
+          gh release create "${{ needs.version.outputs.tag }}" \
             --target "$HEAD_SHA" \
-            --title "${{ steps.version.outputs.tag }}" \
+            --title "${{ needs.version.outputs.tag }}" \
             --generate-notes \
             --notes "$notes"
