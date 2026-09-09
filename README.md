@@ -26,8 +26,9 @@ docker compose up -d
 docker compose logs -f
 ```
 
-That pulls `ghcr.io/mrfyda/rs-matter-server:latest`, published by CI. To run
-your own build instead, `docker build --platform linux/arm64 -t
+That pulls `ghcr.io/mrfyda/rs-matter-server:latest`, the newest release — see
+[Versions and releases](#versions-and-releases) to pin a series or a digest
+instead. To run your own build, `docker build --platform linux/arm64 -t
 rs-matter-server .` and point `image:` at that tag.
 
 State lives in a named volume, so there is nothing to create or chown first —
@@ -58,7 +59,8 @@ on a 16 GB runner. To build the image on a smaller machine, leave it out with
 `--build-arg CARGO_FEATURES=`; the result behaves exactly as a host with no
 adapter does.
 
-The image is built and published by CI on every push to `main`.
+The image is built and released by CI from every commit that lands on
+`main` and passes its tests — see [Versions and releases](#versions-and-releases).
 
 ### Running it directly
 
@@ -108,6 +110,7 @@ Every option is a flag or an environment variable.
 | `--disable-bluetooth` | `DISABLE_BLUETOOTH` | off | Turn off Bluetooth commissioning where an adapter exists |
 | `--enable-test-net-dcl` | `ENABLE_TEST_NET_DCL` | off | Also query the CSA test ledger |
 | `--health-check` | — | — | Probe a running server and exit; used by the container health check |
+| `--version` | — | — | Print the version and exit |
 
 ## Endpoints
 
@@ -212,6 +215,52 @@ what was already there.
 
 `STORAGE_PATH` holds fabric signing material. Treat it like a private key —
 back it up, and do not commit it.
+
+## Versions and releases
+
+Every commit that lands on `main` and passes CI is released: the version is
+derived, the image is published, and a GitHub Release is cut listing the
+commits since the last one. Nothing is tagged by hand, and a commit whose
+tests fail is never released.
+
+Versions are semver, and the project is pre-1.0: a minor bump may break
+compatibility, a patch is not meant to.
+
+| Image tag        | Points at                                    |
+| ---------------- | -------------------------------------------- |
+| `0.1.4`          | that release, permanently                    |
+| `0.1`            | the newest patch of that series              |
+| `latest`         | the newest release                           |
+| `main`           | the same, for anyone already pulling it      |
+| `sha-1a2b3c4`    | the build from that commit                   |
+
+No bare `0` tag is published. While the major is 0 a minor bump may break the
+API, so a tag moving across minors would promise a compatibility that does not
+exist. From 1.0 on, `1` is published and follows that major.
+
+Every release is a patch bump. To release a minor or major instead, bump
+`version` in `server/Cargo.toml` and commit it — the next release takes that
+version, and the automatic patches resume from there. The lockfile records
+that version too, so refresh it in the same commit:
+
+```bash
+cargo metadata --manifest-path server/Cargo.toml --format-version 1 > /dev/null
+```
+
+That manifest version is the floor of the series rather than the released
+version: the patch comes from the tag history at build time, and CI passes the
+result into the build, so `rs-matter-server --version` and the `sdk_version`
+Home Assistant displays both report exactly what the image is tagged with. A
+build that is not a release — anything built locally — reports the manifest
+version.
+
+The `schema_version` the protocol reports (13) is matterjs-server's and has
+nothing to do with this: it says which client protocol is spoken, not which
+release is running.
+
+The mechanics are [tools/next_version.py](tools/next_version.py), whose rules
+are covered by `--self-test` in CI, and
+[.github/workflows/release.yml](.github/workflows/release.yml).
 
 ## Development
 

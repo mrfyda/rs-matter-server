@@ -15,7 +15,11 @@ use rs_matter_server::storage::{ConfigStore, NodeStore};
 use rs_matter_server::ws::{self, ServerConfig};
 
 #[derive(Parser, Debug)]
-#[command(name = "rs-matter-server", about = "Rust Matter controller server")]
+#[command(
+    name = "rs-matter-server",
+    version = rs_matter_server::api::VERSION,
+    about = "Rust Matter controller server"
+)]
 struct Args {
     /// Address the WebSocket and HTTP endpoints listen on.
     #[arg(long, env = "LISTEN_ADDRESS", default_value = "0.0.0.0:5580")]

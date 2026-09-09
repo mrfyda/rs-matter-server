@@ -9,9 +9,13 @@ on:
 # A newer push to the same branch makes the in-flight run irrelevant.
 # Keyed on the event as well as the ref: a manually triggered flake hunt must
 # not cancel the CI run for a push to the same branch.
+#
+# Main is the exception. Passing here is what releases a commit (see
+# release.yml), so cancelling a run on main would silently skip that commit's
+# release rather than merely delay a test result.
 concurrency:
   group: ci-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
@@ -40,6 +44,18 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: server
+
+      - name: The release version rules hold
+        # release.yml derives every released version from this script, and a
+        # bad patch number is not something to discover mid-release.
+        run: python3 tools/next_version.py --self-test
+
+      - name: The lockfile matches the manifest
+        # A minor or major release is made by bumping the manifest version,
+        # which also has to be recorded in Cargo.lock. Without this, that half
+        # of the bump could be forgotten and only fail for whoever next builds
+        # with --locked.
+        run: cargo metadata --manifest-path server/Cargo.toml --format-version 1 --locked > /dev/null
 
       - name: Formatting
         run: cargo fmt --manifest-path server/Cargo.toml --all -- --check

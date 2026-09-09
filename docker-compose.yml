@@ -7,6 +7,8 @@
 services:
   rs-matter-server:
     container_name: rs-matter-server
+    # The newest release. `:0.1` follows that series and takes patches
+    # only; a digest from a release's notes never moves at all.
     image: ghcr.io/mrfyda/rs-matter-server:latest
     # Not optional. Matter reaches devices over IPv6 link-local addresses and
     # finds them with mDNS multicast, neither of which survives Docker's bridge

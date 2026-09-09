@@ -33,6 +33,21 @@ use crate::storage::{ConfigStore, NodeStore};
 /// How many Matter events `diagnostics` reports, matching the reference.
 const EVENT_HISTORY_SIZE: usize = 25;
 
+/// The version this build reports, over `--version` and in `sdk_version`.
+///
+/// Releases are cut from every commit that lands on main, so the patch number
+/// is derived from the tag history at build time rather than committed to the
+/// manifest — CI passes the result in as `RS_MATTER_SERVER_VERSION`, and the
+/// image is tagged with the same string. A build without it, which is any build
+/// that is not a release, reports the manifest's version: the floor of the
+/// series it belongs to.
+pub const VERSION: &str = match option_env!("RS_MATTER_SERVER_VERSION") {
+    // An unset build argument reaches this as an empty string rather than as
+    // nothing at all, because the Dockerfile always defines the variable.
+    Some(version) if !version.is_empty() => version,
+    _ => env!("CARGO_PKG_VERSION"),
+};
+
 /// Server capabilities and identity that do not change at runtime.
 #[derive(Clone, Debug)]
 pub struct RuntimeInfo {
@@ -55,10 +70,7 @@ pub struct RuntimeInfo {
 impl Default for RuntimeInfo {
     fn default() -> Self {
         Self {
-            sdk_version: format!(
-                "rs-matter-server/{} (rs-matter/0.3.0)",
-                env!("CARGO_PKG_VERSION")
-            ),
+            sdk_version: format!("rs-matter-server/{VERSION} (rs-matter/0.3.0)"),
             bluetooth_enabled: false,
             ble_proxy_enabled: false,
             ota_enabled: true,

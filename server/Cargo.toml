@@ -1,5 +1,9 @@
 [package]
 name = "rs-matter-server"
+# The floor of the series, not the version that gets released. Releases are cut
+# from every commit that lands on main and their patch number comes from the tag
+# history; bumping this is how a minor or major release is made. See "Versions
+# and releases" in README.md.
 version = "0.1.0"
 edition = "2021"
 

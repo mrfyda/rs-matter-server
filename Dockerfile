@@ -42,6 +42,16 @@ RUN mkdir -p src \
     && cargo build --release --features "${CARGO_FEATURES}" \
     && rm -rf src
 
+# The version to report over `--version` and in `sdk_version`. CI derives it
+# from the tag history and tags the image with the same string; see
+# tools/next_version.py. Left unset, the binary reports the manifest's version.
+#
+# Deliberately declared after the dependency build above: an ARG that changes
+# invalidates every layer that follows it, and this one changes on every
+# release, which would otherwise mean recompiling rs-matter each time.
+ARG VERSION=
+ENV RS_MATTER_SERVER_VERSION=${VERSION}
+
 COPY server/src ./src
 # COPY preserves the context's timestamps, which can predate the stub build;
 # without this cargo may consider the stub artifacts still current.

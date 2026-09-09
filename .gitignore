@@ -17,3 +17,6 @@ data/
 .DS_Store
 .idea/
 .vscode/
+
+# Byte-compiled tools/
+__pycache__/
