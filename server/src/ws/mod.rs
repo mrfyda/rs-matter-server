@@ -57,8 +57,9 @@ pub async fn run(
 
     let MatterController {
         matter,
-        icac_private_key,
+        issuer_private_key,
         storage_path,
+        origin: _,
     } = controller;
 
     let matter_socket =
@@ -93,7 +94,7 @@ pub async fn run(
     let actor_context = ActorContext {
         matter: &matter,
         crypto: &crypto,
-        icac_private_key: &icac_private_key,
+        issuer_private_key: &issuer_private_key,
         storage_path,
         #[cfg(all(feature = "bluetooth", target_os = "linux"))]
         btp: &ble.btp,

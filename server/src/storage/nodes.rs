@@ -149,6 +149,20 @@ impl NodeStore {
             .copied()
     }
 
+    /// Whether this node has never been read from.
+    ///
+    /// True for a node adopted from another server: it is known to be on the
+    /// fabric, but nothing has been read off the device yet. The first
+    /// successful poll of such a node is its interview, not an update.
+    pub fn awaiting_first_interview(&self, node_id: u64) -> bool {
+        self.nodes
+            .lock()
+            .unwrap()
+            .get(&node_id)
+            .map(|node| node.data.attributes.is_empty() && node.data.interview_version == 0)
+            .unwrap_or(false)
+    }
+
     pub fn upsert(&self, node: StoredNode) {
         self.nodes.lock().unwrap().insert(node.data.node_id, node);
     }

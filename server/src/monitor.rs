@@ -83,13 +83,21 @@ pub async fn run(context: Arc<ServerContext>, config: MonitorConfig) {
 
 /// Read one node and publish whatever changed.
 pub async fn poll_node(context: &Arc<ServerContext>, node_id: u64) {
+    // A node this server has never read — one adopted from another server —
+    // gets its first read treated as an interview rather than as a change.
+    let first_read = context.nodes.awaiting_first_interview(node_id);
+
     let paths = crate::matter::interaction::interview_paths();
     match context.matter.read_attributes(node_id, paths, false).await {
         Ok(attributes) => {
             if attributes.is_empty() {
                 return;
             }
-            publish_changes(context, node_id, attributes);
+            if first_read {
+                publish_first_interview(context, node_id, attributes);
+            } else {
+                publish_changes(context, node_id, attributes);
+            }
             mark_available(context, node_id, true);
         }
         Err(error) => {
@@ -97,6 +105,36 @@ pub async fn poll_node(context: &Arc<ServerContext>, node_id: u64) {
             mark_available(context, node_id, false);
         }
     }
+}
+
+/// Publish the first read of a node as a single complete update.
+///
+/// Not as the usual stream of per-attribute and per-endpoint events: a client
+/// that received this node with no attributes has no endpoints to attach them
+/// to, and the reference client drops attribute updates for endpoints it does
+/// not know. One `node_updated` carrying the whole node is what rebuilds it —
+/// and it is also the honest description of what happened, since the node was
+/// interviewed here for the first time.
+fn publish_first_interview(
+    context: &Arc<ServerContext>,
+    node_id: u64,
+    attributes: crate::protocol::model::AttributesData,
+) {
+    let Some(diff) = context
+        .nodes
+        .apply_interview(node_id, attributes, crate::api::now_iso())
+    else {
+        return;
+    };
+    log::info!(
+        "Node {} answered for the first time; interviewed {} attribute(s)",
+        node_id,
+        diff.node.attributes.len()
+    );
+    if let Err(error) = context.nodes.save() {
+        log::warn!("Could not persist the first interview: {}", error);
+    }
+    context.events.publish(Event::node_updated(&diff.node));
 }
 
 fn publish_changes(
@@ -194,6 +232,43 @@ mod tests {
         // Polling again with the same values is silent.
         publish_changes(&context, 1, attributes);
         assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_nodes_first_read_arrives_as_one_complete_update() {
+        // An adopted node: known to be on the fabric, never read from.
+        let context = test_context();
+        let mut imported =
+            StoredNode::new(MatterNodeData::new(7, "2023-11-14T22:13:20.000Z".into()));
+        imported.data.available = false;
+        context.nodes.upsert(imported);
+        let context = Arc::new(context);
+        let events = context.events.subscribe();
+
+        assert!(context.nodes.awaiting_first_interview(7));
+
+        let mut attributes = AttributesData::new();
+        attributes.insert("0/29/0".into(), json!([{ "0": 22, "1": 1 }]));
+        attributes.insert("1/6/0".into(), json!(true));
+        publish_first_interview(&context, 7, attributes);
+
+        // One event, carrying the whole node: a client that received this node
+        // with no attributes has no endpoints for per-attribute events to
+        // land on, and rebuilds it from this instead.
+        let event = events.try_recv().unwrap();
+        assert_eq!(event.name(), "node_updated");
+        assert_eq!(event.payload["data"]["node_id"], json!(7));
+        assert_eq!(event.payload["data"]["attributes"]["1/6/0"], json!(true));
+        assert_eq!(event.payload["data"]["interview_version"], json!(1));
+        assert!(events.try_recv().is_err(), "exactly one event");
+
+        // And it is no longer a first read, so ordinary polling takes over.
+        assert!(!context.nodes.awaiting_first_interview(7));
+        assert_eq!(
+            context.nodes.get(7).unwrap().date_commissioned,
+            "2023-11-14T22:13:20.000Z",
+            "the commissioning date is history, not something an interview sets"
+        );
     }
 
     #[test]

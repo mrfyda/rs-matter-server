@@ -5,11 +5,13 @@
 //! - `protocol` — the wire contract: envelopes, models, events, paths
 //! - `api`      — command handlers, one module per area of the protocol
 //! - `matter`   — rs-matter: the controller actor, commissioning, TLV codec
+//! - `migrate`  — reading a matterjs-server installation into that state
 //! - `storage`  — persistent state the protocol promises to survive a restart
 //! - `ws`       — the listener, connection lifecycle, and HTTP endpoints
 
 pub mod api;
 pub mod matter;
+pub mod migrate;
 pub mod monitor;
 pub mod protocol;
 pub mod storage;

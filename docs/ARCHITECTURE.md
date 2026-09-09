@@ -28,11 +28,23 @@ WebSocket / HTTP client
   Model client, the TLV↔JSON codec, the cluster registry, the mDNS browser, the
   SPAKE2+ verifier, the update-ledger client.
 - `server/src/storage/` — nodes, credentials, fabric label, node-id counter.
+- `server/src/migrate/` — reading a matterjs-server storage directory into that
+  state: `value` decodes matter.js's tagged JSON, `store` normalises its three
+  storage drivers into one context/key map, `model` extracts the fabric,
+  nodes and settings, and `mod` writes them. Read-only towards the source.
 - `server/src/monitor.rs` — attribute polling; the single place that changes if
   rs-matter gains a client-side subscription receiver.
 - `server/src/ws/` — listener, connection lifecycle, HTTP endpoints.
 
 ## Design decisions
+
+**An import is a first start, not a mode.** `--import-matterjs` only supplies
+the fabric that a first start would otherwise create; every later start takes
+the ordinary path and the flag is ignored with a log line. That keeps the
+migration out of the running server entirely — there is no importing state, no
+half-migrated server, and a flag left in a compose file cannot reset anything.
+The source is read before this server's storage is touched, so a source that
+cannot be read leaves nothing behind to clean up before retrying.
 
 **One actor owns Matter.** `Matter` is `!Send` — it holds a
 `dyn DeviceAttestation` and its transport state — so it stays on one executor

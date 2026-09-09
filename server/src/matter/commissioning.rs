@@ -143,7 +143,7 @@ pub fn parse_pairing_code(code: &str) -> Result<PairingInfo, ApiError> {
 pub async fn commission_at_address<C: Crypto>(
     matter: &Matter<'_>,
     crypto: &C,
-    icac_private_key: &CanonPkcSecretKey,
+    issuer_private_key: &CanonPkcSecretKey,
     peer_addr: Address,
     passcode: u32,
     node_id: u64,
@@ -161,8 +161,13 @@ pub async fn commission_at_address<C: Crypto>(
     let mut noc_generator = matter
         .with_state(|state| {
             let fabric = state.fabrics.fabric(fab_idx)?;
+            // Two shapes of fabric reach this line. One created here has an
+            // ICAC and signs with the ICAC key; one imported from
+            // matterjs-server usually has none and signs with the root key.
+            // rs-matter picks the issuer from whether `icac` is empty, so both
+            // work as long as the stored key is the one that matches.
             NocGenerator::create(
-                icac_private_key.reference(),
+                issuer_private_key.reference(),
                 fabric.root_ca(),
                 fabric.icac(),
                 &mut noc_buf,

@@ -82,6 +82,34 @@ Event gating matches the reference: nothing is delivered before
 require the connection to have issued the corresponding command — which latches
 even when that command returns an error.
 
+## Migration
+
+`--import-matterjs` adopts a matterjs-server installation's fabric so that its
+devices do not have to be re-commissioned. What crosses over, and what does
+not:
+
+| matter.js | here | |
+|---|---|---|
+| `Fabric.Config` — root certificate, controller NOC, ICAC, operational key, IPK, fabric and node ids | the rs-matter fabric | ✅ Installed as-is; rs-matter re-derives the node, fabric and compressed fabric ids from the certificates and cross-checks them against what the source announced. |
+| the CA's root key, or its intermediate key and certificate | `controller-icac-key.bin` | ✅ Both PKI shapes work: rs-matter signs device NOCs with the root directly when there is no ICAC. |
+| `nodes/commissionedNodes` and the per-node commissioning state | `nodes.json` | ✅ Node ids, commissioning dates, last known addresses, and the fabric index the device assigned this controller. |
+| the `config` namespace | `config.json` | ✅ Fabric label, node-id counter, and the Wi-Fi and Thread credential lists. |
+| the cached attribute values | — | ⚠️ Not copied. matter.js stores them decoded into its own object model; each node is re-read instead, on its first poll after startup, and reports unavailable with no attributes until then. |
+| sessions and CASE resumption records | — | ❌ Dropped; a fresh CASE handshake replaces them. |
+| subscription state | — | ❌ Dropped; this server polls (gap 1 below). |
+
+The `wal`, `file` and `json` storage drivers are read; `sqlite` is not, and is
+reported with the command that converts it. The source directory is never
+written to, and the import is skipped once this server has a fabric, so the
+flag is safe to leave in a compose file.
+
+Two things this cannot verify without hardware, both stated plainly: that a
+device commissioned by matterjs-server accepts the imported identity, and that
+a device commissioned *after* the import accepts a NOC signed by the imported
+CA. Everything that decides those outcomes is asserted in `tests/migrate.rs`
+against certificates rs-matter generates, but the devices themselves are the
+only real proof.
+
 ## Known gaps
 
 1. **Device-initiated subscriptions.** rs-matter 0.3 can *establish* a
@@ -180,11 +208,12 @@ it cannot map to one release.
 cargo test --manifest-path server/Cargo.toml
 ```
 
-215 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
+254 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
 wire-naming registry, the SPAKE2+ verifier against the Matter test vector, the
 mDNS browser's message parsing, the update-ledger rules, storage and restart
-recovery, every command handler, and 18 end-to-end contract tests over a real
-WebSocket (including the HTTP endpoints).
+recovery, every command handler, 7 matterjs-server import tests that build a
+source directory from real certificates and adopt it, and 18 end-to-end
+contract tests over a real WebSocket (including the HTTP endpoints).
 
 Two of those are `#[ignore]`d and need `--ignored` to run: one queries the CSA
 ledger over the network, and `fabric_creation_is_not_flaky` loops fabric

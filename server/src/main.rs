@@ -1,12 +1,15 @@
 //! Binary entry point.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
 
 use rs_matter_server::api::RuntimeInfo;
-use rs_matter_server::matter::controller::{init_controller, FabricConfig};
+use rs_matter_server::matter::controller::{
+    init_controller_with_import, FabricConfig, FabricOrigin,
+};
 use rs_matter_server::monitor::MonitorConfig;
 use rs_matter_server::storage::{ConfigStore, NodeStore};
 use rs_matter_server::ws::{self, ServerConfig};
@@ -21,6 +24,25 @@ struct Args {
     /// Directory holding the fabric, node, and configuration state.
     #[arg(long, env = "STORAGE_PATH", default_value = "/data")]
     storage_path: String,
+
+    /// Adopt the fabric, nodes and settings of a matterjs-server installation
+    /// on first start, so its devices do not have to be re-commissioned.
+    ///
+    /// Point this at that server's `--storage-path`. The directory is only
+    /// read; the import is skipped once this server has a fabric of its own,
+    /// so the flag is safe to leave in place.
+    #[arg(long, env = "IMPORT_MATTERJS")]
+    import_matterjs: Option<PathBuf>,
+
+    /// Which matter.js storage namespace holds the fabric to import. Only
+    /// needed for a multi-fabric source, where `server` is not the name.
+    #[arg(long, env = "IMPORT_MATTERJS_NAMESPACE")]
+    import_matterjs_namespace: Option<String>,
+
+    /// Report what `--import-matterjs` would adopt, then exit without
+    /// starting the server or writing anything.
+    #[arg(long, default_value_t = false)]
+    import_matterjs_dry_run: bool,
 
     #[arg(long, env = "LOG_LEVEL", default_value = "info")]
     log_level: String,
@@ -186,18 +208,49 @@ fn main() -> anyhow::Result<()> {
 
     rs_matter_server::storage::private::tighten_existing(std::path::Path::new(&args.storage_path));
 
-    let controller =
-        init_controller(&args.storage_path, &FabricConfig::default()).map_err(|e| {
-            anyhow::anyhow!(
-                "Could not initialize the Matter controller with storage at '{}': {:?}. \
+    // Read the source before touching our own storage: a source that cannot be
+    // imported must not leave a freshly created fabric of our own behind,
+    // because that is the state a retry would then refuse to import into.
+    let import = match &args.import_matterjs {
+        Some(source) => Some(rs_matter_server::migrate::read(
+            source,
+            args.import_matterjs_namespace.as_deref(),
+        )?),
+        None => None,
+    };
+
+    if args.import_matterjs_dry_run {
+        match &import {
+            Some(import) => print!("{}", import.summary()),
+            None => anyhow::bail!("--import-matterjs-dry-run needs --import-matterjs"),
+        }
+        return Ok(());
+    }
+
+    let controller = init_controller_with_import(
+        &args.storage_path,
+        &FabricConfig::default(),
+        import.as_ref().map(|import| &import.fabric),
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "Could not initialize the Matter controller with storage at '{}': {:?}. \
              That directory holds the fabric and must be writable by the user the \
              server runs as (uid 65532 in the container image).",
-                args.storage_path,
-                e
-            )
-        })?;
+            args.storage_path,
+            e
+        )
+    })?;
 
     let storage = std::path::Path::new(&args.storage_path);
+
+    // The node list and the settings belong to the fabric, so they are written
+    // only when the fabric itself was adopted.
+    if controller.origin == FabricOrigin::Imported {
+        if let Some(import) = &import {
+            rs_matter_server::migrate::apply_state(import, storage)?;
+        }
+    }
     let nodes = Arc::new(NodeStore::load(storage.join("nodes.json"))?);
     let config = Arc::new(ConfigStore::load(storage.join("config.json"))?);
 

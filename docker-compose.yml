@@ -39,6 +39,12 @@ services:
       # reverts. Where the bus cannot be reached, BLE proxy mode is the way in
       # — the radio lives elsewhere and the server needs no adapter at all.
       - /run/dbus:/run/dbus
+      # Migrating from matterjs-server: mount its storage directory read-only
+      # and set IMPORT_MATTERJS below. The first start adopts that fabric, so
+      # nothing has to be re-commissioned; later starts ignore it. Stop the
+      # other server first, and note the container runs as uid 65532, so the
+      # directory has to be readable by it.
+      # - /path/to/matter_server:/import:ro
     # There are two permission gates, and they are separate. Opening the bus
     # socket above is plain file permissions — it is normally mode 0666, so any
     # uid can connect. Sending to org.bluez is a D-Bus policy decision, and
@@ -60,6 +66,9 @@ services:
     #   POLL_INTERVAL_SECS: "30"
     #   # Pin the fabric label, ignoring clients that try to set it.
     #   DEFAULT_FABRIC_LABEL: Home
+    #   # Adopt a matterjs-server installation on first start. Pairs with the
+    #   # read-only mount above.
+    #   IMPORT_MATTERJS: /import
 
 volumes:
   rs-matter-data:

@@ -40,6 +40,9 @@ ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 
 # Utilities
 base64 = "0.22"
+# Gzip, for reading matterjs-server's compressed storage snapshots during an
+# import. `rust_backend` keeps this pure Rust — no zlib to cross-compile.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # `all` is required for set_reuse_port, which the Linux mDNS socket needs to
 # share port 5353 with the host's own responder.
 socket2 = { version = "0.5", features = ["all"] }

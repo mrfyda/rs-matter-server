@@ -20,6 +20,8 @@ use rs_matter::onboard::noc::NocGenerator;
 use rs_matter::persist::DirKvBlobStore;
 use rs_matter::Matter;
 
+use crate::migrate::ImportedFabric;
+
 /// Fabric configuration for the controller.
 #[derive(Clone, Debug)]
 pub struct FabricConfig {
@@ -38,7 +40,14 @@ impl Default for FabricConfig {
     }
 }
 
-const ICAC_PRIVATE_KEY_FILE: &str = "controller-icac-key.bin";
+/// Where the NOC-issuing key lives.
+///
+/// The name says ICAC because that is what a fabric created here uses, and
+/// installs in the field already have a file by that name. A fabric imported
+/// from matterjs-server usually has no ICAC and signs with its root key
+/// instead; that key goes in the same file, because what matters to every
+/// reader is that this is the key that signs certificates for devices.
+const ISSUER_PRIVATE_KEY_FILE: &str = "controller-icac-key.bin";
 
 /// Scratch space for the controller's CSR.
 ///
@@ -48,20 +57,52 @@ const ICAC_PRIVATE_KEY_FILE: &str = "controller-icac-key.bin";
 /// size that fits the common case.
 const CSR_BUF_LEN: usize = 512;
 
+/// Where the fabric this server is running on came from.
+///
+/// The caller needs this to know whether the rest of an import — the node list
+/// and the settings — should be written: they belong to the fabric, and
+/// writing them over the state of a server that already had one would lose
+/// data rather than migrate it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FabricOrigin {
+    /// Read back from this server's own storage.
+    Loaded,
+    /// Created here, on a first start with no storage.
+    Created,
+    /// Installed from a matterjs-server storage directory.
+    Imported,
+}
+
 /// Runtime state that must remain with the non-`Send` Matter object.
 ///
 /// rs-matter persists the fabric certificates and the controller operational
-/// key, but the ICAC private key is application-owned signing material. Keep a
-/// copy in a separate file so a restarted server can issue device NOCs.
+/// key, but the key that signs NOCs for devices is application-owned. Keep a
+/// copy in a separate file so a restarted server can go on commissioning.
 pub struct MatterController {
     pub matter: Matter<'static>,
-    pub icac_private_key: CanonPkcSecretKey,
+    pub issuer_private_key: CanonPkcSecretKey,
     pub storage_path: PathBuf,
+    pub origin: FabricOrigin,
 }
 
 /// Initialize (or create) the Matter fabric from persistent storage and load
-/// the application-owned ICAC signing key.
+/// the application-owned signing key.
 pub fn init_controller(storage_path: &str, config: &FabricConfig) -> Result<MatterController> {
+    init_controller_with_import(storage_path, config, None)
+}
+
+/// As [`init_controller`], but seeding a first start from another server's
+/// fabric instead of creating one.
+///
+/// The import is ignored — with a log line, not an error — when storage
+/// already holds a fabric. The flag that requests it lives in a compose file
+/// or a service unit and will be passed on every start after the first, so
+/// refusing to start would turn a successful migration into a boot loop.
+pub fn init_controller_with_import(
+    storage_path: &str,
+    config: &FabricConfig,
+    imported: Option<&ImportedFabric>,
+) -> Result<MatterController> {
     let matter = Matter::new(&TEST_DEV_DET, TEST_DEV_COMM, &TEST_DEV_ATT, 0);
 
     let storage_path = Path::new(storage_path);
@@ -73,30 +114,164 @@ pub fn init_controller(storage_path: &str, config: &FabricConfig) -> Result<Matt
     let kv_access = matter.kv(kv_store);
     matter.startup(kv_access)?;
 
-    let icac_private_key = if !matter.has_fabrics() {
-        let key = create_fabric(&matter, config)?;
-        persist_fabric(&matter, storage_path)?;
-        persist_icac_private_key(storage_path, &key)?;
-        log::info!("Created new Matter fabric at {}", storage_path.display());
-        key
-    } else {
+    let (issuer_private_key, origin) = if matter.has_fabrics() {
         log::info!(
             "Loaded existing Matter fabric from {}",
             storage_path.display()
         );
-        load_icac_private_key(storage_path)?
+        if imported.is_some() {
+            log::info!(
+                "Ignoring the requested matterjs-server import: {} already holds a fabric",
+                storage_path.display()
+            );
+        }
+        (load_issuer_private_key(storage_path)?, FabricOrigin::Loaded)
+    } else if let Some(imported) = imported {
+        let key = install_fabric(&matter, imported)?;
+        persist_fabric(&matter, storage_path)?;
+        persist_issuer_private_key(storage_path, &key)?;
+        log::info!(
+            "Imported the matterjs-server fabric (fabric id 0x{:016x}, controller node 0x{:016x}) into {}",
+            imported.fabric_id,
+            imported.node_id,
+            storage_path.display()
+        );
+        (key, FabricOrigin::Imported)
+    } else {
+        let key = create_fabric(&matter, config)?;
+        persist_fabric(&matter, storage_path)?;
+        persist_issuer_private_key(storage_path, &key)?;
+        log::info!("Created new Matter fabric at {}", storage_path.display());
+        (key, FabricOrigin::Created)
     };
 
     Ok(MatterController {
         matter,
-        icac_private_key,
+        issuer_private_key,
         storage_path: storage_path.to_path_buf(),
+        origin,
     })
 }
 
 /// Compatibility helper for callers that only need the Matter state.
 pub fn init_matter(storage_path: &str, config: &FabricConfig) -> Result<Matter<'static>> {
     Ok(init_controller(storage_path, config)?.matter)
+}
+
+/// Install a fabric read from another controller's storage.
+///
+/// Every value comes across unchanged — root certificate, the controller's own
+/// NOC and operational key, and the IPK — because that is the whole point: a
+/// device recognises its fabric by the root public key and grants admin to a
+/// specific controller node id, so an identical identity means already
+/// commissioned devices need not be touched. rs-matter re-derives the node id,
+/// the fabric id and the compressed fabric id from the certificates, and the
+/// operational IPK from the epoch key, so nothing that can be computed is
+/// carried over and trusted.
+fn install_fabric(matter: &Matter<'_>, imported: &ImportedFabric) -> Result<CanonPkcSecretKey> {
+    let crypto = default_crypto(OsRng, rs_matter::dm::devices::test::DAC_PRIVKEY);
+
+    let operational_key = CanonPkcSecretKey::try_from(imported.operational_key.as_slice())
+        .map_err(|e| anyhow::anyhow!("the imported operational key is unusable: {:?}", e))?;
+    let issuer_key = CanonPkcSecretKey::try_from(imported.issuer_key.as_slice())
+        .map_err(|e| anyhow::anyhow!("the imported issuing key is unusable: {:?}", e))?;
+    let mut epoch_key = CanonAeadKey::new();
+    if imported.ipk_epoch_key.len() != epoch_key.access().len() {
+        anyhow::bail!(
+            "the imported identity protection key is {} bytes, expected {}",
+            imported.ipk_epoch_key.len(),
+            epoch_key.access().len()
+        );
+    }
+    epoch_key
+        .access_mut()
+        .copy_from_slice(&imported.ipk_epoch_key);
+
+    let fab_idx = matter
+        .with_state(|state| {
+            state
+                .fabrics
+                .add(
+                    &crypto,
+                    operational_key.reference(),
+                    &imported.root_cert,
+                    &imported.noc,
+                    &imported.icac,
+                    Some(epoch_key.reference()),
+                    imported.vendor_id,
+                    imported.node_id,
+                )
+                .map(|fabric| fabric.fab_idx())
+        })
+        .map_err(|e| anyhow::anyhow!("installing the imported fabric: {:?}", e.code()))?;
+
+    // The identifiers rs-matter derived have to match what the source server
+    // was using, or the fabric is not the same fabric and every device on it
+    // would refuse us. Checking is cheap; discovering it against a device is
+    // not.
+    matter
+        .with_state(|state| -> Result<(), rs_matter::error::Error> {
+            let fabric = state.fabrics.fabric(fab_idx)?;
+            if let Some(expected) = imported.compressed_fabric_id {
+                if fabric.compressed_fabric_id() != expected {
+                    log::error!(
+                        "The imported certificates give compressed fabric id 0x{:016x}, but the \
+                     source server was announcing 0x{:016x}. Devices look this controller up \
+                     by that value, so importing it would leave them unreachable",
+                        fabric.compressed_fabric_id(),
+                        expected,
+                    );
+                    return Err(ErrorCode::InvalidData.into());
+                }
+            }
+            if fabric.node_id() != imported.node_id || fabric.fabric_id() != imported.fabric_id {
+                log::error!(
+                "The imported certificates describe node 0x{:016x} on fabric 0x{:016x}, but the \
+                 source server recorded node 0x{:016x} on fabric 0x{:016x}",
+                fabric.node_id(),
+                fabric.fabric_id(),
+                imported.node_id,
+                imported.fabric_id,
+            );
+                return Err(ErrorCode::InvalidData.into());
+            }
+            Ok(())
+        })
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "the imported certificates do not match the fabric they were stored with; \
+             the source storage is inconsistent and importing it would not work"
+            )
+        })?;
+
+    if !imported.label.is_empty() {
+        // A label longer than the spec allows is the source server's problem,
+        // not a reason to abandon the import.
+        if let Err(error) = matter.with_state(|state| {
+            state.fabrics.update_label(fab_idx, &imported.label)?;
+            Ok::<(), rs_matter::error::Error>(())
+        }) {
+            log::warn!(
+                "Could not carry over the fabric label '{}': {:?}",
+                imported.label,
+                error.code()
+            );
+        }
+    }
+
+    log::info!(
+        "Fabric imported: vendor=0x{:04x}, fabric=0x{:016x}, node=0x{:016x}, NOCs signed by the {}",
+        imported.vendor_id,
+        imported.fabric_id,
+        imported.node_id,
+        if imported.issuer_is_icac {
+            "intermediate CA"
+        } else {
+            "root CA"
+        }
+    );
+
+    Ok(issuer_key)
 }
 
 pub fn persist_fabric(matter: &Matter<'_>, storage_path: &Path) -> Result<()> {
@@ -110,25 +285,25 @@ pub fn persist_fabric(matter: &Matter<'_>, storage_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn persist_icac_private_key(storage_path: &Path, key: &CanonPkcSecretKey) -> Result<()> {
+fn persist_issuer_private_key(storage_path: &Path, key: &CanonPkcSecretKey) -> Result<()> {
     fs::create_dir_all(storage_path)
         .with_context(|| format!("creating storage directory {}", storage_path.display()))?;
-    let path = storage_path.join(ICAC_PRIVATE_KEY_FILE);
+    let path = storage_path.join(ISSUER_PRIVATE_KEY_FILE);
     fs::write(&path, key.access())
-        .with_context(|| format!("writing ICAC private key {}", path.display()))?;
+        .with_context(|| format!("writing the issuing private key {}", path.display()))?;
     Ok(())
 }
 
-fn load_icac_private_key(storage_path: &Path) -> Result<CanonPkcSecretKey> {
-    let path = storage_path.join(ICAC_PRIVATE_KEY_FILE);
+fn load_issuer_private_key(storage_path: &Path) -> Result<CanonPkcSecretKey> {
+    let path = storage_path.join(ISSUER_PRIVATE_KEY_FILE);
     let bytes = fs::read(&path).with_context(|| {
         format!(
-            "reading ICAC private key {}; existing fabrics created by an older build must be reset",
+            "reading the issuing private key {}; existing fabrics created by an older build must be reset",
             path.display()
         )
     })?;
     CanonPkcSecretKey::try_from(bytes.as_slice())
-        .map_err(|e| anyhow::anyhow!("invalid ICAC private key {}: {:?}", path.display(), e))
+        .map_err(|e| anyhow::anyhow!("invalid issuing private key {}: {:?}", path.display(), e))
 }
 
 /// How many times fabric creation is attempted before giving up.

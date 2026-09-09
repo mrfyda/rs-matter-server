@@ -97,6 +97,9 @@ Every option is a flag or an environment variable.
 |---|---|---|---|
 | `--listen` | `LISTEN_ADDRESS` | `0.0.0.0:5580` | WebSocket and HTTP listen address |
 | `--storage-path` | `STORAGE_PATH` | `/data` | Fabric, nodes, credentials, config |
+| `--import-matterjs` | `IMPORT_MATTERJS` | — | Adopt a matterjs-server installation on first start |
+| `--import-matterjs-namespace` | `IMPORT_MATTERJS_NAMESPACE` | — | Which storage namespace to import, for a multi-fabric source |
+| `--import-matterjs-dry-run` | — | — | Report what would be imported, then exit |
 | `--log-level` | `LOG_LEVEL` | `info` | `error`, `warning`, `info`, `debug` |
 | `--poll-interval-secs` | `POLL_INTERVAL_SECS` | `30` | How often a reachable node is re-read |
 | `--default-fabric-label` | `DEFAULT_FABRIC_LABEL` | — | Pin the fabric label, ignoring clients |
@@ -118,11 +121,92 @@ Every option is a flag or an environment variable.
 The protocol itself is documented by the reference server; this implementation
 is verified against it command by command in [PARITY.md](PARITY.md).
 
+## Migrating from matterjs-server
+
+Point the server at the storage directory the other server was using, and it
+adopts that fabric instead of creating one:
+
+```bash
+LISTEN_ADDRESS=0.0.0.0:5580 STORAGE_PATH=/data \
+  IMPORT_MATTERJS=/root/.matter_server \
+  ./server/target/release/rs-matter-server
+```
+
+**Nothing has to be re-commissioned.** A Matter device recognises its fabric by
+the root public key and grants administrative access to one controller node id,
+so this server presents the identity the devices already trust: the same root
+certificate, the same controller certificate and operational key, and the same
+IPK. Node ids, the fabric label, the node-id counter, and the Wi-Fi and Thread
+credentials come across too, so Home Assistant keeps its devices and entities.
+
+What it does *not* copy is the cached attribute values. matter.js stores those
+decoded into its own object model; the devices are the authority, so each node
+is read afresh instead. Until a node answers that first read it is reported
+unavailable and carries no attributes — normally a few seconds, and up to one
+poll interval. Sleepy devices take longer, exactly as they do after any restart.
+
+To see what it would take across without committing to anything:
+
+```bash
+./server/target/release/rs-matter-server \
+  --import-matterjs /root/.matter_server --import-matterjs-dry-run
+```
+
+```
+Namespace:              server
+Fabric id:              0x1122334455667788
+Controller node id:     0x000000000001b669 (112233)
+Fabric label:           Living Room
+Device NOCs signed by:  the root CA
+Nodes:                  2
+                        1 — 2 address(es), fabric index 3 on the device
+                        2 — 0 address(es)
+Wi-Fi credentials:      default (home-network), guest (guest-net)
+```
+
+Some details worth knowing before you run it:
+
+- **The source directory is only read.** Stop matterjs-server first, then start
+  this one. If you want to go back, point matterjs-server at that same
+  directory: it is byte for byte as it was.
+- **The import happens once.** After this server has a fabric of its own the
+  flag is ignored with a log line, so it is safe to leave in the compose file
+  or unit — there is no risk of a later restart resetting anything.
+- **Every file-based storage driver is read** — matter.js's current `wal`
+  format, the older one-file-per-key `file` format, and `json`. A directory written
+  by the `sqlite` driver has to be converted first: start matterjs-server once
+  with `MATTER_STORAGE_DRIVER=wal`, let it exit, then import.
+- **A bad path costs nothing.** The source is read before this server's storage
+  is touched, so a mistyped path fails with an error and leaves you able to
+  retry rather than with a fabric of our own to delete.
+- **Back up the source directory first anyway.** It holds the fabric's signing
+  material, and it is the only copy of the identity your devices trust.
+
+With Docker, mount the old data read-only and name it:
+
+```yaml
+services:
+  rs-matter-server:
+    volumes:
+      - matter-data:/data
+      - /path/to/matter_server:/import:ro
+    environment:
+      IMPORT_MATTERJS: /import
+```
+
+The container runs as uid 65532, so the mounted directory has to be readable by
+it — `:ro` plus world-readable, or match the ownership.
+
+If matterjs-server was itself migrated from the Python Matter Server, its
+certificates run through an intermediate CA. That works, and the intermediate
+key comes across so new devices can still be commissioned.
+
 ## What survives a restart
 
 Everything the protocol promises: the Matter fabric and its certificates, the
-ICAC signing key, the node list with interview results, Wi-Fi and Thread
-credentials, the fabric label, and the node-id counter. State is written
+key that signs certificates for newly commissioned devices, the node list with
+interview results, Wi-Fi and Thread credentials, the fabric label, and the
+node-id counter. State is written
 through a temporary file and renamed, so an interrupted write cannot truncate
 what was already there.
 
@@ -132,7 +216,7 @@ back it up, and do not commit it.
 ## Development
 
 ```bash
-cargo test --manifest-path server/Cargo.toml               # 215 tests
+cargo test --manifest-path server/Cargo.toml               # 254 tests
 cargo test --manifest-path server/Cargo.toml -- --ignored  # + the 2 ignored
 tools/linux-check.sh                                       # Linux-only paths
 tools/linux-check.sh --features bluetooth                  # needs >8 GB

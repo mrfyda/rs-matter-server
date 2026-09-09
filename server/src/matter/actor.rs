@@ -416,7 +416,7 @@ pub fn channel() -> (MatterHandle, Receiver<Request>) {
 pub struct ActorContext<'a, C: Crypto> {
     pub matter: &'a Matter<'a>,
     pub crypto: C,
-    pub icac_private_key: &'a CanonPkcSecretKey,
+    pub issuer_private_key: &'a CanonPkcSecretKey,
     pub storage_path: PathBuf,
     /// The BTP state machine the transport is already chained to. Commissioning
     /// needs it to pump the GATT connection while the flow runs.
@@ -727,7 +727,7 @@ async fn commission<C: Crypto + Clone>(
     let result = commission_at_address(
         context.matter,
         &context.crypto,
-        context.icac_private_key,
+        context.issuer_private_key,
         address,
         passcode,
         node_id,
@@ -794,7 +794,7 @@ async fn commission_over_ble<C: Crypto + Clone>(
             commission_at_address(
                 context.matter,
                 &context.crypto,
-                context.icac_private_key,
+                context.issuer_private_key,
                 Address::Btp(addr),
                 passcode,
                 node_id,
