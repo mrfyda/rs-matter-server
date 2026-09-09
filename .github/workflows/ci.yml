@@ -33,7 +33,7 @@ jobs:
     # only a Linux job compiles the code path the container actually ships.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install the toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -98,7 +98,7 @@ jobs:
       # A typecheck needs no debug info, and debug info is most of the memory.
       CARGO_PROFILE_DEV_DEBUG: 0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -121,7 +121,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
