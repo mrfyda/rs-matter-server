@@ -4,8 +4,11 @@ The contract this server implements is the WebSocket API of
 [`matter-js/matterjs-server`](https://github.com/matter-js/matterjs-server)
 at **schema version 13** (minimum supported 11) — the same API Home Assistant's
 Matter integration speaks. Shapes below come from the reference's own
-`docs/websockets_api.md` and `packages/ws-client/src/models/model.ts` rather
-than being inferred from traffic.
+[`docs/websockets_api.md`](https://github.com/matter-js/matterjs-server/blob/main/docs/websockets_api.md)
+and
+[`packages/ws-client/src/models/model.ts`](https://github.com/matter-js/matterjs-server/blob/main/packages/ws-client/src/models/model.ts)
+rather than being inferred from traffic. Both are public: anything below that
+says a shape is unknown is a shape nobody looked up.
 
 "Parity" here means the wire contract: message shapes, command names, error
 codes, lifecycle events, persistence, and observable behaviour. It does not
@@ -165,18 +168,19 @@ How these get closed, in what order, and what each one takes to verify is in
    Closing this means sending the same query from an IPv6 socket to `ff02::fb`
    and collecting both, which is additive — the IPv4 query is unaffected by an
    IPv6 one failing to send.
-4. **Thread diagnostics: the answer's shape is not known here.** Border
-   Routers are discovered and reported in the shape this doc's source
-   specifies. What `get_thread_diagnostics` should answer *with* is a
-   different matter: the empty answers are documented (`null` for one network,
-   `[]` for all) and implemented, but nothing in the reference material this
-   server was built from says what a populated one looks like — and this
-   project takes its shapes from that material rather than inventing them.
+4. **Thread diagnostics are not collected.** Border Routers are discovered and
+   reported; the per-node diagnostics behind them are not. The shape is
+   settled — `ThreadDiagnosticsBatch` and `ThreadDiagnosticsNode` in the
+   reference's `model.ts`, with an `extPanIdHex`-keyed batch, a `source` of
+   `meshcop` / `otbr-rest` / `none`, and a `partialReason` while a collection
+   is still filling in. What is missing is the collection itself: a MeshCoP
+   (CoAP/DTLS) client, which needs the `pskc` and `networkKey` from a stored
+   Thread dataset, or the OpenThread REST API where a discovered Border Router
+   exposes it.
 
-   Collecting the data is the smaller half: a MeshCoP (CoAP/DTLS) or OTBR REST
-   client against the border routers already discovered. Shaping the answer is
-   what is blocked, and what unblocks it is the reference's own model for it —
-   or a capture of one answering.
+   The reference also caches a batch for about an hour, collects over a
+   ~20 second streaming window, and takes a `force` argument to bypass the
+   cache. None of that exists here yet.
 5. **An update the ledger knows about cannot be installed.** The whole
    provider side works — `matter::responder` hosts the OTA Software Update
    Provider cluster, `update_node` grants the device access and announces this
@@ -195,19 +199,19 @@ How these get closed, in what order, and what each one takes to verify is in
    Note that a Matter update is not the same thing as a vendor update: a device
    can be current in the ledger while the vendor's own app offers newer
    firmware over its own channel, which Matter cannot see.
-6. **WebRTC: the callback's shape is not known here.** rs-matter 0.3 has both
-   signalling clusters (`dm::clusters::app::webrtc_prov`, `webrtc_req`) and a
-   TCP transport for the SDP payloads too large for MRP, and this server can
-   already invoke `SolicitOffer` / `ProvideOffer` on a camera. The half that is
-   missing is the answer coming back: the camera invokes it on a
-   `WebRTCTransportRequestor` this node would host, and the result reaches a
-   client as `webrtc_callback` — whose payload the reference material this
-   server was built from does not describe.
+6. **WebRTC signalling is not relayed.** rs-matter 0.3 has both signalling
+   clusters (`dm::clusters::app::webrtc_prov`, `webrtc_req`) and a TCP
+   transport for the SDP payloads too large for MRP. What is missing is this
+   side: `send_webrtc_provider_command` invokes `SolicitOffer` / `ProvideOffer`
+   on the camera, and the camera answers by invoking on a
+   `WebRTCTransportRequestor` this node would host — which becomes the
+   `webrtc_callback` event (`WebRtcCallbackData` in the reference's `model.ts`:
+   a session id, node, endpoint and fabric index, plus an `event_type` of
+   `offer` / `answer` / `ice_candidates` / `end` and its data).
 
-   Sending the offer without hosting the requestor would be worse than the
-   current error: a client would get a session id and then wait forever for an
-   answer arriving nowhere. So both halves wait on the same thing, the
-   reference's own model for that event.
+   Both halves land together or neither does: sending an offer without hosting
+   the requestor would leave a client with a session id and no answer, which is
+   worse than the error it gets today.
 
    Media itself never touches this server; the reference relays signalling
    only, as would this.

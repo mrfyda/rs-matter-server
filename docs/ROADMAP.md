@@ -107,41 +107,52 @@ uploaded — at which point everything above already works. rs-matter's
 `ota_prov::dcl` module is a worked example of exactly this, behind its
 `ota-dcl` feature, over a pluggable HTTPS client.
 
-## Phase 4 — WebRTC signalling — blocked on a wire shape
+## Phase 4 — WebRTC signalling
 
-The plan still holds: host `WebRTCTransportRequestor`, relay the invokes it
-receives out as `webrtc_callback`, let `send_webrtc_provider_command` perform
-the invoke it already validates, and chain `TcpNetwork` alongside UDP because
-an SDP payload does not fit in MRP.
+Host `WebRTCTransportRequestor`, relay the invokes it receives out as
+`webrtc_callback`, let `send_webrtc_provider_command` perform the invoke it
+already validates, and chain `TcpNetwork` alongside UDP because an SDP payload
+does not fit in MRP.
 
-What stops it is not effort. **The `webrtc_callback` payload is not described
-in the material this server's contract was taken from**, and this project's
-first rule is that shapes come from that material rather than from
-inference — every other event here can be traced to it. Building the invoke
-half alone would be worse than the honest error the command returns today: the
-client would get a session id and wait forever for an answer that arrives
-nowhere.
+Both shapes are in the reference. `send_webrtc_provider_command` takes
+`{ node_id, endpoint_id, command_name: "ProvideOffer" | "SolicitOffer",
+payload }`, and the event carries `WebRtcCallbackData`: `webrtc_session_id`,
+`node_id`, `endpoint_id`, `fabric_index`, an `event_type` of `offer` /
+`answer` / `ice_candidates` / `end`, and a `data` object per type (`sdp` for
+an offer or answer, an `ice_candidates` array of
+`{ candidate, sdpMid, sdpMLineIndex }`, a numeric `reason` for an end) that may
+be null.
 
-What unblocks it: the reference's `model.ts` entry for that event, its
-`websockets_api.md` section, or a capture of a real matterjs-server emitting
-one. Then this is a couple of days' work, verifiable against
-connectedhomeip's `camera-app`.
+Both halves land together: an offer sent without the requestor hosted leaves a
+client with a session id and no answer. Verifiable against connectedhomeip's
+`camera-app`.
 
-## Phase 5 — Thread diagnostics — blocked on a wire shape too
+## Phase 5 — Thread diagnostics
 
-The collection half is clear: an OTBR REST client (or MeshCoP over CoAP/DTLS)
-against the border routers `get_thread_border_routers` already discovers. The
-border-router shape itself was taken from the reference and is implemented.
+Collect per-node diagnostics from the border routers
+`get_thread_border_routers` already discovers, and answer
+`get_thread_diagnostics` with them.
 
-**What a populated `get_thread_diagnostics` answers with was not.** The empty
-answers are documented and implemented; the filled one is not described in the
-material here, and neither is the `thread_diagnostics_updated` batch. Same rule
-as phase 4: not inferred.
+The shape is `ThreadDiagnosticsBatch` in the reference's `model.ts`: one batch
+per network, keyed by `extPanIdHex`, carrying `networkName`, `collectedAt`, a
+`source` of `meshcop` / `otbr-rest` / `none`, a `nodes` array of
+`ThreadDiagnosticsNode` (every field optional — a node reports the TLVs it
+supports), and a `partialReason` while the batch is incomplete.
 
-What unblocks it: the reference's model for those two, and an open border
-router (a Pi with `ot-br-posix`, or Home Assistant's OTBR add-on) to verify
-against. If it turns out the reference simply passes the border router's own
-REST response through, that is the answer and this becomes a small job.
+Two ways in, and the reference prefers the first: **MeshCoP** over CoAP/DTLS,
+authenticated with the `pskc` and `networkKey` from a stored Thread dataset;
+or the **OpenThread REST API** where a discovered border router exposes it. A
+network with neither yields a partial batch with reason `no_credentials`.
+
+The behaviour around it matters as much as the shape: collection streams over
+about 20 seconds, with batches published as they fill in; results are cached
+for about an hour; `force: true` bypasses the cache; and
+`get_thread_diagnostics` without an `ext_pan_id` returns the current cache
+immediately and refreshes in the background.
+
+Verifying it needs an open border router — a Pi running `ot-br-posix`, or Home
+Assistant's OTBR add-on. Apple and Google border routers expose no REST API
+and hand out no credentials.
 
 ## Deferred
 
@@ -153,8 +164,8 @@ else.
 
 Phases 1, 2 and 3 are done, and with them everything that was blocked behind
 the responder. What remains is one phase-0 item (the dual-stack browser), the
-ledger half of phase 3, and phases 4 and 5 — the last two blocked on wire
-shapes rather than on work, as above.
+ledger half of phase 3, and phases 4 and 5 — none of them blocked on anything
+but the work.
 
 Nothing built in phases 1 through 3 has run against a device. That is the
 next thing worth doing, and the table below says what it takes.
