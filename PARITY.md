@@ -118,14 +118,20 @@ only real proof.
 What closing each one takes, and what it takes to prove closed, is in
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
-1. **Subscriptions have never run against a device.** Every node is subscribed
-   to — a wildcard subscription over attributes *and* events, established by
-   `crate::monitor`, its reports consumed by `matter::reports` and published as
-   `attribute_updated`, `node_updated` and `node_event` — so a change made at a
-   device should now appear at once rather than within a poll interval. What
-   has not happened is a device doing it: the whole path is asserted by unit
-   tests and by construction, and the Shelly plug in the hardware table below
-   was measured against the polling build.
+1. **Subscriptions have run against a device; node events have not.** Every
+   node is subscribed to — a wildcard subscription over attributes *and*
+   events, established by `crate::monitor`, its reports consumed by
+   `matter::reports` and published as `attribute_updated`, `node_updated` and
+   `node_event`. The attribute half is now proven on hardware: the Shelly plug
+   accepts the wildcard subscription, and a change made *at the device* — its
+   physical button — arrives as `attribute_updated` on an exchange the device
+   itself opens, with no poll involved (the monitor skips a node with a live
+   subscription entirely).
+
+   The event half is not. The plug raises no `Switch` cluster events, so
+   nothing has ever exercised `node_event` against a device, and the
+   delta-encoded timestamp path in particular is still asserted only by unit
+   tests.
 
    Polling remains, for the two cases where it is still the answer: a node that
    will not subscribe (no slots left, or a refused wildcard) keeps being
@@ -135,6 +141,15 @@ What closing each one takes, and what it takes to prove closed, is in
    Changes this controller *caused* are still read back from the target
    endpoint as soon as the command returns (about 110 ms), which is quicker
    than waiting for the device's own report.
+
+   What that first hardware run cost, recorded because it is the argument for
+   doing this sooner: a device's report carries only what changed, and it was
+   being applied as though it were a poll's wildcard read. One button press
+   reduced the node from 179 attributes to the 2 in the report and announced
+   endpoint 0 as removed. The priming report *is* a full read — which is why
+   establishing a subscription always looked right, and why 324 tests missed
+   it. Absent paths now mean different things depending on where the values
+   came from; see `storage::nodes::Coverage`.
 2. **Bluetooth commissioning is Linux-only, and has never run on hardware.**
    `commission_with_code` scans over Bluetooth when mDNS finds nothing. The
    device is reached over BTP, handed its Wi-Fi or Thread credentials over the
@@ -242,6 +257,26 @@ Run against a Shelly Plug S Gen3 (vendor 5264, product 1) on a live network:
 | `open_commissioning_window` | The locally computed SPAKE2+ verifier was **accepted by the device**; manual and QR codes returned |
 | `get_matter_fabrics` | Fabric descriptor decoded, vendor name resolved |
 | Two contending clients | Home Assistant claimed the fabric label first; the second connection was correctly ignored, exactly as the reference specifies |
+
+A second run on 2026-09-10, against the current build after a factory reset,
+covering what the first could not:
+
+| Step | Result |
+|---|---|
+| `discover` against a factory-reset plug | Full TXT record: `long_discriminator` 1612 — matching the manual pairing code's own encoding — vendor 5264, product 1, port 5540, `commissioning_mode` 1. Only the IPv4 address is reported, which is the IPv4-only browser (gap 3) visible in practice |
+| `commission_with_code`, current build | PASE → CASE → CommissioningComplete → **subscribe** → interview in **6.93 s**, on a debug build |
+| A device accepts a wildcard subscription | Accepted, keepalive 300 s. Never previously proven |
+| A change made *at the device* | Physical button press → `attribute_updated [2, "1/6/0", true]`, delivered on an exchange the device opened. The monitor skips subscribed nodes, so no poll was involved |
+| The store survives a report | **Failed first**, then fixed: see gap 1. After the fix, one press produces exactly `attribute_updated` and `node_updated`, no `endpoint_removed`, and the node still holds all 179 attributes across both endpoints |
+| `ping_node` on an unreachable node | `{"fe80::4af6:eeff:feb6:8e4c": false}`, keyed by the known address, after a 5.0 s CASE timeout |
+| `remove_node` on an unreachable node | Removed locally after 10.0 s of trying, logged as `could not be decommissioned cleanly (...); removing it locally anyway`, and `node_removed` published with the bare node id |
+
+One measurement from that run belongs with the gaps rather than the passes.
+Commissioning published **184 events** — 179 `attribute_updated`, 2
+`endpoint_added`, 2 `node_updated`, 1 `node_added` — into the 256-slot event
+channel, on a connection that was also listening, which is what Home Assistant
+does. That is 72% of the buffer for a two-endpoint plug, so the interview
+overflow described in the roadmap is not a bridge-only concern.
 
 Home Assistant drives the same plug — entity discovery and control — against
 the published container image.

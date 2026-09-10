@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 use crate::api::ServerContext;
 use crate::protocol::error::{ApiError, ErrorCode as ProtocolError};
 use crate::protocol::events::Event;
+use crate::storage::nodes::Coverage;
 
 /// How soon a device may report a change: immediately.
 ///
@@ -154,7 +155,12 @@ pub async fn maintain_node(context: &Arc<ServerContext>, node_id: u64) {
                 if first_read {
                     publish_first_interview(context, node_id, subscription.attributes);
                 } else {
-                    publish_changes(context, node_id, subscription.attributes);
+                    publish_changes(
+                        context,
+                        node_id,
+                        subscription.attributes,
+                        Coverage::Complete,
+                    );
                 }
             }
             mark_available(context, node_id, true);
@@ -198,7 +204,7 @@ pub async fn poll_node(context: &Arc<ServerContext>, node_id: u64) {
             if first_read {
                 publish_first_interview(context, node_id, attributes);
             } else {
-                publish_changes(context, node_id, attributes);
+                publish_changes(context, node_id, attributes, Coverage::Complete);
             }
             mark_available(context, node_id, true);
         }
@@ -239,12 +245,19 @@ fn publish_first_interview(
     context.events.publish(Event::node_updated(&diff.node));
 }
 
+/// Apply attribute values a node produced and announce what changed.
+///
+/// `coverage` says whether `attributes` is everything the node has (a poll's
+/// wildcard read) or only what changed (a subscription report). The store
+/// needs to be told, because the two disagree about what an absent path
+/// means.
 pub fn publish_changes(
     context: &Arc<ServerContext>,
     node_id: u64,
     attributes: crate::protocol::model::AttributesData,
+    coverage: Coverage,
 ) {
-    let Some(diff) = context.nodes.merge_attributes(node_id, attributes) else {
+    let Some(diff) = context.nodes.merge_attributes(node_id, attributes, coverage) else {
         return;
     };
     if diff.changed_attributes.is_empty()
@@ -343,7 +356,7 @@ mod tests {
 
         let mut attributes = AttributesData::new();
         attributes.insert("1/6/0".into(), json!(true));
-        publish_changes(&context, 1, attributes.clone());
+        publish_changes(&context, 1, attributes.clone(), Coverage::Complete);
 
         let mut seen = Vec::new();
         while let Ok(event) = events.try_recv() {
@@ -355,7 +368,7 @@ mod tests {
         );
 
         // Polling again with the same values is silent.
-        publish_changes(&context, 1, attributes);
+        publish_changes(&context, 1, attributes, Coverage::Complete);
         assert!(events.try_recv().is_err());
     }
 
@@ -417,12 +430,57 @@ mod tests {
         );
     }
 
+    /// Regression: the Shelly plug's first real subscription report.
+    ///
+    /// A device reports only what changed. Applied as though it were a poll's
+    /// wildcard read, the two attributes in that report replaced all 179 the
+    /// interview had stored, and endpoint 0 — which reported nothing, because
+    /// nothing on it changed — was announced as removed.
+    #[test]
+    fn a_subscription_report_does_not_erase_what_it_does_not_mention() {
+        let context = context_with_node();
+
+        let mut interviewed = AttributesData::new();
+        interviewed.insert("0/40/1".into(), json!("Shelly"));
+        interviewed.insert("0/40/3".into(), json!("Shelly Plug S Gen3"));
+        interviewed.insert("1/5/3".into(), json!(false));
+        interviewed.insert("1/6/0".into(), json!(false));
+        publish_changes(&context, 1, interviewed, Coverage::Complete);
+
+        let events = context.events.subscribe();
+
+        // What the device actually sent when its button was pressed.
+        let mut report = AttributesData::new();
+        report.insert("1/6/0".into(), json!(true));
+        publish_changes(&context, 1, report, Coverage::Partial);
+
+        let node = context.nodes.get(1).unwrap();
+        assert_eq!(
+            node.attributes.len(),
+            4,
+            "the report replaced the node instead of updating it: {:?}",
+            node.attributes
+        );
+        assert_eq!(node.attributes.get("1/6/0"), Some(&json!(true)));
+        assert_eq!(node.attributes.get("0/40/1"), Some(&json!("Shelly")));
+
+        let seen: Vec<String> = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|event| event.name().to_string())
+            .collect();
+        assert!(
+            !seen.iter().any(|name| name == "endpoint_removed"),
+            "a delta cannot remove an endpoint: {:?}",
+            seen
+        );
+        assert_eq!(seen, vec!["attribute_updated", "node_updated"]);
+    }
+
     #[test]
     fn polling_an_unknown_node_is_harmless() {
         let context = context_with_node();
         let events = context.events.subscribe();
         mark_available(&context, 99, true);
-        publish_changes(&context, 99, AttributesData::new());
+        publish_changes(&context, 99, AttributesData::new(), Coverage::Complete);
         assert!(events.try_recv().is_err());
     }
 

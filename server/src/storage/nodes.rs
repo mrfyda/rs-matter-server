@@ -260,16 +260,20 @@ impl NodeStore {
         })
     }
 
-    /// Merge a fresh attribute snapshot without treating it as an interview.
+    /// Merge fresh attribute values without treating them as an interview.
     ///
     /// Polling produces the same diff an interview does, but must not bump
     /// `interview_version` or `last_interview`: those describe an explicit
     /// re-interview, and clients use them to decide whether to rebuild their
     /// view of the node.
+    ///
+    /// `coverage` decides what an *absent* path means, and getting it wrong is
+    /// not a subtle failure — see [`Coverage`].
     pub fn merge_attributes(
         &self,
         node_id: u64,
         attributes: AttributesData,
+        coverage: Coverage,
     ) -> Option<InterviewDiff> {
         let mut nodes = self.nodes.lock().unwrap();
         let node = nodes.get_mut(&node_id)?;
@@ -281,15 +285,22 @@ impl NodeStore {
                 changed.push((path.clone(), value.clone()));
             }
         }
-        let removed: Vec<String> = node
-            .data
-            .attributes
-            .keys()
-            .filter(|path| !attributes.contains_key(*path))
-            .cloned()
-            .collect();
+        let removed: Vec<String> = match coverage {
+            Coverage::Complete => node
+                .data
+                .attributes
+                .keys()
+                .filter(|path| !attributes.contains_key(*path))
+                .cloned()
+                .collect(),
+            // Nothing can be concluded from a path a delta does not mention.
+            Coverage::Partial => Vec::new(),
+        };
 
-        node.data.attributes = attributes;
+        match coverage {
+            Coverage::Complete => node.data.attributes = attributes,
+            Coverage::Partial => node.data.attributes.extend(attributes),
+        }
         node.data.is_bridge = detect_bridge(&node.data.attributes);
         node.data.matter_version = detect_matter_version(&node.data.attributes);
 
@@ -322,6 +333,27 @@ impl NodeStore {
         node.data.attributes.insert(path.to_string(), value);
         Some(node.data.clone())
     }
+}
+
+/// Whether a set of attribute values is everything the node has, or only what
+/// just changed.
+///
+/// The distinction is the whole meaning of an absent path. A poll is a
+/// wildcard read, so a path it does not carry is a path the node no longer
+/// has. A subscription report carries only what changed, so a path it does
+/// not carry says nothing at all.
+///
+/// Reading one as the other is destructive rather than merely inaccurate:
+/// applying a device's first report as though it were complete empties the
+/// store down to the handful of attributes that happened to change, and
+/// announces every endpoint that reported nothing — endpoint 0 included — as
+/// removed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Coverage {
+    /// Every attribute the node has. An absent path is a removal.
+    Complete,
+    /// Only what changed. An absent path means nothing.
+    Partial,
 }
 
 /// What changed when interview results were merged.
@@ -449,7 +481,9 @@ mod tests {
             .unwrap();
 
         attributes.insert("1/6/0".into(), json!(true));
-        let diff = store.merge_attributes(1, attributes).unwrap();
+        let diff = store
+            .merge_attributes(1, attributes, Coverage::Complete)
+            .unwrap();
         assert_eq!(diff.changed_attributes.len(), 1);
         assert_eq!(diff.changed_attributes[0].0, "1/6/0");
         // A poll is not an interview.

@@ -26,6 +26,7 @@ use rs_matter::im::{EventDataTimestamp, EventResp, IMStatusCode, ReportDataResp}
 
 use crate::api::ServerContext;
 use crate::protocol::model::{AttributesData, MatterNodeEvent};
+use crate::storage::nodes::Coverage;
 
 use super::interaction::collect_attributes;
 use super::subscriptions::Registry;
@@ -112,7 +113,8 @@ impl ReportDataHandler for ReportReceiver {
         }
 
         if !attributes.is_empty() {
-            crate::monitor::publish_changes(&self.context, node_id, attributes);
+            // A report carries only what changed, never the whole node.
+            crate::monitor::publish_changes(&self.context, node_id, attributes, Coverage::Partial);
         }
 
         for event in node_events(node_id, report) {
