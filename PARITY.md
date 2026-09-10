@@ -118,12 +118,15 @@ How these get closed, in what order, and what each one takes to verify is in
 1. **Device-initiated subscriptions.** rs-matter 0.3 establishes a subscription
    and then hands the caller nothing to consume it with: after the priming
    chunks, reports arrive on device-initiated exchanges, and there is no
-   receiver abstraction upstream for them. The primitives are public
-   (`Exchange::accept`, `ReportDataResp`, `StatusResp`), so the receiver is
-   buildable here — a responder loop plus a registry keyed by
-   `(fabric, node, subscription id)`, with resubscribe on a missed `max_int`.
-   Until it exists, clients see the same `attribute_updated` / `node_updated`
-   events, produced two ways:
+   receiver abstraction upstream for them. The primitives are public, so the
+   receiver is buildable here. Half of it now is: `matter::responder` accepts
+   those exchanges and routes them, and a report for a subscription this
+   server does not have is answered `InvalidSubscription` rather than ignored.
+   What is missing is the other half — subscribing in the first place, and a
+   registry keyed by `(fabric, node, subscription id)` to match reports to,
+   with a resubscribe when a node misses its committed `max_int`. Until that
+   exists, clients see the same `attribute_updated` / `node_updated` events,
+   produced two ways:
 
    - **Changes this controller caused** are read back from the target endpoint
      as soon as the command returns, so a client's view updates in about
@@ -175,11 +178,11 @@ How these get closed, in what order, and what each one takes to verify is in
    The Matter half of that is in rs-matter 0.3 already: `dm::clusters::ota_prov`
    has `OtaProviderHandler` and `OtaBdxHandler` over the `OtaImagesRegistry` and
    `OtaImages` traits, and `bdx` is a complete transfer engine. What is missing
-   is this side: the server runs `matter.run` and nothing else, so it accepts no
-   incoming exchange and a device's `QueryImage` reaches no handler. Closing this
-   means the responder loop of gap 1, those two handlers over the existing image
-   store, an `AnnounceOTAProvider` invoke to point the device here, and the ACL
-   entry that lets it invoke back. Until then, if the ledger offers an update a
+   is this side: `matter::responder` accepts the exchange a device opens, but
+   this node hosts no data model, so a `QueryImage` is answered `Busy` rather
+   than served. Closing this means a minimal hosted data model, those two
+   handlers over the existing image store, an `AnnounceOTAProvider` invoke to
+   point the device here, and the ACL entry that lets it invoke back. Until then, if the ledger offers an update a
    client will show it and installing it will fail with the documented update
    error.
 
@@ -187,7 +190,7 @@ How these get closed, in what order, and what each one takes to verify is in
    can be current in the ledger while the vendor's own app offers newer
    firmware over its own channel, which Matter cannot see.
 6. **WebRTC.** No camera signalling is relayed. The blocker is the same missing
-   responder as gap 5, not a missing transport: rs-matter 0.3 has both
+   data model as gap 5, not a missing transport: rs-matter 0.3 has both
    signalling clusters (`dm::clusters::app::webrtc_prov`, `webrtc_req`) and a
    TCP transport for the SDP payloads too large for MRP. A controller invokes
    `SolicitOffer` / `ProvideOffer` on the camera — which this server can already
@@ -227,12 +230,13 @@ it cannot map to one release.
 cargo test --manifest-path server/Cargo.toml
 ```
 
-277 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
+282 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
 wire-naming registry, the SPAKE2+ verifier against the Matter test vector, the
 mDNS browser's message parsing, the update-ledger rules, storage and restart
 recovery, every command handler, 7 matterjs-server import tests that build a
-source directory from real certificates and adopt it, and 18 end-to-end
-contract tests over a real WebSocket (including the HTTP endpoints).
+source directory from real certificates and adopt it, 18 end-to-end contract
+tests over a real WebSocket (including the HTTP endpoints), and one that opens
+a Matter exchange against the responder over a real UDP round-trip.
 
 Four more are `#[ignore]`d and need `--ignored` to run: three query the CSA
 ledger over the network, and `fabric_creation_is_not_flaky` loops fabric

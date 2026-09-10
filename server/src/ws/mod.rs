@@ -32,6 +32,7 @@ use rs_matter::transport::network::{Address, ChainedNetwork};
 use crate::api::{RuntimeInfo, ServerContext};
 use crate::matter::actor::{self, ActorContext};
 use crate::matter::controller::MatterController;
+use crate::matter::responder;
 use crate::monitor::{self, MonitorConfig};
 use crate::protocol::events::Event;
 use crate::storage::{ConfigStore, NodeStore};
@@ -114,11 +115,17 @@ pub async fn run(
     let mdns = prepare_mdns()?;
 
     // `or` polls both branches and returns when either finishes. The transport,
-    // mDNS, actor, and accept loops are all long-lived, so any of them exiting
-    // ends the server — which is what should happen if the radio stops.
+    // mDNS, responder, actor, and accept loops are all long-lived, so any of
+    // them exiting ends the server — which is what should happen if the radio
+    // stops.
+    //
+    // The responder shares this thread with the transport and the actor
+    // deliberately: `Matter` is `!Send`, and rs-matter's responder is written
+    // as one future running several handlers concurrently, so it needs no
+    // thread or executor of its own.
     let network = futures_lite::future::or(
         run_transport(&matter, &crypto, &matter_socket, &ble),
-        run_mdns(&matter, &crypto, &mdns),
+        futures_lite::future::or(run_mdns(&matter, &crypto, &mdns), responder::run(&matter)),
     );
     let work = futures_lite::future::or(
         actor::run(actor_context, requests),

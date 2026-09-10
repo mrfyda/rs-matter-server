@@ -11,20 +11,25 @@ without an app bundle and entitlements. Nothing here can fix that. Everything
 else in PARITY.md's gap list is work in this repository against rs-matter 0.3
 as it already ships.
 
-## The one thing five gaps have in common
+## The one thing five gaps had in common
 
-**This server accepts no incoming exchange.** `ws::run` drives
-`matter.run(...)` and nothing else, so a message a device *starts* — a
-subscription report, an ICD check-in, an OTA `QueryImage`, a WebRTC answer —
-arrives at a stack with no responder behind it and is dropped.
+**This server accepted no incoming exchange.** `ws::run` drove `matter.run(...)`
+and nothing else, so a message a device *started* — a subscription report, an
+ICD check-in, an OTA `QueryImage`, a WebRTC answer — arrived at a stack with no
+responder behind it and was dropped.
 
-That single absence is what is actually behind gaps 1, 5 and 6, the ICD fields
-in `get_icd_state`, and the `node_event` event. The Matter-side pieces those
-gaps need are all present in rs-matter 0.3: `Exchange::accept` and the IM
-encodings for a receiver, `dm::clusters::ota_prov` and `bdx` for updates,
+That single absence was what sat behind gaps 1, 5 and 6, the ICD fields in
+`get_icd_state`, and the `node_event` event. The Matter-side pieces those gaps
+need are all present in rs-matter 0.3: `Exchange::accept` and the IM encodings
+for a receiver, `dm::clusters::ota_prov` and `bdx` for updates,
 `dm::clusters::app::webrtc_prov` / `webrtc_req` and a TCP transport for camera
-signalling. So the plan is one keystone phase and then the things it unlocks,
-with the independent work pulled forward so it is not held behind the keystone.
+signalling. So the plan was one keystone phase and then the things it unlocks,
+with the independent work pulled forward so it was not held behind the
+keystone.
+
+Phase 1 below is that keystone, and it has landed: exchanges are accepted and
+routed. What each of the phases after it adds is the handling behind one of
+those routes.
 
 ## Phase 0 — independent wins
 
@@ -39,26 +44,27 @@ well and merge the answers. Additive by construction: the IPv4 query keeps
 working if the IPv6 one cannot be sent, which is what makes it safe to do
 without a Thread network to test on.
 
-## Phase 1 — the responder loop
+## Phase 1 — the responder loop — done
 
-Add an accept arm beside `run_transport` in `ws/mod.rs`: `Exchange::accept` in
-a loop, each accepted exchange driven inside a `FuturesUnordered` — the pattern
-`matter::actor` already uses for concurrent work. It has to live on the
-executor thread that owns `Matter`, which is `!Send`, and it must never block
-the actor's own exchanges. Concurrent exchanges are fine at the transport
-layer; the serialization constraint is this server's design, not Matter's.
+`matter::responder` runs beside the transport on the Matter thread and routes
+each accepted exchange by protocol and opcode. rs-matter's own `Responder`
+turned out to be the whole loop — accept, hand to a handler, log, repeat, with
+a fixed number of handlers running concurrently as one future — so this was a
+routing table and a wiring change rather than an accept loop written by hand.
 
-Dispatch on protocol id and opcode:
+What each arm does today, and what replaces it:
 
-- IM `ReportData` → the subscription receiver (phase 2)
-- Secure Channel `CheckIn` → ICD (phase 2)
-- IM `InvokeRequest` → the hosted clusters (phases 3 and 4); until those exist,
-  answer through `im::busy`
-- anything else, or a peer that is not a commissioned node → a status response
-  and drop. An unsolicited exchange is not evidence of anything.
-
-This phase changes nothing a client can see. Its test is a contract test that
-opens an exchange against the server and gets a well-formed status back.
+- IM `ReportData` → `InvalidSubscription`, since nothing here subscribes yet.
+  Phase 2 replaces it with the receiver.
+- Secure Channel `CheckIn` → dropped, which is all an unreliable sessionless
+  message asks for. Phase 2 records it.
+- Any other IM message → `Busy` via `im::busy`. Phase 3 replaces it with a
+  hosted data model.
+- Any other Secure Channel message → `Busy` via `sc::busy`. That includes
+  `CASESigma1`, so a device trying to establish a session *to* this node is
+  told to try later rather than met with silence. Phase 3 replaces it with
+  rs-matter's real `SecureChannel` handler.
+- Any other protocol → dropped.
 
 ## Phase 2 — subscriptions, events, ICD
 
@@ -79,15 +85,18 @@ for a subscription that has gone quiet. Keep `refresh_endpoint`'s read-back as
 the fast path for changes this controller caused — 110 ms is quicker than a
 device's own report.
 
-Check-ins (`sc.rs`'s handler hook, `sc/checkin.rs`'s codec) fill in `awake` and
-`next_expected_checkin` in `get_icd_state`.
+Check-ins want rs-matter's `SecureChannel` handler rather than the busy one:
+`sc::AsyncScHandler` exists precisely so a controller can react to the messages
+the accessory role drops, check-ins among them. Taking it means taking the CASE
+responder with it, which phase 3 needs anyway — so this is where the Secure
+Channel arm stops answering `Busy`.
 
 ## Phase 3 — OTA distribution
 
-Needs phase 1 **plus a minimal hosted data model**: a root endpoint with
-Descriptor and ACL, because an incoming invoke is access-controlled and a node
-that has not been granted anything can invoke nothing. Standing that up is the
-real cost of this phase and the next, and the reason both come last.
+Needs **a minimal hosted data model** on top of the responder: a root endpoint
+with Descriptor and ACL, because an incoming invoke is access-controlled and a
+node that has not been granted anything can invoke nothing. Standing that up is
+the real cost of this phase and the next, and the reason both come last.
 
 On top of it: `OtaProviderHandler` and `OtaBdxHandler` over the image store
 `api::ota` already keeps, implementing `OtaImagesRegistry` and `OtaImages`
@@ -124,9 +133,10 @@ else.
 
 ## Sequencing
 
-Phases 0 and 5 run in parallel with anything. `1 → 2 → 3 → 4` is a hard chain.
-Most of the user-visible value is in phase 2 — 30 seconds down to immediate for
-a change made at the device — and most of the cost is in 3 and 4.
+Phase 5 and what is left of phase 0 run in parallel with anything.
+`2 → 3 → 4` is a hard chain on phase 1, which is done. Most of the
+user-visible value is in phase 2 — 30 seconds down to immediate for a change
+made at the device — and most of the cost is in 3 and 4.
 
 ## What it takes to verify
 
@@ -146,7 +156,7 @@ where the thing being tested is physical.
 | 0 — registry | `lock-app` / `thermostat-app` for a named nested payload; unit tests cover the rest | none |
 | 0 — operational address | — | a device that must be commissioned over BLE, i.e. a Thread device, plus a border router and the Linux BLE host |
 | 0 — DCL, topology push | — | none beyond the existing plug |
-| 1 — responder | a contract test opening an exchange | none |
+| 1 — responder | done: a test opens a real exchange over UDP | none |
 | 2 — subscriptions | `all-clusters-app` | the Shelly plug: press its button, expect an immediate `attribute_updated` rather than a poll |
 | 2 — events | `all-clusters-app`; a reboot raises `StartUp` | a Matter button or switch raises real `Switch` cluster events |
 | 2 — ICD | — | a genuinely sleepy device — a battery Thread contact or motion sensor — plus a border router. Nothing else produces a check-in |
