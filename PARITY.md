@@ -277,6 +277,14 @@ covering what the first could not:
 | `get_icd_state` on a device without the cluster | `supported: false`, everything else null, as specified |
 | `check_node_update` against the real CSA ledger | `null` in 178 ms cold, 3 ms cached. Independently confirmed correct: the ledger publishes exactly one software version for vid 5264 / pid 1, `16908353`, which is what the device runs |
 | `get_network_topology` | Real graph: node 2 as a Wi-Fi station at RSSI −47, edged to a synthetic AP whose BSSID `C4:9A:31:01:51:F1` is the router's LAN MAC plus one |
+| `set_acl_entry` | `status: 0` writing the fabric's own admin entry back unchanged, in the snake_case shape — the asymmetry with `write_attribute`'s capitalised one is real. The ACL read back identical afterwards, and access was retained |
+| `set_node_binding` on an endpoint with no Binding cluster | `status: 195` (`UNSUPPORTED_CLUSTER`) — a per-path status in a real `WriteResponse`, which is the device answering rather than refusing the action |
+| `open_commissioning_window` | The locally computed SPAKE2+ verifier was accepted, in 102 ms. `discover` then showed the node at `commissioning_mode: 2` with a *fresh* discriminator 1696, distinct from the factory 1612 |
+| `device_command` with a timed invoke | `RevokeCommissioning` (cluster 60) closed that window in 279 ms; `discover` returned to `commissioning_mode: 0` and discriminator 1612 |
+| The fabric label reaches the device | `set_default_fabric_label` to `RigLabel` in 106 ms, then read back off the device's own `OperationalCredentials.Fabrics`. Restored to `Home` afterwards |
+| `ping_node` on a reachable node | `{"192.168.1.228": true}` in 3.4 ms, against 5.0 s for the unreachable case above |
+| `interview_node` on an already-interviewed node | 265 ms and **3** events, not 179: only the attributes that actually changed are republished |
+| `read_attribute` shapes | Single path, a list of three paths, and the `1/6/*` wildcard all correct, including live values such as RSSI |
 
 One measurement from that run belongs with the gaps rather than the passes.
 Commissioning published **184 events** — 179 `attribute_updated`, 2
