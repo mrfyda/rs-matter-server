@@ -150,7 +150,38 @@ What closing each one takes, and what it takes to prove closed, is in
    establishing a subscription always looked right, and why 324 tests missed
    it. Absent paths now mean different things depending on where the values
    came from; see `storage::nodes::Coverage`.
-2. **Bluetooth commissioning is Linux-only, and has never run on hardware.**
+2. **A device that reboots is not recovered until this server restarts.**
+   Found on hardware, and the worst thing on this list: power-cycling the
+   Shelly plug left it unreachable for the ten minutes it was tried, and only
+   restarting the server fixed it.
+
+   What is established. The device rebooted at 22:24:08 by its own uptime
+   attribute and was healthy throughout — it pinged in 5 ms. From 22:25 every
+   `read_attribute` failed with a 45 s timeout, and
+   `rs_matter::transport::mrp` reported `Too many retransmissions. Giving up`
+   for the `ReadRequest`, so this server was talking on a CASE session the
+   device had forgotten. No reports arrived and the stored attributes froze.
+   The monitor, whose job is to notice a silent subscription and re-subscribe,
+   printed nothing for 100 s at debug level, while the Matter actor stayed
+   healthy and answered `discover` and `ping_node` immediately. A restart
+   established a fresh CASE in 3 s and everything worked again.
+
+   What is not. Where the monitor blocks. `maintain_node` calls
+   `subscriptions.forget()` and then awaits `subscribe()`, which has the 45 s
+   actor timeout, so a failing subscribe should log and retry — and does not.
+   That `forget()` is also why nothing ever logs `stopped reporting`: the
+   entry is gone before `forget_silent` could name it, which removes the one
+   diagnostic that would have made this obvious.
+
+   Two smaller things fall out of the same run. `ping_node` answered `true` in
+   3.2 ms throughout, and availability stayed `true`, because `ping` opens an
+   exchange through `open()` and rs-matter hands back the cached session
+   without a round trip — so the probe proves a session object exists, not
+   that the device answers. And `set_loglevel` takes `console_loglevel`; a
+   request naming an argument it does not know changes nothing and still
+   reports success.
+
+3. **Bluetooth commissioning is Linux-only, and has never run on hardware.**
    `commission_with_code` scans over Bluetooth when mDNS finds nothing. The
    device is reached over BTP, handed its Wi-Fi or Thread credentials over the
    PASE session between AddNOC and CASE, and then resolved over mDNS once it
@@ -173,7 +204,7 @@ What closing each one takes, and what it takes to prove closed, is in
      commissioning still be refused. The compose file says how.
    - **No hardware run.** Every part of this is verified by compilation only.
      It has never commissioned a real device.
-3. **mDNS queries go out over IPv4 only.** The one-shot browser binds an IPv4
+4. **mDNS queries go out over IPv4 only.** The one-shot browser binds an IPv4
    socket and asks the IPv4 group, so every discovery this server does —
    `discover`, `get_thread_border_routers`, and the operational resolve behind
    `get_node_ip_addresses` — depends on something answering over IPv4. A
@@ -183,7 +214,7 @@ What closing each one takes, and what it takes to prove closed, is in
    Closing this means sending the same query from an IPv6 socket to `ff02::fb`
    and collecting both, which is additive — the IPv4 query is unaffected by an
    IPv6 one failing to send.
-4. **Nothing collects Thread diagnostics yet.** The shape, the cache and the
+5. **Nothing collects Thread diagnostics yet.** The shape, the cache and the
    answers are implemented — a network is named, its batch is cached for an
    hour once complete, `force` bypasses that, and each batch is announced as
    an event. What is missing is a source, so every batch says `no_credentials`
@@ -201,7 +232,7 @@ What closing each one takes, and what it takes to prove closed, is in
    The reference also collects over a ~20 second streaming window, publishing
    partial batches as nodes answer. The event and the `partialReason` that
    carries are in place; nothing yet streams into them.
-5. **An update the ledger knows about cannot be installed.** The whole
+6. **An update the ledger knows about cannot be installed.** The whole
    provider side works — `matter::responder` hosts the OTA Software Update
    Provider cluster, `update_node` grants the device access and announces this
    server to it, and the image goes out over BDX — but only for an image that
@@ -219,7 +250,7 @@ What closing each one takes, and what it takes to prove closed, is in
    Note that a Matter update is not the same thing as a vendor update: a device
    can be current in the ledger while the vendor's own app offers newer
    firmware over its own channel, which Matter cannot see.
-6. **WebRTC signalling has never met a camera.** Both halves are implemented —
+7. **WebRTC signalling has never met a camera.** Both halves are implemented —
    the offer goes out to the camera's provider cluster, and the
    `WebRTCTransportRequestor` this node hosts turns what comes back into
    `webrtc_callback` — and neither has run against a device. Matter cameras are
@@ -263,7 +294,7 @@ covering what the first could not:
 
 | Step | Result |
 |---|---|
-| `discover` against a factory-reset plug | Full TXT record: `long_discriminator` 1612 — matching the manual pairing code's own encoding — vendor 5264, product 1, port 5540, `commissioning_mode` 1. Only the IPv4 address is reported, which is the IPv4-only browser (gap 3) visible in practice |
+| `discover` against a factory-reset plug | Full TXT record: `long_discriminator` 1612 — matching the manual pairing code's own encoding — vendor 5264, product 1, port 5540, `commissioning_mode` 1. Only the IPv4 address is reported, which is the IPv4-only browser (gap 4) visible in practice |
 | `commission_with_code`, current build | PASE → CASE → CommissioningComplete → **subscribe** → interview in **6.93 s**, on a debug build |
 | A device accepts a wildcard subscription | Accepted, keepalive 300 s. Never previously proven |
 | A change made *at the device* | Physical button press → `attribute_updated [2, "1/6/0", true]`, delivered on an exchange the device opened. The monitor skips subscribed nodes, so no poll was involved |
@@ -272,7 +303,7 @@ covering what the first could not:
 | `remove_node` on an unreachable node | Removed locally after 10.0 s of trying, logged as `could not be decommissioned cleanly (...); removing it locally anyway`, and `node_removed` published with the bare node id |
 | `device_command` `on` / `off` | 129 ms and 144 ms; exactly one `attribute_updated` each. The read-back updates the store first, so the device's own report of the same change is correctly recognised as no change rather than published twice |
 | `write_attribute` | **Failed first**, then fixed: every write this server makes omitted the mandatory `TimedRequest` field and the plug rejected the action. After the fix, `Status: 0`, the value read back off the device, and the timed form works too |
-| `get_node_ip_addresses` | `["192.168.1.228"]` — resolved over mDNS in 1.5 s, but **IPv4 only**. The documented "link-local IPv6 first" ordering cannot happen while the browser is IPv4-only (gap 3) |
+| `get_node_ip_addresses` | `["192.168.1.228"]` — resolved over mDNS in 1.5 s, but **IPv4 only**. The documented "link-local IPv6 first" ordering cannot happen while the browser is IPv4-only (gap 4) |
 | `get_matter_fabrics` | One fabric decoded off the device: index 1, label `Home`, vendor 65521 resolved to `[Test vendor #1]` |
 | `get_icd_state` on a device without the cluster | `supported: false`, everything else null, as specified |
 | `check_node_update` against the real CSA ledger | `null` in 178 ms cold, 3 ms cached. Independently confirmed correct: the ledger publishes exactly one software version for vid 5264 / pid 1, `16908353`, which is what the device runs |
