@@ -12,6 +12,7 @@ use rs_matter::cert::MAX_CERT_TLV_AND_ASN1_LEN;
 use rs_matter::crypto::{
     default_crypto, CanonAeadKey, CanonPkcSecretKey, Crypto, SecretKey, SigningSecretKey,
 };
+use rs_matter::dm::clusters::basic_info::BasicInfoConfig;
 use rs_matter::dm::devices::test::{TEST_DEV_ATT, TEST_DEV_COMM, TEST_DEV_DET};
 use rs_matter::error::ErrorCode;
 use rs_matter::fabric::FabricPersist;
@@ -40,6 +41,20 @@ pub struct FabricConfig {
 
 /// The port Matter reserves for operational traffic.
 pub const MATTER_PORT: u16 = 5540;
+
+/// What this node says about itself.
+///
+/// rs-matter's test device details, with one change: this node accepts TCP.
+/// That is advertised in the operational mDNS record as the `T` key, and it is
+/// how a peer knows it may send a payload too large for MRP — a camera's SDP
+/// offer being the case that needs it. Everything else here describes a device
+/// this node is not; none of it is read by anything, because a controller
+/// hosts no Basic Information cluster and never advertises itself as
+/// commissionable.
+pub const CONTROLLER_DEV_DET: BasicInfoConfig = BasicInfoConfig {
+    tcp_supported: true,
+    ..TEST_DEV_DET
+};
 
 impl Default for FabricConfig {
     fn default() -> Self {
@@ -115,7 +130,7 @@ pub fn init_controller_with_import(
     config: &FabricConfig,
     imported: Option<&ImportedFabric>,
 ) -> Result<MatterController> {
-    let matter = Matter::new(&TEST_DEV_DET, TEST_DEV_COMM, &TEST_DEV_ATT, config.port);
+    let matter = Matter::new(&CONTROLLER_DEV_DET, TEST_DEV_COMM, &TEST_DEV_ATT, config.port);
 
     let storage_path = Path::new(storage_path);
     fs::create_dir_all(storage_path)

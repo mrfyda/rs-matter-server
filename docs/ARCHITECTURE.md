@@ -31,6 +31,10 @@ WebSocket / HTTP client
 - `server/src/matter/` — the controller actor, commissioning, the Interaction
   Model client, the TLV↔JSON codec, the cluster registry, the mDNS browser, the
   SPAKE2+ verifier, the update-ledger client.
+- `server/src/ws/mod.rs` — listener, connection lifecycle, HTTP endpoints, and
+  the run loop that owns the Matter stack: the transport (UDP, TCP and, on
+  Linux, BTP chained together), mDNS, the responder and the actor, all as one
+  future on one thread because `Matter` is `!Send`.
 - `server/src/matter/responder.rs` — the accept side: the exchanges a *device*
   opens, answered by rs-matter's own Interaction Model, Secure Channel and BDX
   handlers over a controller-shaped data model — one endpoint, hosting the OTA
@@ -44,7 +48,6 @@ WebSocket / HTTP client
   nodes and settings, and `mod` writes them. Read-only towards the source.
 - `server/src/monitor.rs` — attribute polling; the single place that changes if
   rs-matter gains a client-side subscription receiver.
-- `server/src/ws/` — listener, connection lifecycle, HTTP endpoints.
 
 ## Design decisions
 

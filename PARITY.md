@@ -248,13 +248,14 @@ it cannot map to one release.
 cargo test --manifest-path server/Cargo.toml
 ```
 
-312 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
+313 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
 wire-naming registry, the SPAKE2+ verifier against the Matter test vector, the
 mDNS browser's message parsing, the update-ledger rules, storage and restart
 recovery, every command handler, 7 matterjs-server import tests that build a
 source directory from real certificates and adopt it, 18 end-to-end contract
-tests over a real WebSocket (including the HTTP endpoints), and one that opens
-a Matter exchange against the responder over a real UDP round-trip.
+tests over a real WebSocket (including the HTTP endpoints), and two that open a
+Matter exchange against the responder over a real round-trip — one on each
+transport.
 
 Four more are `#[ignore]`d and need `--ignored` to run: three query the CSA
 ledger over the network, and `fabric_creation_is_not_flaky` loops fabric

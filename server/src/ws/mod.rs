@@ -26,7 +26,7 @@ use rs_matter::transport::network::btp::Btp;
 use rs_matter::transport::network::mdns::astro::AstroMdns;
 #[cfg(not(target_os = "macos"))]
 use rs_matter::transport::network::mdns::builtin::{BuiltinMdns, Host};
-#[cfg(all(feature = "bluetooth", target_os = "linux"))]
+use rs_matter::transport::network::tcp::TcpNetwork;
 use rs_matter::transport::network::{Address, ChainedNetwork};
 
 use crate::api::{RuntimeInfo, ServerContext};
@@ -82,6 +82,16 @@ pub async fn run(
             matter_port
         )
     })?;
+
+    // The same port over TCP, which is what the operational record advertises
+    // and what a peer uses for a payload MRP cannot carry: a camera's SDP
+    // offer is several kilobytes against MRP's roughly one.
+    let matter_tcp = MatterTcp::new(
+        Async::<TcpListener>::bind(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, matter_port, 0, 0))
+            .with_context(|| {
+                format!("binding the Matter port {} for TCP", matter_port)
+            })?,
+    );
     let crypto = default_crypto(OsRng, DAC_PRIVKEY);
 
     let (handle, requests) = actor::channel();
@@ -144,7 +154,7 @@ pub async fn run(
     // as one future running several handlers concurrently, so it needs no
     // thread or executor of its own.
     let network = futures_lite::future::or(
-        run_transport(&matter, &crypto, &matter_socket, &ble),
+        run_transport(&matter, &crypto, &matter_socket, &matter_tcp, &ble),
         futures_lite::future::or(
             run_mdns(&matter, &crypto, &mdns),
             responder::run(&matter, &crypto, responder_storage, context.clone()),
@@ -163,24 +173,34 @@ pub async fn run(
     Ok(())
 }
 
-/// Run the Matter transport with BTP chained in next to UDP.
+/// Run the Matter transport with BTP and TCP chained in next to UDP.
 ///
-/// Chaining is what keeps commissioning transport-agnostic: a device reached
-/// over Bluetooth is just another `Address` to everything above the transport,
-/// so the flow in `matter::commissioning` does not care which it is.
-/// Multicast stays on the UDP socket alone — `Btp` has no `NetworkMulticast`
-/// impl, and mDNS has no business on a GATT link.
+/// Chaining is what keeps everything above the transport transport-agnostic: a
+/// device reached over Bluetooth, or a peer that answered over TCP, is just
+/// another `Address`, so the flow in `matter::commissioning` does not care
+/// which it is. Multicast stays on the UDP socket alone — neither `Btp` nor
+/// `TcpNetwork` has a `NetworkMulticast` impl, and mDNS has no business on a
+/// GATT link or a stream.
 #[cfg(all(feature = "bluetooth", target_os = "linux"))]
 async fn run_transport<C: Crypto>(
     matter: &rs_matter::Matter<'_>,
     crypto: &C,
     socket: &Async<UdpSocket>,
+    tcp: &MatterTcp,
     ble: &BleSetup,
 ) {
     // Two chains rather than one: `run` takes send and receive separately, and
     // each needs its own value to borrow mutably.
-    let send = ChainedNetwork::new(Address::is_btp, &ble.btp, socket);
-    let recv = ChainedNetwork::new(Address::is_btp, &ble.btp, socket);
+    let send = ChainedNetwork::new(
+        Address::is_btp,
+        &ble.btp,
+        ChainedNetwork::new(Address::is_tcp, tcp, socket),
+    );
+    let recv = ChainedNetwork::new(
+        Address::is_btp,
+        &ble.btp,
+        ChainedNetwork::new(Address::is_tcp, tcp, socket),
+    );
 
     if let Err(error) = matter.run(crypto, send, recv, socket).await {
         log::error!("Matter transport stopped: {:?}", error);
@@ -192,12 +212,23 @@ async fn run_transport<C: Crypto>(
     matter: &rs_matter::Matter<'_>,
     crypto: &C,
     socket: &Async<UdpSocket>,
+    tcp: &MatterTcp,
     _ble: &BleSetup,
 ) {
-    if let Err(error) = matter.run(crypto, socket, socket, socket).await {
+    let send = ChainedNetwork::new(Address::is_tcp, tcp, socket);
+    let recv = ChainedNetwork::new(Address::is_tcp, tcp, socket);
+
+    if let Err(error) = matter.run(crypto, send, recv, socket).await {
         log::error!("Matter transport stopped: {:?}", error);
     }
 }
+
+/// How many TCP connections this node keeps at once.
+///
+/// A stream is opened per peer that needs one, and only for a payload too
+/// large for MRP — a camera's SDP, in practice. Four is more cameras than a
+/// home has and still a bounded amount of buffer.
+type MatterTcp = TcpNetwork<4>;
 
 /// What the Bluetooth transport needs before the run loop starts.
 ///

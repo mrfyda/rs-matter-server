@@ -18,7 +18,7 @@
 //! path: the exchange was accepted, the Secure Channel handler read it, the
 //! fabric table was consulted, and the answer was sent back over UDP.
 
-use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket};
+use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6, TcpListener, UdpSocket};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -32,7 +32,8 @@ use rs_matter::dm::devices::test::DAC_PRIVKEY;
 use rs_matter::sc::{GeneralCode, OpCode, StatusReport, PROTO_ID_SECURE_CHANNEL};
 use rs_matter::tlv::{TLVTag, TLVWrite};
 use rs_matter::transport::exchange::Exchange;
-use rs_matter::transport::network::Address;
+use rs_matter::transport::network::tcp::TcpNetwork;
+use rs_matter::transport::network::{Address, ChainedNetwork};
 use rs_matter::utils::storage::ReadBuf;
 use rs_matter_server::api::{RuntimeInfo, ServerContext};
 use rs_matter_server::matter::actor;
@@ -68,15 +69,18 @@ fn context() -> Arc<ServerContext> {
     ))
 }
 
-/// An ephemeral UDP port for a Matter stack to answer on.
+/// An ephemeral port for a Matter stack to answer on, over both transports.
 ///
-/// The socket is bound before the stack that will own it, so the port is known
-/// to the test without having to ask the thread for it afterwards.
-fn udp_socket() -> (UdpSocket, u16) {
+/// Bound before the stack that will own it, so the port is known to the test
+/// without having to ask the thread for it afterwards — and bound on UDP
+/// first, since TCP can then be asked for the same number.
+fn matter_sockets() -> (UdpSocket, TcpListener, u16) {
     let socket = UdpSocket::bind(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0))
         .expect("an ephemeral UDP port");
     let port = socket.local_addr().unwrap().port();
-    (socket, port)
+    let listener = TcpListener::bind(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0))
+        .expect("the same port for TCP");
+    (socket, listener, port)
 }
 
 /// A server: its transport and its responder, on their own thread, for the
@@ -84,14 +88,25 @@ fn udp_socket() -> (UdpSocket, u16) {
 ///
 /// `Matter` is `!Send` — it holds a `dyn DeviceAttestation` — so it is built
 /// on the thread that will run it, exactly as the real server does.
-fn serve(storage: String, socket: UdpSocket) {
+fn serve(storage: String, socket: UdpSocket, listener: TcpListener) {
     thread::spawn(move || {
-        let matter = init_matter(&storage, &FabricConfig::default()).expect("a fabric");
+        let port = socket.local_addr().unwrap().port();
+        let matter = init_matter(
+            &storage,
+            &FabricConfig {
+                port,
+                ..FabricConfig::default()
+            },
+        )
+        .expect("a fabric");
         let socket = Async::new(socket).expect("a non-blocking socket");
+        let tcp = TcpNetwork::<2>::new(Async::new(listener).expect("a non-blocking listener"));
         let crypto = default_crypto(OsRng, DAC_PRIVKEY);
+        let send = ChainedNetwork::new(Address::is_tcp, &tcp, &socket);
+        let recv = ChainedNetwork::new(Address::is_tcp, &tcp, &socket);
         block_on(or(
             async {
-                let _ = matter.run(&crypto, &socket, &socket, &socket).await;
+                let _ = matter.run(&crypto, send, recv, &socket).await;
             },
             responder::run(&matter, &crypto, PathBuf::from(&storage), context()),
         ));
@@ -102,21 +117,36 @@ fn serve(storage: String, socket: UdpSocket) {
 
 #[test]
 fn a_handshake_from_an_unknown_fabric_is_answered_rather_than_ignored() {
+    probe_over(|port| Address::Udp(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port)));
+}
+
+/// The same handshake over TCP, which is the transport a payload too large for
+/// MRP takes — a camera's SDP offer being the one that needs it. What is being
+/// tested is that the stream is accepted, de-framed and answered at all.
+#[test]
+fn a_handshake_over_tcp_is_answered_too() {
+    probe_over(|port| Address::Tcp(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port)));
+}
+
+fn probe_over(address: impl Fn(u16) -> Address) {
     let server_dir = tempfile::tempdir().expect("tempdir");
     let client_dir = tempfile::tempdir().expect("tempdir");
-    let (server_socket, port) = udp_socket();
+    let (server_socket, server_listener, port) = matter_sockets();
     serve(
         server_dir.path().to_str().unwrap().to_string(),
         server_socket,
+        server_listener,
     );
 
     let client_storage = client_dir.path().to_str().unwrap().to_string();
     let client_matter = init_matter(&client_storage, &FabricConfig::default()).expect("a fabric");
-    let (client_socket, _) = udp_socket();
+    let (client_socket, client_listener, _) = matter_sockets();
     let client_socket = Async::new(client_socket).expect("a non-blocking socket");
+    let client_tcp =
+        TcpNetwork::<2>::new(Async::new(client_listener).expect("a non-blocking listener"));
 
     let crypto = default_crypto(OsRng, DAC_PRIVKEY);
-    let peer = Address::Udp(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port));
+    let peer = address(port);
 
     let probe = async {
         let mut exchange = Exchange::initiate_plaintext(&client_matter, &crypto, peer)
@@ -173,8 +203,10 @@ fn a_handshake_from_an_unknown_fabric_is_answered_rather_than_ignored() {
     };
     block_on(or(
         async {
+            let send = ChainedNetwork::new(Address::is_tcp, &client_tcp, &client_socket);
+            let recv = ChainedNetwork::new(Address::is_tcp, &client_tcp, &client_socket);
             let _ = client_matter
-                .run(&crypto, &client_socket, &client_socket, &client_socket)
+                .run(&crypto, send, recv, &client_socket)
                 .await;
         },
         or(probe, timeout),
