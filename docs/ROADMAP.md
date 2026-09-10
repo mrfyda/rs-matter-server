@@ -107,26 +107,41 @@ uploaded — at which point everything above already works. rs-matter's
 `ota_prov::dcl` module is a worked example of exactly this, behind its
 `ota-dcl` feature, over a pluggable HTTPS client.
 
-## Phase 4 — WebRTC signalling
+## Phase 4 — WebRTC signalling — blocked on a wire shape
 
-On the same data model: host `WebRTCTransportRequestor`, relay the invokes it
-receives out as `webrtc_callback` events, and let
-`send_webrtc_provider_command` perform the invoke it already validates. Also
-needs `TcpNetwork` chained alongside UDP — an SDP payload does not fit in MRP.
+The plan still holds: host `WebRTCTransportRequestor`, relay the invokes it
+receives out as `webrtc_callback`, let `send_webrtc_provider_command` perform
+the invoke it already validates, and chain `TcpNetwork` alongside UDP because
+an SDP payload does not fit in MRP.
 
-No media touches this server. The reference relays signalling only, and so
-would this.
+What stops it is not effort. **The `webrtc_callback` payload is not described
+in the material this server's contract was taken from**, and this project's
+first rule is that shapes come from that material rather than from
+inference — every other event here can be traced to it. Building the invoke
+half alone would be worse than the honest error the command returns today: the
+client would get a session id and wait forever for an answer that arrives
+nowhere.
 
-## Phase 5 — Thread diagnostics
+What unblocks it: the reference's `model.ts` entry for that event, its
+`websockets_api.md` section, or a capture of a real matterjs-server emitting
+one. Then this is a couple of days' work, verifiable against
+connectedhomeip's `camera-app`.
 
-Independent of everything above, and not Matter at all: an OTBR REST client (or
-MeshCoP over CoAP/DTLS) against the border routers `get_thread_border_routers`
-already discovers, feeding `get_thread_diagnostics` and the gated
-`thread_diagnostics_updated` batches.
+## Phase 5 — Thread diagnostics — blocked on a wire shape too
 
-Sequence this one by whether there is an open border router to test against.
-Without one it is unverifiable, which is what makes it a poor early pick
-despite being self-contained.
+The collection half is clear: an OTBR REST client (or MeshCoP over CoAP/DTLS)
+against the border routers `get_thread_border_routers` already discovers. The
+border-router shape itself was taken from the reference and is implemented.
+
+**What a populated `get_thread_diagnostics` answers with was not.** The empty
+answers are documented and implemented; the filled one is not described in the
+material here, and neither is the `thread_diagnostics_updated` batch. Same rule
+as phase 4: not inferred.
+
+What unblocks it: the reference's model for those two, and an open border
+router (a Pi with `ot-br-posix`, or Home Assistant's OTBR add-on) to verify
+against. If it turns out the reference simply passes the border router's own
+REST response through, that is the answer and this becomes a small job.
 
 ## Deferred
 
@@ -136,10 +151,13 @@ else.
 
 ## Sequencing
 
-Phase 5 and what is left of phase 0 run in parallel with anything.
-`2 → 3 → 4` is a hard chain on phase 1, which is done. Most of the
-user-visible value is in phase 2 — 30 seconds down to immediate for a change
-made at the device — and most of the cost is in 3 and 4.
+Phases 1, 2 and 3 are done, and with them everything that was blocked behind
+the responder. What remains is one phase-0 item (the dual-stack browser), the
+ledger half of phase 3, and phases 4 and 5 — the last two blocked on wire
+shapes rather than on work, as above.
+
+Nothing built in phases 1 through 3 has run against a device. That is the
+next thing worth doing, and the table below says what it takes.
 
 ## What it takes to verify
 

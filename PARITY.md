@@ -165,9 +165,18 @@ How these get closed, in what order, and what each one takes to verify is in
    Closing this means sending the same query from an IPv6 socket to `ff02::fb`
    and collecting both, which is additive — the IPv4 query is unaffected by an
    IPv6 one failing to send.
-4. **Thread diagnostics.** Border Routers are discovered, but collecting
-   per-node diagnostics from one needs a MeshCoP (CoAP/DTLS) or OTBR REST
-   client.
+4. **Thread diagnostics: the answer's shape is not known here.** Border
+   Routers are discovered and reported in the shape this doc's source
+   specifies. What `get_thread_diagnostics` should answer *with* is a
+   different matter: the empty answers are documented (`null` for one network,
+   `[]` for all) and implemented, but nothing in the reference material this
+   server was built from says what a populated one looks like — and this
+   project takes its shapes from that material rather than inventing them.
+
+   Collecting the data is the smaller half: a MeshCoP (CoAP/DTLS) or OTBR REST
+   client against the border routers already discovered. Shaping the answer is
+   what is blocked, and what unblocks it is the reference's own model for it —
+   or a capture of one answering.
 5. **An update the ledger knows about cannot be installed.** The whole
    provider side works — `matter::responder` hosts the OTA Software Update
    Provider cluster, `update_node` grants the device access and announces this
@@ -186,14 +195,22 @@ How these get closed, in what order, and what each one takes to verify is in
    Note that a Matter update is not the same thing as a vendor update: a device
    can be current in the ledger while the vendor's own app offers newer
    firmware over its own channel, which Matter cannot see.
-6. **WebRTC.** No camera signalling is relayed. The blocker is the same empty
-   data model as gap 5, not a missing transport: rs-matter 0.3 has both
+6. **WebRTC: the callback's shape is not known here.** rs-matter 0.3 has both
    signalling clusters (`dm::clusters::app::webrtc_prov`, `webrtc_req`) and a
-   TCP transport for the SDP payloads too large for MRP. A controller invokes
-   `SolicitOffer` / `ProvideOffer` on the camera — which this server can already
-   do — and hosts `WebRTCTransportRequestor` to receive the answer and the ICE
-   candidates the camera invokes back, which it cannot. Media itself never
-   touches this server; the reference relays signalling only, as would this.
+   TCP transport for the SDP payloads too large for MRP, and this server can
+   already invoke `SolicitOffer` / `ProvideOffer` on a camera. The half that is
+   missing is the answer coming back: the camera invokes it on a
+   `WebRTCTransportRequestor` this node would host, and the result reaches a
+   client as `webrtc_callback` — whose payload the reference material this
+   server was built from does not describe.
+
+   Sending the offer without hosting the requestor would be worse than the
+   current error: a client would get a session id and then wait forever for an
+   answer arriving nowhere. So both halves wait on the same thing, the
+   reference's own model for that event.
+
+   Media itself never touches this server; the reference relays signalling
+   only, as would this.
 
 ## Hardware validation
 
