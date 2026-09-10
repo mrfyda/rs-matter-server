@@ -76,13 +76,11 @@ gone silent. This needed the data model of phase 1's second commit: rs-matter
 routes a report to a `ReportDataHandler` *with the peer that sent it*, and
 nothing else in its public API says who opened an accepted exchange.
 
-**Events: next.** The same reports carry `event_reports`, which is what
-`node_event` — shape and `diagnostics` history already implemented, nothing
-emitting it — is waiting for. The subscription already asks for attributes
-only, so this is an `event_requests_from` on the request and a second arm in
-the report handler.
+**Events: done.** The subscription asks for events as well as attributes, and
+the report handler turns each one into the `node_event` that had a shape, a
+`diagnostics` history, and nothing emitting it.
 
-**ICD after that.** Check-ins want an `sc::AsyncScHandler`, which exists
+**ICD next.** Check-ins want an `sc::AsyncScHandler`, which exists
 precisely so a controller can react to the Secure Channel messages the
 accessory role drops. `awake` and `next_expected_checkin` in `get_icd_state`
 are what it fills in.

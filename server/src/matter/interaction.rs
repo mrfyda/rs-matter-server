@@ -14,7 +14,7 @@ use serde_json::{Map, Value};
 use rs_matter::crypto::Crypto;
 use rs_matter::error::ErrorCode;
 use rs_matter::im::client::{ImClient, SubscribeOutcome, TxOutcome};
-use rs_matter::im::{AttrPath, AttrResp, CmdResp, IMStatusCode, ReportDataResp};
+use rs_matter::im::{AttrPath, AttrResp, CmdResp, EventPath, IMStatusCode, ReportDataResp};
 use rs_matter::tlv::TLVTag;
 use rs_matter::transport::exchange::Exchange;
 use rs_matter::Matter;
@@ -150,6 +150,7 @@ pub async fn subscribe<C: Crypto>(
     max_interval_secs: u16,
 ) -> Result<Subscription, ApiError> {
     let paths = interview_paths();
+    let events = event_paths();
     let exchange = open(matter, crypto, fabric_index, node_id).await?;
     let mut sender = exchange
         .subscribe_sender()
@@ -172,6 +173,8 @@ pub async fn subscribe<C: Crypto>(
                     .map_err(|e| im_error("subscribe max interval", e))?
                     .attr_requests_from(&paths)
                     .map_err(|e| im_error("subscribe path", e))?
+                    .event_requests_from(&events)
+                    .map_err(|e| im_error("subscribe event path", e))?
                     .fabric_filtered(false)
                     .map_err(|e| im_error("subscribe filter", e))?
                     .end()
@@ -417,6 +420,18 @@ pub async fn ping<C: Crypto>(
 /// A single wildcard read (`*/*/*`) is what the reference does and what devices
 /// expect; it is also the only way to discover endpoints that were not present
 /// at commissioning time.
+/// Every event on every cluster of every endpoint.
+///
+/// A controller cannot know which events matter to a client, and the protocol
+/// forwards all of them as `node_event`, so the subscription asks for the lot.
+/// Unlike attributes there is no priming burst to pay for: events are only
+/// reported as they occur.
+pub fn event_paths() -> Vec<EventPath> {
+    vec![EventPath::from_gp(&rs_matter::im::GenericPath::new(
+        None, None, None,
+    ))]
+}
+
 pub fn interview_paths() -> Vec<AttrPath> {
     vec![AttrPath::from_gp(&rs_matter::im::GenericPath::new(
         None, None, None,
