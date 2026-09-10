@@ -43,7 +43,7 @@ The `every_advertised_command_is_routed` contract test enforces that against
 | `discover` / `discover_commissionable_nodes` | ✅ | Browses `_matterc._udp` directly and reports the full TXT record: discriminator, vendor, product, device type and name, pairing hint and instruction, MRP intervals, TCP support, addresses. Filters are applied to the results. |
 | `read_attribute` | ✅ | Single path, lists, and wildcards. Values decode tag-based with base64 octet strings, matching the reference. |
 | `write_attribute` | ✅ | Returns `[{ Path: { EndpointId, ClusterId, AttributeId }, Status }]` — the capitalised shape the reference sends here (unlike ACL/binding writes). |
-| `device_command` | ✅ | `command_name` and named payload fields resolve through cluster metadata generated from rs-matter's own definitions (153 clusters, 411 commands). Responses decode name-based via each command's declared response struct, so a shared response (`NOCResponse`) is still named correctly. |
+| `device_command` | ✅ | `command_name` and named payload fields resolve through cluster metadata generated from rs-matter's own definitions (153 clusters, 411 commands, 58 payload structs). Fields inside a nested struct — and inside a list of structs — resolve by name too. Responses decode name-based via each command's declared response struct, so a shared response (`NOCResponse`) is still named correctly. |
 | `get_matter_fabrics` | ✅ | Reads `OperationalCredentials.Fabrics`, decorated with vendor names. |
 | `remove_matter_fabric` | ✅ | `RemoveFabric` invoke. |
 | `set_acl_entry` | ✅ | Writes the fabric-scoped ACL; returns the snake_case `AttributeWriteResult`. |
@@ -195,8 +195,6 @@ How these get closed, in what order, and what each one takes to verify is in
 7. **Epoch-typed attributes.** matter.js converts `epoch-s`/`epoch-us`
    attributes to Unix time using the cluster schema. Values here are reported as
    the device sent them (Matter epoch).
-8. **Nested command payload fields.** Top-level payload fields resolve by name;
-   fields inside a nested struct must be addressed by their numeric TLV tag.
 
 ## Hardware validation
 
@@ -230,7 +228,7 @@ it cannot map to one release.
 cargo test --manifest-path server/Cargo.toml
 ```
 
-254 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
+261 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
 wire-naming registry, the SPAKE2+ verifier against the Matter test vector, the
 mDNS browser's message parsing, the update-ledger rules, storage and restart
 recovery, every command handler, 7 matterjs-server import tests that build a

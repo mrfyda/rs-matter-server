@@ -31,16 +31,14 @@ with the independent work pulled forward so it is not held behind the keystone.
 Nothing here touches the transport, and each item flips a PARITY.md row on its
 own.
 
-**Cluster registry: nested fields and epoch types** (gaps 7 and 8).
-`tools/build_registry.py` reads rs-matter's generated Rust, where a Matter
-`epoch_us` has already been lowered to a `u64` — the semantic type is gone by
-the time the generator sees it. The `.matter` IDL that codegen parses ships
-inside the crate (`rs-matter-codegen-0.3.0/src/idl/parser/`) and carries both
-the epoch types and the full nested struct definitions. Read types from the
-IDL, keep tags from the generated code — those are the wire truth — and
-cross-check the two so a version skew fails the generator instead of drifting
-silently. Then recurse nested structs into `req`/`resp` so `device_command`
-resolves their fields by name, and convert epoch attributes to Unix time in
+**Epoch-typed attributes** (gap 7). `tools/build_registry.py` reads
+rs-matter's generated Rust, where a Matter `epoch_us` has already been lowered
+to a `u64` — the semantic type is gone by the time the generator sees it. The
+`.matter` IDL that codegen parses ships inside the crate
+(`rs-matter-codegen-0.3.0/src/idl/parser/`) and does carry it. Read the epoch
+types from the IDL, keep ids and tags from the generated code — those are the
+wire truth — and cross-check the two so a version skew fails the generator
+instead of drifting silently. Then convert those attributes to Unix time in
 `matter::tlv_json` on read, reversing it on write.
 
 **Operational address** (gap 3, and the `get_node_ip_addresses` caveat). Browse

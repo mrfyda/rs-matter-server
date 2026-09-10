@@ -201,7 +201,7 @@ pub async fn device_command(args: &Args, context: CallContext<'_>) -> ApiResult 
                 })?;
             (
                 command_id,
-                tlv_json::from_json(&payload, clusters::FieldKind::Other)?,
+                tlv_json::from_json(&payload, &clusters::FieldKind::Other)?,
                 BTreeMap::new(),
             )
         }
