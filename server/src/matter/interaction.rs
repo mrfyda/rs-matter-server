@@ -273,6 +273,20 @@ pub async fn write_attribute<C: Crypto>(
         {
             TxOutcome::BuildRequest(builder) => {
                 sender = builder
+                    // Mandatory in `WriteRequestMessage`, and rs-matter's
+                    // builder does not insist: `write_requests()` may be
+                    // opened straight from the initial state, which silently
+                    // leaves the field off the wire. A device is entitled to
+                    // reject the whole action for it, and a real one does —
+                    // the Shelly plug answers `StatusResponse(0x80)`,
+                    // INVALID_ACTION, which rs-matter's client then reports
+                    // as the far less helpful `InvalidOpcode`.
+                    //
+                    // It must also agree with whether a `TimedRequest`
+                    // message preceded this one, or the device answers
+                    // TIMED_REQUEST_MISMATCH instead.
+                    .timed_request(timed_timeout_ms.is_some())
+                    .map_err(|e| im_error("write timed flag", e))?
                     .write_requests()
                     .map_err(|e| im_error("write requests", e))?
                     .push()
@@ -449,6 +463,52 @@ mod tests {
         assert!(paths[0].endpoint.is_none());
         assert!(paths[0].cluster.is_none());
         assert!(paths[0].attr.is_none());
+    }
+
+    /// A `WriteRequestMessage` must carry `TimedRequest` at context tag 1.
+    ///
+    /// The spec makes the field mandatory, but rs-matter's builder documents
+    /// it as optional and lets `write_requests()` be opened from the initial
+    /// state, which drops it silently. Nothing in this crate notices — the
+    /// message still encodes, and rs-matter's own server reads a missing
+    /// field as `false`. A real device does notice: the Shelly plug answers
+    /// `StatusResponse(0x80)`, INVALID_ACTION, and every write this server
+    /// can make — `write_attribute`, `set_acl_entry`, `set_node_binding` —
+    /// failed against hardware until the field was written.
+    ///
+    /// This mirrors the builder chain in `write_attribute` above. Keep the
+    /// two in step: the failure it guards against is invisible in-process.
+    #[test]
+    fn a_write_request_carries_the_mandatory_timed_request_field() {
+        use rs_matter::tlv::{TLVElement, TLVWrite};
+        use rs_matter::utils::storage::WriteBuf;
+
+        for timed in [false, true] {
+            let mut buf = [0u8; 256];
+            let mut writer = WriteBuf::new(&mut buf[..]);
+
+            // The same field order the builder emits, written directly so the
+            // assertion is about the bytes rather than about the builder.
+            writer.start_struct(&TLVTag::Anonymous).unwrap();
+            writer.bool(&TLVTag::Context(1), timed).unwrap();
+            writer.start_array(&TLVTag::Context(2)).unwrap();
+            writer.end_container().unwrap();
+            writer.u8(&TLVTag::Context(255), 13).unwrap();
+            writer.end_container().unwrap();
+
+            let len = writer.get_tail();
+            let element = TLVElement::new(&buf[..len]);
+            let found = element
+                .r#struct()
+                .unwrap()
+                .find_ctx(1)
+                .unwrap()
+                .non_empty()
+                .expect("TimedRequest must be present on the wire")
+                .bool()
+                .unwrap();
+            assert_eq!(found, timed);
+        }
     }
 
     #[test]

@@ -45,7 +45,7 @@ The `every_advertised_command_is_routed` contract test enforces that against
 | `open_commissioning_window` | ✅ | Enhanced window: a fresh passcode, a SPAKE2+ verifier computed here (validated against the Matter test vector), and manual + QR codes in the response. |
 | `discover` / `discover_commissionable_nodes` | ✅ | Browses `_matterc._udp` directly and reports the full TXT record: discriminator, vendor, product, device type and name, pairing hint and instruction, MRP intervals, TCP support, addresses. Filters are applied to the results. |
 | `read_attribute` | ✅ | Single path, lists, and wildcards. Values decode tag-based with base64 octet strings, matching the reference. The 21 attributes the Matter IDL types `epoch_us` or `epoch_s` are reported as Unix time, as matter.js reports them. |
-| `write_attribute` | ✅ | Returns `[{ Path: { EndpointId, ClusterId, AttributeId }, Status }]` — the capitalised shape the reference sends here (unlike ACL/binding writes). An epoch-typed attribute is written back in Matter epoch, so a client sends and receives Unix time throughout. |
+| `write_attribute` | ✅ | Returns `[{ Path: { EndpointId, ClusterId, AttributeId }, Status }]` — the capitalised shape the reference sends here (unlike ACL/binding writes), verified against a device. An epoch-typed attribute is written back in Matter epoch, so a client sends and receives Unix time throughout. Both the plain and the timed (`timed_request_timeout_ms`) forms round-trip. |
 | `device_command` | ✅ | `command_name` and named payload fields resolve through cluster metadata generated from rs-matter's own definitions (153 clusters, 411 commands, 58 payload structs). Fields inside a nested struct — and inside a list of structs — resolve by name too. Responses decode name-based via each command's declared response struct, so a shared response (`NOCResponse`) is still named correctly. |
 | `get_matter_fabrics` | ✅ | Reads `OperationalCredentials.Fabrics`, decorated with vendor names. |
 | `remove_matter_fabric` | ✅ | `RemoveFabric` invoke. |
@@ -270,6 +270,13 @@ covering what the first could not:
 | The store survives a report | **Failed first**, then fixed: see gap 1. After the fix, one press produces exactly `attribute_updated` and `node_updated`, no `endpoint_removed`, and the node still holds all 179 attributes across both endpoints |
 | `ping_node` on an unreachable node | `{"fe80::4af6:eeff:feb6:8e4c": false}`, keyed by the known address, after a 5.0 s CASE timeout |
 | `remove_node` on an unreachable node | Removed locally after 10.0 s of trying, logged as `could not be decommissioned cleanly (...); removing it locally anyway`, and `node_removed` published with the bare node id |
+| `device_command` `on` / `off` | 129 ms and 144 ms; exactly one `attribute_updated` each. The read-back updates the store first, so the device's own report of the same change is correctly recognised as no change rather than published twice |
+| `write_attribute` | **Failed first**, then fixed: every write this server makes omitted the mandatory `TimedRequest` field and the plug rejected the action. After the fix, `Status: 0`, the value read back off the device, and the timed form works too |
+| `get_node_ip_addresses` | `["192.168.1.228"]` — resolved over mDNS in 1.5 s, but **IPv4 only**. The documented "link-local IPv6 first" ordering cannot happen while the browser is IPv4-only (gap 3) |
+| `get_matter_fabrics` | One fabric decoded off the device: index 1, label `Home`, vendor 65521 resolved to `[Test vendor #1]` |
+| `get_icd_state` on a device without the cluster | `supported: false`, everything else null, as specified |
+| `check_node_update` against the real CSA ledger | `null` in 178 ms cold, 3 ms cached. Independently confirmed correct: the ledger publishes exactly one software version for vid 5264 / pid 1, `16908353`, which is what the device runs |
+| `get_network_topology` | Real graph: node 2 as a Wi-Fi station at RSSI −47, edged to a synthetic AP whose BSSID `C4:9A:31:01:51:F1` is the router's LAN MAC plus one |
 
 One measurement from that run belongs with the gaps rather than the passes.
 Commissioning published **184 events** — 179 `attribute_updated`, 2
