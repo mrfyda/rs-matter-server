@@ -227,7 +227,7 @@ it cannot map to one release.
 cargo test --manifest-path server/Cargo.toml
 ```
 
-311 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
+312 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
 wire-naming registry, the SPAKE2+ verifier against the Matter test vector, the
 mDNS browser's message parsing, the update-ledger rules, storage and restart
 recovery, every command handler, 7 matterjs-server import tests that build a

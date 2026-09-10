@@ -28,7 +28,18 @@ pub struct FabricConfig {
     pub vendor_id: u16,
     pub fabric_id: u64,
     pub node_id: u64,
+    /// The port this node answers Matter traffic on, and advertises in mDNS.
+    ///
+    /// A controller is a node others reach — a device fetching a firmware
+    /// image, an ICD following up a check-in — and they find it by resolving
+    /// its operational instance, which carries this number. It has to be a
+    /// port this server is actually listening on, and a stable one: a device
+    /// caches what it resolved.
+    pub port: u16,
 }
+
+/// The port Matter reserves for operational traffic.
+pub const MATTER_PORT: u16 = 5540;
 
 impl Default for FabricConfig {
     fn default() -> Self {
@@ -36,6 +47,7 @@ impl Default for FabricConfig {
             vendor_id: 0xFFF1,
             fabric_id: 1,
             node_id: 112233,
+            port: MATTER_PORT,
         }
     }
 }
@@ -103,7 +115,7 @@ pub fn init_controller_with_import(
     config: &FabricConfig,
     imported: Option<&ImportedFabric>,
 ) -> Result<MatterController> {
-    let matter = Matter::new(&TEST_DEV_DET, TEST_DEV_COMM, &TEST_DEV_ATT, 0);
+    let matter = Matter::new(&TEST_DEV_DET, TEST_DEV_COMM, &TEST_DEV_ATT, config.port);
 
     let storage_path = Path::new(storage_path);
     fs::create_dir_all(storage_path)

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_io::Async;
 use futures_lite::future::block_on;
 
@@ -63,8 +63,25 @@ pub async fn run(
         origin: _,
     } = controller;
 
-    let matter_socket =
-        Async::<UdpSocket>::bind(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0))?;
+    // The port a device will look for. It is what mDNS advertises for this
+    // node, so binding anything else — an ephemeral port, say — would publish
+    // an address nothing answers on, and every device-initiated exchange (an
+    // OTA download, an ICD following up) would arrive nowhere.
+    let matter_port = matter.port();
+    let matter_socket = Async::<UdpSocket>::bind(SocketAddrV6::new(
+        Ipv6Addr::UNSPECIFIED,
+        matter_port,
+        0,
+        0,
+    ))
+    .with_context(|| {
+        format!(
+            "binding the Matter port {}. Another Matter stack — a matterjs-server \
+             or python-matter-server on this host — may already have it; \
+             --matter-port moves this one",
+            matter_port
+        )
+    })?;
     let crypto = default_crypto(OsRng, DAC_PRIVKEY);
 
     let (handle, requests) = actor::channel();

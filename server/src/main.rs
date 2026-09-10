@@ -29,6 +29,16 @@ struct Args {
     #[arg(long, env = "STORAGE_PATH", default_value = "/data")]
     storage_path: String,
 
+    /// The port this node answers Matter traffic on, and advertises to
+    /// devices.
+    ///
+    /// The default is Matter's own port. Move it only if something else on
+    /// this host has it — another Matter server, most likely — remembering
+    /// that a device caches what it resolved, so changing it after
+    /// commissioning makes this node briefly unreachable.
+    #[arg(long, env = "MATTER_PORT", default_value_t = rs_matter_server::matter::controller::MATTER_PORT)]
+    matter_port: u16,
+
     /// Adopt the fabric, nodes and settings of a matterjs-server installation
     /// on first start, so its devices do not have to be re-commissioned.
     ///
@@ -233,7 +243,10 @@ fn main() -> anyhow::Result<()> {
 
     let controller = init_controller_with_import(
         &args.storage_path,
-        &FabricConfig::default(),
+        &FabricConfig {
+            port: args.matter_port,
+            ..FabricConfig::default()
+        },
         import.as_ref().map(|import| &import.fabric),
     )
     .map_err(|e| {

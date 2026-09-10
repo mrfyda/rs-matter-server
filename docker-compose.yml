@@ -13,6 +13,11 @@ services:
     # Not optional. Matter reaches devices over IPv6 link-local addresses and
     # finds them with mDNS multicast, neither of which survives Docker's bridge
     # NAT. The server refuses to start without a usable interface.
+    #
+    # It also means this container owns the Matter port (5540) on the host. A
+    # matterjs-server or python-matter-server still running there holds it, and
+    # this server will refuse to start rather than advertise a port it is not
+    # listening on; stop that one first, or set MATTER_PORT to move this one.
     network_mode: host
     restart: unless-stopped
     volumes:
