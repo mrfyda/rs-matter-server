@@ -39,9 +39,6 @@ well and merge the answers. Additive by construction: the IPv4 query keeps
 working if the IPv6 one cannot be sent, which is what makes it safe to do
 without a Thread network to test on.
 
-**`get_vendor_names` from the ledger.** Static table first, the DCL for a miss,
-through the existing `matter::dcl` client and its hour cache.
-
 **`network_topology_updated` as a push.** Publish after a poll or a `refresh`
 recomputes the graph, rather than only building it on request.
 

@@ -30,7 +30,7 @@ The `every_advertised_command_is_routed` contract test enforces that against
 | `interview_node` | ✅ | Wildcard read of every endpoint; publishes the attribute, endpoint and node events it produced. |
 | `ping_node` | ✅ | CASE probe with `attempts`; keyed by the node's known addresses. Updates availability. |
 | `import_test_node` | ✅ | All three Home Assistant dump shapes; ids allocated from `0xFFFF_FFFE_0000_0000`. |
-| `get_vendor_names` | ⚠️ | Serves the reference's static vendor table (1245 entries, decimal-keyed). No DCL lookup, so a very new vendor may be missing. |
+| `get_vendor_names` | ✅ | Serves the reference's static vendor table (1245 entries, decimal-keyed). A `filter_vendors` id the table does not cover is looked up in the ledger, which is where vendor ids are assigned — 161 assigned ids are missing from that table. Cached for an hour, negative answers included; an unreachable ledger drops that one id rather than failing the call. An unfiltered request answers from the table alone, as the reference does. |
 | `set_wifi_credentials` | ✅ | Named lists, write-only secrets, and the "omit the password only for an unchanged SSID" rule. |
 | `set_thread_dataset` | ✅ | Hex validation; the dataset is decoded for the credential summary. |
 | `remove_wifi_credentials` / `remove_thread_dataset` | ✅ | Clearing `default` zeroes it but keeps it listed. |
@@ -227,14 +227,14 @@ it cannot map to one release.
 cargo test --manifest-path server/Cargo.toml
 ```
 
-273 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
+275 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
 wire-naming registry, the SPAKE2+ verifier against the Matter test vector, the
 mDNS browser's message parsing, the update-ledger rules, storage and restart
 recovery, every command handler, 7 matterjs-server import tests that build a
 source directory from real certificates and adopt it, and 18 end-to-end
 contract tests over a real WebSocket (including the HTTP endpoints).
 
-Two of those are `#[ignore]`d and need `--ignored` to run: one queries the CSA
+Four more are `#[ignore]`d and need `--ignored` to run: three query the CSA
 ledger over the network, and `fabric_creation_is_not_flaky` loops fabric
 creation enough times to be meaningful (see
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)).

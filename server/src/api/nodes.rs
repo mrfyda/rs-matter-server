@@ -392,7 +392,6 @@ fn extract_dump_nodes(dump: &Value) -> Option<Vec<&Value>> {
 /// vendor-registry client the static table is what this server has, so a very
 /// new vendor may be missing rather than wrong.
 pub async fn get_vendor_names(args: &Args, context: CallContext<'_>) -> ApiResult {
-    let _ = context;
     let all = vendors();
     let Some(filter) = args.u64_array("filter_vendors")? else {
         return Ok(serde_json::to_value(all).unwrap_or(Value::Null));
@@ -405,6 +404,16 @@ pub async fn get_vendor_names(args: &Args, context: CallContext<'_>) -> ApiResul
         let key = vendor_id.to_string();
         if let Some(name) = all.get(&key) {
             result.insert(key, name.clone());
+            continue;
+        }
+        // Not in the table the reference ships. A vendor id is assigned in the
+        // ledger, so a vendor that shipped after that table was cut is still
+        // nameable — and an id nobody holds is simply absent from the answer,
+        // exactly as it is today.
+        if let Ok(vendor_id) = u16::try_from(vendor_id) {
+            if let Some(name) = context.server.vendor_name_from_dcl(vendor_id) {
+                result.insert(key, name);
+            }
         }
     }
     Ok(serde_json::to_value(result).unwrap_or(Value::Null))
@@ -594,5 +603,18 @@ mod tests {
         let all = block_on(get_vendor_names(&Args::default(), call(&context))).unwrap();
         assert!(all.as_object().unwrap().len() > 1000);
         assert_eq!(all["0"], json!("[Matter Standard]"));
+    }
+
+    /// Hits the real CSA ledger; run with `--ignored` when online. 161 vendor
+    /// ids the ledger has assigned are missing from the reference's table,
+    /// and this is one of them.
+    #[test]
+    #[ignore]
+    fn a_vendor_missing_from_the_static_table_is_named_from_the_ledger() {
+        let context = test_context();
+        assert!(!vendors().contains_key("5687"));
+        let args = Args::new(json!({ "filter_vendors": [5687] }));
+        let result = block_on(get_vendor_names(&args, call(&context))).unwrap();
+        assert_eq!(result["5687"], json!("NVIDIA"));
     }
 }

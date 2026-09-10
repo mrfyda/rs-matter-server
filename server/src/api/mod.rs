@@ -222,6 +222,22 @@ impl ServerContext {
             .check_update(vendor_id, product_id, current_version)
     }
 
+    /// The name a ledger has for a vendor id, for the ids the reference's
+    /// static table does not cover.
+    ///
+    /// A test vendor id is only looked up when the test ledger is enabled, as
+    /// with `check_dcl`: the production ledger does not carry them, so asking
+    /// it would spend a round-trip to learn nothing.
+    ///
+    /// This performs blocking HTTP and must be called from a connection
+    /// thread, never from the Matter executor.
+    pub fn vendor_name_from_dcl(&self, vendor_id: u16) -> Option<String> {
+        if is_test_vendor(vendor_id) {
+            return self.test_dcl.as_ref()?.vendor_name(vendor_id);
+        }
+        self.dcl.vendor_name(vendor_id)
+    }
+
     pub fn console_loglevel(&self) -> String {
         self.console_loglevel.lock().unwrap().clone()
     }
