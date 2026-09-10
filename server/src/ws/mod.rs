@@ -83,6 +83,13 @@ pub async fn run(
         thread::spawn(move || block_on(monitor::run(context, monitor_config)));
     }
 
+    // The topology watcher only reads the node store and the event stream, so
+    // it needs neither Matter nor a connection.
+    {
+        let context = context.clone();
+        thread::spawn(move || block_on(crate::api::network::watch_topology(context)));
+    }
+
     // Prepared before the actor context, which borrows the BTP state machine
     // out of it.
     let ble = prepare_ble();

@@ -4,7 +4,12 @@
 //! and Wi-Fi diagnostics clusters cached from their interviews. `refresh`
 //! re-reads those clusters from every reachable node first, which is real radio
 //! traffic and therefore only ever user-initiated.
+//!
+//! Because the graph is derived, it can be kept current for free: `watch_topology`
+//! rebuilds it when a node change says it might have moved, and publishes
+//! `network_topology_updated` only when the graph is actually different.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -12,6 +17,7 @@ use serde_json::{json, Value};
 
 use crate::matter::mdns_browser::{self, ServiceInstance};
 use crate::protocol::error::ApiResult;
+use crate::protocol::events::Event;
 use crate::protocol::message::Args;
 use crate::protocol::model::{
     MatterNodeData, NetworkTopology, NetworkTopologyConnection, NetworkTopologyNode,
@@ -19,7 +25,7 @@ use crate::protocol::model::{
 };
 use crate::protocol::paths::parse_path;
 
-use super::CallContext;
+use super::{CallContext, ServerContext};
 
 const THREAD_DIAGNOSTICS_CLUSTER: u32 = 53;
 const WIFI_DIAGNOSTICS_CLUSTER: u32 = 54;
@@ -158,6 +164,63 @@ pub async fn get_thread_diagnostics(args: &Args, context: CallContext<'_>) -> Ap
         }
         None => Ok(json!([])),
     }
+}
+
+/// Publish `network_topology_updated` whenever the graph actually changes.
+///
+/// The graph is derived from what the nodes report, so it changes when a node
+/// is added or removed, when one comes or goes, and when a poll brings back
+/// new Thread or Wi-Fi diagnostics. All of those already announce themselves
+/// with a node event, so this watches the event stream rather than asking
+/// every publisher to remember the topology as well.
+///
+/// A client that never issued `get_network_topology` is not sent these, so
+/// this is one recomputation per burst of node changes and no traffic at all
+/// on a server whose clients do not use the graph.
+pub async fn watch_topology(context: Arc<ServerContext>) {
+    let events = context.events.subscribe();
+    watch(context, events).await
+}
+
+/// The loop itself, over a subscription the caller made — so a test can
+/// subscribe before it publishes anything and not race the watcher.
+async fn watch(context: Arc<ServerContext>, events: async_channel::Receiver<Event>) {
+    let mut published: Option<Value> = None;
+
+    while let Ok(event) = events.recv().await {
+        if !matches!(
+            event.name(),
+            "node_added" | "node_updated" | "node_removed"
+        ) {
+            continue;
+        }
+        // A poll publishes a node event per changed attribute, and an
+        // interview publishes one per endpoint. Draining what is already
+        // queued collapses that burst into a single rebuild — nothing is lost,
+        // because the rebuild reads the store rather than the events.
+        while events.try_recv().is_ok() {}
+
+        let topology = build_topology(&context.nodes.all());
+        let shape = topology_shape(&topology);
+        if published.as_ref() == Some(&shape) {
+            continue;
+        }
+        published = Some(shape);
+        context
+            .events
+            .publish(Event::network_topology_updated(&topology));
+    }
+}
+
+/// The part of the graph a client cares about seeing change.
+///
+/// `collected_at` is the time the graph was built, so it differs on every
+/// rebuild; comparing it would make every poll look like a change.
+fn topology_shape(topology: &NetworkTopology) -> Value {
+    json!({
+        "nodes": topology.nodes,
+        "connections": topology.connections,
+    })
 }
 
 /// Build the network graph.
@@ -605,6 +668,68 @@ mod tests {
             .insert("0/53/4".into(), json!(0x1122334455667788u64));
         node.attributes.insert("0/53/63".into(), json!(base64(ext)));
         node
+    }
+
+    /// `collected_at` moves on every rebuild, so a graph compared with it
+    /// would look different every time and publish on every poll.
+    #[test]
+    fn the_compared_shape_ignores_when_it_was_collected() {
+        let nodes = [thread_node(1, &[0xAA; 8], 6)];
+        let mut early = build_topology(&nodes);
+        let mut late = build_topology(&nodes);
+        early.collected_at = 1;
+        late.collected_at = 2;
+        assert_eq!(topology_shape(&early), topology_shape(&late));
+
+        let grown = build_topology(&[nodes[0].clone(), thread_node(2, &[0xBB; 8], 5)]);
+        assert_ne!(topology_shape(&early), topology_shape(&grown));
+    }
+
+    /// The watcher publishes on a node change, and only when the graph moved.
+    #[test]
+    fn a_node_change_publishes_the_graph_once() {
+        let context = Arc::new(test_context());
+        context.nodes.upsert(crate::storage::StoredNode::new(
+            thread_node(1, &[0xAA; 8], 6),
+        ));
+        // Subscribed before the watcher runs, so nothing is missed either way.
+        let watched = context.events.subscribe();
+        let seen = context.events.subscribe();
+
+        let driver = async {
+            let node = context.nodes.get(1).unwrap();
+            context.events.publish(Event::node_updated(&node));
+
+            let mut topologies = 0;
+            let mut node_events = 0;
+            // Two rounds: the second publishes a node event that changes
+            // nothing, so the graph must not be announced again.
+            while node_events < 2 {
+                let event = seen.recv().await.unwrap();
+                match event.name() {
+                    "network_topology_updated" => {
+                        topologies += 1;
+                        assert_eq!(event.payload["data"]["nodes"].as_array().unwrap().len(), 1);
+                        // Nothing about the store changed, so this must be
+                        // the last one.
+                        context.events.publish(Event::node_updated(&node));
+                    }
+                    "node_updated" => node_events += 1,
+                    other => panic!("unexpected event {}", other),
+                }
+                // Let the watcher run before deciding it published nothing.
+                for _ in 0..8 {
+                    futures_lite::future::yield_now().await;
+                }
+            }
+            topologies
+        };
+
+        let watcher = async {
+            watch(context.clone(), watched).await;
+            0
+        };
+        assert_eq!(block_on(futures_lite::future::or(driver, watcher)), 1);
     }
 
     #[test]

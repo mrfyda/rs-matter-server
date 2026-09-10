@@ -28,8 +28,8 @@ with the independent work pulled forward so it is not held behind the keystone.
 
 ## Phase 0 — independent wins
 
-Nothing here touches the transport, and each item flips a PARITY.md row on its
-own.
+Nothing here touches the Matter transport, and each item flips a PARITY.md row
+on its own. One is left:
 
 **A dual-stack mDNS browser** (gap 3). The one-shot browser asks over IPv4
 only, so everything it finds depends on an IPv4 answer — fine for Wi-Fi and
@@ -38,9 +38,6 @@ re-advertises it. Send the same query from an IPv6 socket to `ff02::fb` as
 well and merge the answers. Additive by construction: the IPv4 query keeps
 working if the IPv6 one cannot be sent, which is what makes it safe to do
 without a Thread network to test on.
-
-**`network_topology_updated` as a push.** Publish after a poll or a `refresh`
-recomputes the graph, rather than only building it on request.
 
 ## Phase 1 — the responder loop
 

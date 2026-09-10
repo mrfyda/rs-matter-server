@@ -74,7 +74,7 @@ The `every_advertised_command_is_routed` contract test enforces that against
 | `server_shutdown` | ✅ | Published before the listener closes. |
 | `node_event` | ⚠️ | The shape and the `diagnostics` history are implemented, but nothing emits one: receiving Matter events needs the subscription path below. |
 | `thread_diagnostics_updated` | ❌ | Gated opt-in is implemented; Border Routers are discovered but no collector produces diagnostics batches. |
-| `network_topology_updated` | ⚠️ | Gated opt-in is implemented; the graph is built on request rather than pushed. |
+| `network_topology_updated` | ✅ | Published when a node change moves the graph — a node added or removed, one coming or going, or a poll bringing back different Thread or Wi-Fi diagnostics. A rebuild that produces the same graph is not announced, and `collected_at` is excluded from that comparison so a rebuild alone is not a change. |
 | `webrtc_callback` | ❌ | A device raises these by invoking `WebRTCTransportRequestor` on the controller; nothing here hosts that cluster. |
 
 Event gating matches the reference: nothing is delivered before
@@ -227,7 +227,7 @@ it cannot map to one release.
 cargo test --manifest-path server/Cargo.toml
 ```
 
-275 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
+277 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
 wire-naming registry, the SPAKE2+ verifier against the Matter test vector, the
 mDNS browser's message parsing, the update-ledger rules, storage and restart
 recovery, every command handler, 7 matterjs-server import tests that build a
