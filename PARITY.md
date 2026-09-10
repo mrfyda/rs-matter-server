@@ -53,12 +53,12 @@ The `every_advertised_command_is_routed` contract test enforces that against
 | `unregister_icd` | ✅ | `force` skips the peer round-trip. |
 | `resync_icd` | ✅ | Unregisters and reconnects; answers `null`. |
 | `check_node_update` | ✅ | Locally uploaded images first, then the CSA Distributed Compliance Ledger (cached for an hour). Test vendor ids use the test ledger only with `--enable-test-net-dcl`. A version with no published image is not reported as an update. |
-| `update_node` | ❌ | Reports error 11 with a reason. Delivering an image needs an OTA Provider cluster server and a BDX transfer, which are not implemented. |
+| `update_node` | ❌ | Reports error 11 with a reason. Delivering an image means hosting the OTA Provider cluster and streaming the bytes over BDX. rs-matter 0.3 ships both halves; what is missing here is a responder to host them — see the gaps below. |
 | `initiate_ota_upload` | ✅ | Single-use, client-bound, expiring ticket; the HTTP endpoint parses the OTA header and stores the image. |
 | `get_thread_border_routers` | ✅ | Passive `_meshcop._udp` browse reporting extended address, extended PAN id, network name, host name, addresses and vendor/model. |
 | `get_thread_diagnostics` | ❌ | Returns the documented "nothing cached" answers (`null` for one network, `[]` for all). MeshCoP/OTBR collection is not implemented. `ext_pan_id` is still validated. |
 | `get_network_topology` | ✅ | Real graph derived from the nodes' Thread and Wi-Fi diagnostics: roles, neighbour links with per-direction LQI/RSSI, route-table fallback edges, unknown Thread neighbours, and synthetic Wi-Fi access points. `refresh` re-reads the diagnostics clusters. |
-| `send_webrtc_provider_command` | ❌ | Validates its arguments, then reports error 7 with a reason. rs-matter has no WebRTC transport. |
+| `send_webrtc_provider_command` | ❌ | Validates its arguments, then reports error 7 with a reason. Invoking the provider command is the easy half; the answer and ICE candidates come back as invokes on a `WebRTCTransportRequestor` server this node does not host — see the gaps below. |
 | `subscribe_attribute` | ❌ | Error 9, matching the reference implementation (its docs call it a stub, but its dispatcher rejects it). |
 
 ## Events
@@ -75,7 +75,7 @@ The `every_advertised_command_is_routed` contract test enforces that against
 | `node_event` | ⚠️ | The shape and the `diagnostics` history are implemented, but nothing emits one: receiving Matter events needs the subscription path below. |
 | `thread_diagnostics_updated` | ❌ | Gated opt-in is implemented; Border Routers are discovered but no collector produces diagnostics batches. |
 | `network_topology_updated` | ⚠️ | Gated opt-in is implemented; the graph is built on request rather than pushed. |
-| `webrtc_callback` | ❌ | No WebRTC transport. |
+| `webrtc_callback` | ❌ | A device raises these by invoking `WebRTCTransportRequestor` on the controller; nothing here hosts that cluster. |
 
 Event gating matches the reference: nothing is delivered before
 `start_listening`, and the Thread, topology and WebRTC events additionally
@@ -112,10 +112,18 @@ only real proof.
 
 ## Known gaps
 
-1. **Device-initiated subscriptions.** rs-matter 0.3 can *establish* a
-   subscription but gives a controller no way to consume the ongoing reports,
-   which arrive as device-initiated exchanges. Clients see the same
-   `attribute_updated` / `node_updated` events, produced two ways:
+How these get closed, in what order, and what each one takes to verify is in
+[docs/ROADMAP.md](docs/ROADMAP.md).
+
+1. **Device-initiated subscriptions.** rs-matter 0.3 establishes a subscription
+   and then hands the caller nothing to consume it with: after the priming
+   chunks, reports arrive on device-initiated exchanges, and there is no
+   receiver abstraction upstream for them. The primitives are public
+   (`Exchange::accept`, `ReportDataResp`, `StatusResp`), so the receiver is
+   buildable here — a responder loop plus a registry keyed by
+   `(fabric, node, subscription id)`, with resubscribe on a missed `max_int`.
+   Until it exists, clients see the same `attribute_updated` / `node_updated`
+   events, produced two ways:
 
    - **Changes this controller caused** are read back from the target endpoint
      as soon as the command returns, so a client's view updates in about
@@ -161,15 +169,29 @@ only real proof.
    per-node diagnostics from one needs a MeshCoP (CoAP/DTLS) or OTBR REST
    client.
 5. **OTA distribution.** Update *discovery* is complete — the ledger is queried
-   and local uploads are stored — but serving an image to a device needs an OTA
-   Provider cluster server and a BDX transfer, which are not implemented. If the
-   ledger offers an update, a client will show it and installing it will fail
-   with the documented update error.
+   and local uploads are stored — but nothing serves the image to the device.
+   The Matter half of that is in rs-matter 0.3 already: `dm::clusters::ota_prov`
+   has `OtaProviderHandler` and `OtaBdxHandler` over the `OtaImagesRegistry` and
+   `OtaImages` traits, and `bdx` is a complete transfer engine. What is missing
+   is this side: the server runs `matter.run` and nothing else, so it accepts no
+   incoming exchange and a device's `QueryImage` reaches no handler. Closing this
+   means the responder loop of gap 1, those two handlers over the existing image
+   store, an `AnnounceOTAProvider` invoke to point the device here, and the ACL
+   entry that lets it invoke back. Until then, if the ledger offers an update a
+   client will show it and installing it will fail with the documented update
+   error.
 
    Note that a Matter update is not the same thing as a vendor update: a device
    can be current in the ledger while the vendor's own app offers newer
    firmware over its own channel, which Matter cannot see.
-6. **WebRTC.** Not supported by rs-matter.
+6. **WebRTC.** No camera signalling is relayed. The blocker is the same missing
+   responder as gap 5, not a missing transport: rs-matter 0.3 has both
+   signalling clusters (`dm::clusters::app::webrtc_prov`, `webrtc_req`) and a
+   TCP transport for the SDP payloads too large for MRP. A controller invokes
+   `SolicitOffer` / `ProvideOffer` on the camera — which this server can already
+   do — and hosts `WebRTCTransportRequestor` to receive the answer and the ICE
+   candidates the camera invokes back, which it cannot. Media itself never
+   touches this server; the reference relays signalling only, as would this.
 7. **Epoch-typed attributes.** matter.js converts `epoch-s`/`epoch-us`
    attributes to Unix time using the cluster schema. Values here are reported as
    the device sent them (Matter epoch).

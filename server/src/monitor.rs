@@ -1,10 +1,10 @@
 //! Attribute monitoring.
 //!
 //! The protocol promises `attribute_updated` events, and clients build their
-//! whole view of a device from them. rs-matter 0.3 has no client-side
-//! subscription receiver — establishing a subscription is supported, but the
-//! ongoing reports arrive as device-initiated exchanges that a controller has
-//! no API to consume — so changes are discovered by polling instead.
+//! whole view of a device from them. rs-matter 0.3 establishes a subscription
+//! but offers no receiver for it: the ongoing reports arrive as
+//! device-initiated exchanges, and this server accepts none — so changes are
+//! discovered by polling instead.
 //!
 //! The observable protocol behaviour is the same: a change produces an
 //! `attribute_updated` event, a node that stops answering produces a

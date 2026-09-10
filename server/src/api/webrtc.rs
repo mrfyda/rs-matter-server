@@ -1,10 +1,12 @@
 //! WebRTC provider commands.
 //!
-//! Routing `ProvideOffer` / `SolicitOffer` needs a WebRTC Transport Provider
-//! client, session bookkeeping, and the `webrtc_callback` event stream that
-//! carries answers and ICE candidates back. rs-matter has no WebRTC transport,
-//! so the command reports the SDK error with a reason instead of appearing to
-//! start a session that can never be completed.
+//! Routing `ProvideOffer` / `SolicitOffer` is only half of the exchange: the
+//! camera returns its answer and ICE candidates by invoking
+//! `WebRTCTransportRequestor` on the controller, which this node does not host
+//! — it accepts no incoming exchange at all — so there is nothing to feed the
+//! `webrtc_callback` event stream or the session bookkeeping behind it. The
+//! command reports the SDK error with a reason instead of appearing to start a
+//! session that can never be completed.
 
 use crate::protocol::error::{ApiError, ApiResult};
 use crate::protocol::message::Args;
