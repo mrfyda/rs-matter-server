@@ -26,7 +26,7 @@ use rs_matter::tlv::{TLVElement, TLVTag, TLVValue, TLVWrite};
 
 use crate::protocol::error::ApiError;
 
-use super::clusters::{CommandMeta, FieldKind, StructMeta};
+use super::clusters::{self, CommandMeta, EpochUnit, FieldKind, StructMeta};
 
 // ---------------------------------------------------------------------------
 // Decoding: TLV -> JSON
@@ -36,6 +36,37 @@ use super::clusters::{CommandMeta, FieldKind, StructMeta};
 /// context tag.
 pub fn to_json(element: &TLVElement<'_>) -> Result<Value, Error> {
     decode(element, None)
+}
+
+/// Decode an attribute report, converting an epoch-typed value to Unix time.
+///
+/// Matter counts these from 2000-01-01 and the reference reports them as Unix
+/// time, so a client comparing one to its own clock needs the conversion done
+/// here rather than left to it.
+pub fn attribute_to_json(
+    cluster_id: u32,
+    attribute_id: u32,
+    element: &TLVElement<'_>,
+) -> Result<Value, Error> {
+    let value = decode(element, None)?;
+    Ok(match attribute_epoch(cluster_id, attribute_id) {
+        Some(unit) => to_unix_time(value, unit),
+        None => value,
+    })
+}
+
+fn attribute_epoch(cluster_id: u32, attribute_id: u32) -> Option<EpochUnit> {
+    clusters::cluster(cluster_id)?.attribute_epoch(attribute_id)
+}
+
+/// Matter epoch -> Unix. A null (the usual "not known yet" for these
+/// attributes) and anything that is not an unsigned count pass through
+/// unchanged.
+fn to_unix_time(value: Value, unit: EpochUnit) -> Value {
+    match value.as_u64() {
+        Some(matter) => Value::from(matter.saturating_add(unit.unix_offset())),
+        None => value,
+    }
 }
 
 /// Decode an invoke response: the top-level members are keyed by name, and
@@ -264,9 +295,19 @@ pub fn command_payload_from_json(
 }
 
 /// Encode an attribute value for a write. Attribute payloads are tag based, so
-/// no schema is consulted; a bytes-valued attribute must be sent as base64 and
-/// is detected by the caller supplying [`FieldKind::Bytes`].
-pub fn attribute_value_from_json(value: &Value) -> Result<TlvNode, ApiError> {
+/// no schema is consulted beyond the epoch types: a client sends Unix time for
+/// those, and the device expects Matter epoch.
+///
+/// A Unix time before 2000-01-01 has no Matter representation and encodes as
+/// the epoch itself, which is the closest instant the device can hold.
+pub fn attribute_value_from_json(
+    cluster_id: u32,
+    attribute_id: u32,
+    value: &Value,
+) -> Result<TlvNode, ApiError> {
+    if let (Some(unit), Some(unix)) = (attribute_epoch(cluster_id, attribute_id), value.as_u64()) {
+        return Ok(TlvNode::U64(unix.saturating_sub(unit.unix_offset())));
+    }
     from_json(value, &FieldKind::Other)
 }
 
@@ -484,7 +525,8 @@ mod tests {
 
     #[test]
     fn attribute_writes_address_struct_fields_by_tag() {
-        let node = attribute_value_from_json(&json!({ "1": 5, "0": "text" })).unwrap();
+        // Basic Information's NodeLabel: an ordinary, non-epoch attribute.
+        let node = attribute_value_from_json(40, 5, &json!({ "1": 5, "0": "text" })).unwrap();
         assert_eq!(
             node,
             TlvNode::Struct(vec![
@@ -492,7 +534,71 @@ mod tests {
                 (1, TlvNode::U64(5))
             ])
         );
-        let error = attribute_value_from_json(&json!({ "label": 5 })).unwrap_err();
+        let error = attribute_value_from_json(40, 5, &json!({ "label": 5 })).unwrap_err();
         assert!(error.details.contains("numeric TLV tag"));
+    }
+
+    /// 2001-09-09T01:46:40Z, which is 1_000_000_000 in Unix seconds and
+    /// 53_315_200 in Matter seconds.
+    const UNIX_SECS: u64 = 1_000_000_000;
+    const MATTER_SECS: u64 = UNIX_SECS - 946_684_800;
+
+    #[test]
+    fn epoch_attributes_are_reported_as_unix_time() {
+        let mut buf = [0u8; 32];
+        let len = encode(&TlvNode::U64(MATTER_SECS), &mut buf);
+        let element = TLVElement::new(&buf[..len]);
+        // EnergyEvse::NextChargeStartTime, an epoch_s attribute.
+        assert_eq!(
+            attribute_to_json(153, 35, &element).unwrap(),
+            json!(UNIX_SECS)
+        );
+        // The same bytes on an attribute that is not an epoch stay as they are.
+        assert_eq!(
+            attribute_to_json(153, 0, &element).unwrap(),
+            json!(MATTER_SECS)
+        );
+    }
+
+    #[test]
+    fn an_unknown_epoch_value_is_left_alone() {
+        let mut buf = [0u8; 32];
+        let len = encode(&TlvNode::Null, &mut buf);
+        let element = TLVElement::new(&buf[..len]);
+        assert_eq!(attribute_to_json(153, 35, &element).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn epoch_attribute_writes_are_converted_back() {
+        assert_eq!(
+            attribute_value_from_json(153, 35, &json!(UNIX_SECS)).unwrap(),
+            TlvNode::U64(MATTER_SECS)
+        );
+        // TimeSynchronization::UTCTime counts microseconds.
+        assert_eq!(
+            attribute_value_from_json(56, 0, &json!(UNIX_SECS * 1_000_000)).unwrap(),
+            TlvNode::U64(MATTER_SECS * 1_000_000)
+        );
+    }
+
+    /// A client that sends a time before the Matter epoch gets the epoch
+    /// rather than a wrapped u64.
+    #[test]
+    fn a_pre_2000_write_saturates_at_the_matter_epoch() {
+        assert_eq!(
+            attribute_value_from_json(153, 35, &json!(0)).unwrap(),
+            TlvNode::U64(0)
+        );
+    }
+
+    #[test]
+    fn epoch_conversion_round_trips() {
+        let node = attribute_value_from_json(56, 0, &json!(UNIX_SECS * 1_000_000)).unwrap();
+        let mut buf = [0u8; 32];
+        let len = encode(&node, &mut buf);
+        assert_eq!(
+            attribute_to_json(56, 0, &TLVElement::new(&buf[..len])).unwrap(),
+            json!(UNIX_SECS * 1_000_000)
+        );
     }
 }

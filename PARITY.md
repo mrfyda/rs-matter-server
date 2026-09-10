@@ -41,8 +41,8 @@ The `every_advertised_command_is_routed` contract test enforces that against
 | `commission_on_network` | ✅ | Explicit `ip_addr`, or `filter_type`/`filter` (none / short discriminator / long discriminator / vendor / device type). |
 | `open_commissioning_window` | ✅ | Enhanced window: a fresh passcode, a SPAKE2+ verifier computed here (validated against the Matter test vector), and manual + QR codes in the response. |
 | `discover` / `discover_commissionable_nodes` | ✅ | Browses `_matterc._udp` directly and reports the full TXT record: discriminator, vendor, product, device type and name, pairing hint and instruction, MRP intervals, TCP support, addresses. Filters are applied to the results. |
-| `read_attribute` | ✅ | Single path, lists, and wildcards. Values decode tag-based with base64 octet strings, matching the reference. |
-| `write_attribute` | ✅ | Returns `[{ Path: { EndpointId, ClusterId, AttributeId }, Status }]` — the capitalised shape the reference sends here (unlike ACL/binding writes). |
+| `read_attribute` | ✅ | Single path, lists, and wildcards. Values decode tag-based with base64 octet strings, matching the reference. The 21 attributes the Matter IDL types `epoch_us` or `epoch_s` are reported as Unix time, as matter.js reports them. |
+| `write_attribute` | ✅ | Returns `[{ Path: { EndpointId, ClusterId, AttributeId }, Status }]` — the capitalised shape the reference sends here (unlike ACL/binding writes). An epoch-typed attribute is written back in Matter epoch, so a client sends and receives Unix time throughout. |
 | `device_command` | ✅ | `command_name` and named payload fields resolve through cluster metadata generated from rs-matter's own definitions (153 clusters, 411 commands, 58 payload structs). Fields inside a nested struct — and inside a list of structs — resolve by name too. Responses decode name-based via each command's declared response struct, so a shared response (`NOCResponse`) is still named correctly. |
 | `get_matter_fabrics` | ✅ | Reads `OperationalCredentials.Fabrics`, decorated with vendor names. |
 | `remove_matter_fabric` | ✅ | `RemoveFabric` invoke. |
@@ -192,9 +192,6 @@ How these get closed, in what order, and what each one takes to verify is in
    do — and hosts `WebRTCTransportRequestor` to receive the answer and the ICE
    candidates the camera invokes back, which it cannot. Media itself never
    touches this server; the reference relays signalling only, as would this.
-7. **Epoch-typed attributes.** matter.js converts `epoch-s`/`epoch-us`
-   attributes to Unix time using the cluster schema. Values here are reported as
-   the device sent them (Matter epoch).
 
 ## Hardware validation
 
@@ -228,7 +225,7 @@ it cannot map to one release.
 cargo test --manifest-path server/Cargo.toml
 ```
 
-261 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
+268 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
 wire-naming registry, the SPAKE2+ verifier against the Matter test vector, the
 mDNS browser's message parsing, the update-ledger rules, storage and restart
 recovery, every command handler, 7 matterjs-server import tests that build a

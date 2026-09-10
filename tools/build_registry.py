@@ -15,7 +15,16 @@ Usage:
     cargo build --manifest-path server/Cargo.toml --release
     python3 tools/build_registry.py \
         "$(ls -d server/target/release/build/rs-matter-*/out/clusters_generated | head -1)" \
-        server/src/matter/clusters.json
+        server/src/matter/clusters.json \
+        "$(ls -d ~/.cargo/registry/src/*/rs-matter-codegen-* | head -1)"
+
+The third argument is rs-matter-codegen's source directory, which is where the
+Matter IDL lives. It is read for one thing the generated Rust can no longer
+say: whether an attribute is `epoch_us` or `epoch_s`, both of which codegen
+lowers to a plain `u64`. Every one of them is checked against the generated
+`AttributeId` — same id, same name — so a codegen that moved to a newer IDL
+than the compiled crate fails here instead of silently mislabelling an
+attribute.
 
 Re-run this after upgrading rs-matter. The output is checked in so that
 building this project does not depend on locating a build artifact.
@@ -53,6 +62,79 @@ ACCESSOR_RE = re.compile(
 )
 
 ARRAY_RE = re.compile(r"(?:TLVArray|ArrayIter)<\s*'\w+\s*,\s*(.+)>$")
+
+# Which IDL revision the compiled crate generated from: codegen includes one
+# and leaves the others commented out.
+ACTIVE_IDL_RE = re.compile(r'^\s*include_str!\("(idl/parser/[\w.\-]+\.matter)"\)', re.M)
+# `cluster Thermostat = 513 {`, with the qualifiers the IDL allows in front.
+IDL_CLUSTER_RE = re.compile(
+    r"^(?:provisional\s+|internal\s+)?(?:client\s+|server\s+)?cluster\s+(\w+)\s*=\s*(\d+)\s*\{",
+    re.M,
+)
+# `readonly attribute optional nullable epoch_us localTime = 7;`
+IDL_EPOCH_ATTRIBUTE_RE = re.compile(
+    r"^\s*(?:readonly\s+)?attribute\s+(?:access\([^)]*\)\s+)?"
+    r"(?:optional\s+)?(?:nullable\s+)?(?:optional\s+)?"
+    r"(epoch_us|epoch_s)\s+(\w+)\s*=\s*(\d+)\s*;",
+    re.M,
+)
+
+
+def read_idl(codegen_dir: Path) -> str:
+    """The IDL revision the compiled crate actually generated from."""
+    active = ACTIVE_IDL_RE.search((codegen_dir / "src" / "idl.rs").read_text())
+    if active is None:
+        raise SystemExit(f"no active .matter IDL found in {codegen_dir}/src/idl.rs")
+    return (codegen_dir / "src" / active.group(1)).read_text()
+
+
+def parse_epoch_attributes(idl: str) -> dict[int, dict[int, tuple[str, str]]]:
+    """Cluster id -> attribute id -> (unit, name as the IDL spells it).
+
+    Matter measures these from 2000-01-01, and the reference server converts
+    them to Unix time using its own cluster schema. The generated Rust has
+    already lowered both to `u64`, so this is the only place the distinction
+    survives.
+    """
+    clusters = [
+        (match.start(), int(match.group(2))) for match in IDL_CLUSTER_RE.finditer(idl)
+    ]
+    out: dict[int, dict[int, tuple[str, str]]] = {}
+    for index, (start, cluster_id) in enumerate(clusters):
+        end = clusters[index + 1][0] if index + 1 < len(clusters) else len(idl)
+        for unit, name, attribute_id in IDL_EPOCH_ATTRIBUTE_RE.findall(idl[start:end]):
+            out.setdefault(cluster_id, {})[int(attribute_id)] = (
+                unit.removeprefix("epoch_"),
+                name,
+            )
+    return out
+
+
+def check_against_generated(
+    cluster_id: int, epochs: dict[int, tuple[str, str]], attributes: dict[str, int]
+) -> dict[str, str]:
+    """Attribute id -> unit, once the IDL and the generated code agree.
+
+    A mismatch means the two inputs describe different Matter revisions, which
+    would put an epoch label on the wrong attribute. That is worse than no
+    label at all, so it stops the build rather than being warned about.
+    """
+    by_id = {id: name for name, id in attributes.items()}
+    out = {}
+    for attribute_id, (unit, idl_name) in sorted(epochs.items()):
+        generated = by_id.get(attribute_id)
+        if generated is None:
+            raise SystemExit(
+                f"cluster {cluster_id}: IDL has epoch attribute {idl_name} = "
+                f"{attribute_id}, the generated code has no such attribute id"
+            )
+        if generated.lower() != idl_name.lower():
+            raise SystemExit(
+                f"cluster {cluster_id}: attribute {attribute_id} is {idl_name} in "
+                f"the IDL and {generated} in the generated code"
+            )
+        out[str(attribute_id)] = unit
+    return out
 
 
 def unwrap(rust_type: str) -> str:
@@ -171,8 +253,9 @@ def parse_enums(source: str) -> dict[str, dict[str, int]]:
     return out
 
 
-def main(generated_dir: str, out_path: str) -> None:
+def main(generated_dir: str, out_path: str, codegen_dir: str) -> None:
     directory = Path(generated_dir)
+    epoch_attributes = parse_epoch_attributes(read_idl(Path(codegen_dir)))
     registry = {}
 
     for path in sorted(directory.glob("*.rs")):
@@ -218,6 +301,11 @@ def main(generated_dir: str, out_path: str) -> None:
         }
         if definitions:
             cluster["structs"] = definitions
+        epochs = check_against_generated(
+            cluster_id, epoch_attributes.get(cluster_id, {}), cluster["attributes"]
+        )
+        if epochs:
+            cluster["epoch"] = epochs
         registry[str(cluster_id)] = cluster
 
     Path(out_path).write_text(json.dumps(registry, separators=(",", ":"), sort_keys=True))
@@ -225,8 +313,12 @@ def main(generated_dir: str, out_path: str) -> None:
     commands = sum(len(c["commands"]) for c in registry.values())
     attributes = sum(len(c["attributes"]) for c in registry.values())
     structs = sum(len(c.get("structs", {})) for c in registry.values())
-    print(f"{clusters} clusters, {commands} commands, {attributes} attributes, {structs} structs")
+    epochs = sum(len(c.get("epoch", {})) for c in registry.values())
+    print(
+        f"{clusters} clusters, {commands} commands, {attributes} attributes, "
+        f"{structs} structs, {epochs} epoch attributes"
+    )
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2])
+    main(sys.argv[1], sys.argv[2], sys.argv[3])

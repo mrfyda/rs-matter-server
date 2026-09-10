@@ -31,6 +31,10 @@ struct RawCluster {
     /// Struct definitions the commands above refer to by name.
     #[serde(default)]
     structs: BTreeMap<String, RawStruct>,
+    /// Attribute id (as a string key) -> `us` or `s`, for the attributes the
+    /// Matter IDL types as an epoch.
+    #[serde(default)]
+    epoch: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,6 +64,28 @@ pub struct ClusterMeta {
     commands: Vec<CommandMeta>,
     attributes: Vec<(String, u32)>,
     events: Vec<(String, u32)>,
+    epoch: BTreeMap<u32, EpochUnit>,
+}
+
+/// How an epoch-typed attribute counts.
+///
+/// Matter measures both from 2000-01-01T00:00:00 UTC; the reference reports
+/// them as Unix time, so the conversion happens at the codec boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpochUnit {
+    Seconds,
+    Micros,
+}
+
+impl EpochUnit {
+    /// How far the Matter epoch sits after the Unix one, in this unit.
+    pub const fn unix_offset(self) -> u64 {
+        const MATTER_EPOCH_UNIX_SECS: u64 = 946_684_800;
+        match self {
+            Self::Seconds => MATTER_EPOCH_UNIX_SECS,
+            Self::Micros => MATTER_EPOCH_UNIX_SECS * 1_000_000,
+        }
+    }
 }
 
 /// What a payload field holds. TLV is self-describing on read, so this is
@@ -234,6 +260,11 @@ impl ClusterMeta {
             .map(|(name, _)| name.as_str())
     }
 
+    /// The epoch unit an attribute is typed with, if any.
+    pub fn attribute_epoch(&self, id: u32) -> Option<EpochUnit> {
+        self.epoch.get(&id).copied()
+    }
+
     pub fn event_name(&self, id: u32) -> Option<&str> {
         self.events
             .iter()
@@ -318,6 +349,18 @@ fn registry() -> &'static BTreeMap<u32, ClusterMeta> {
                         commands,
                         attributes: cluster.attributes.into_iter().collect(),
                         events: cluster.events.into_iter().collect(),
+                        epoch: cluster
+                            .epoch
+                            .into_iter()
+                            .filter_map(|(id, unit)| {
+                                let unit = match unit.as_str() {
+                                    "us" => EpochUnit::Micros,
+                                    "s" => EpochUnit::Seconds,
+                                    _ => return None,
+                                };
+                                Some((id.parse().ok()?, unit))
+                            })
+                            .collect(),
                     },
                 ))
             })
@@ -435,6 +478,29 @@ mod tests {
         // Clients send this as PINCode or pinCode depending on their SDK.
         assert_eq!(lock.request_tag("PINCode"), lock.request_tag("pinCode"));
         assert!(lock.request_tag("PINCode").is_some());
+    }
+
+    #[test]
+    fn epoch_typed_attributes_are_labelled_with_their_unit() {
+        let time_sync = cluster(56).unwrap();
+        let utc_time = time_sync.attribute_id("UTCTime").unwrap();
+        assert_eq!(time_sync.attribute_epoch(utc_time), Some(EpochUnit::Micros));
+
+        let evse = cluster(153).unwrap();
+        let next_start = evse.attribute_id("NextChargeStartTime").unwrap();
+        assert_eq!(evse.attribute_epoch(next_start), Some(EpochUnit::Seconds));
+
+        // An ordinary integer attribute is not an epoch, and neither is an
+        // attribute id that belongs to a different cluster.
+        assert_eq!(cluster(6).unwrap().attribute_epoch(0), None);
+        assert_eq!(time_sync.attribute_epoch(1), None);
+    }
+
+    #[test]
+    fn the_matter_epoch_offset_is_the_2000_01_01_boundary() {
+        // 1970-01-01 to 2000-01-01 is 30 years with 7 leap days.
+        assert_eq!(EpochUnit::Seconds.unix_offset(), 946_684_800);
+        assert_eq!(EpochUnit::Micros.unix_offset(), 946_684_800_000_000);
     }
 
     #[test]

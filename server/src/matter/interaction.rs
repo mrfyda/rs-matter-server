@@ -102,12 +102,11 @@ pub async fn read_attributes<C: Crypto>(
             for report in reports.iter() {
                 match report.map_err(|e| im_error("attribute report", e))? {
                     AttrResp::Data(data) => {
-                        let path = format_path(
-                            data.path.endpoint.unwrap_or(0),
-                            data.path.cluster.unwrap_or(0),
-                            data.path.attr.unwrap_or(0),
-                        );
-                        let value = tlv_json::to_json(&data.data)
+                        let cluster = data.path.cluster.unwrap_or(0);
+                        let attribute = data.path.attr.unwrap_or(0);
+                        let path =
+                            format_path(data.path.endpoint.unwrap_or(0), cluster, attribute);
+                        let value = tlv_json::attribute_to_json(cluster, attribute, &data.data)
                             .map_err(|e| im_error("attribute value", e))?;
                         attributes.insert(path, value);
                     }
