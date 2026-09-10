@@ -15,6 +15,7 @@ use serde_json::Value;
 
 use crate::protocol::error::{ApiError, ApiResult};
 use crate::protocol::message::Args;
+use crate::matter::tlv_json::TlvNode;
 use crate::protocol::model::{MatterSoftwareVersion, OtaUploadTicket, UpdateSource};
 
 use super::{require_node, CallContext};
@@ -48,6 +49,15 @@ impl StoredImage {
             && self.version.software_version == software_version
     }
 }
+
+/// The OTA Software Update Requestor cluster on a device, and the command that
+/// points it at a provider.
+const OTA_REQUESTOR_ENDPOINT: u16 = 0;
+const OTA_REQUESTOR_CLUSTER: u32 = 0x002A;
+const ANNOUNCE_OTA_PROVIDER_COMMAND: u32 = 0;
+/// `AnnouncementReasonEnum::UpdateAvailable`: an update is waiting, so query
+/// now rather than at the next scheduled poll.
+const ANNOUNCEMENT_UPDATE_AVAILABLE: u64 = 1;
 
 /// Upload reservations plus the images they produced.
 ///
@@ -264,16 +274,92 @@ pub async fn check_node_update(args: &Args, context: CallContext<'_>) -> ApiResu
 
 /// Apply a firmware update.
 ///
-/// Distributing an image needs an OTA Provider cluster server and a BDX
-/// transfer, which this build does not implement; the documented update error
-/// says so rather than reporting a success that will never happen.
+/// This does not push an image: a Matter device fetches its own. What happens
+/// here is that the device is told where a provider is, and this server is
+/// that provider — so the answer means "the device has been told", not "the
+/// device has been updated". The download and the reboot follow on the
+/// device's own schedule, and are visible as they happen: the OTA Requestor
+/// cluster's `UpdateState` and `UpdateStateProgress` attributes are part of
+/// the node's subscription, so they arrive as `attribute_updated` events.
 pub async fn update_node(args: &Args, context: CallContext<'_>) -> ApiResult {
     let node_id = require_node(args, context)?;
-    let _ = args.u64("software_version")?;
-    Err(ApiError::update(format!(
-        "Node {} cannot be updated: this server has no OTA provider, so it cannot deliver firmware images",
-        node_id
-    )))
+    if !context.server.runtime.ota_enabled {
+        return Err(ApiError::update("OTA support is disabled on this server"));
+    }
+    let requested = args.u64("software_version")?;
+
+    let node = context
+        .server
+        .nodes
+        .get(node_id)
+        .ok_or_else(|| ApiError::node_not_exists(node_id))?;
+    let vendor_id = node.attributes.get("0/40/2").and_then(Value::as_u64);
+    let product_id = node.attributes.get("0/40/4").and_then(Value::as_u64);
+    let current_version = node.attributes.get("0/40/9").and_then(Value::as_u64);
+    let (Some(vendor_id), Some(product_id), Some(current_version)) =
+        (vendor_id, product_id, current_version)
+    else {
+        return Err(ApiError::update(format!(
+            "Node {} has not been interviewed, so what it is running is unknown",
+            node_id
+        )));
+    };
+
+    // Only an image this server holds can be served: the ledger says an update
+    // exists, not what is in it, and a provider with nothing to send would
+    // leave the device retrying against a promise.
+    let offered = context
+        .server
+        .ota
+        .best_match(vendor_id as u16, product_id as u16, current_version)
+        .filter(|image| requested.is_none_or(|version| image.software_version == version))
+        .ok_or_else(|| {
+            ApiError::update(match requested {
+                Some(version) => format!(
+                    "No image for version {} of node {} has been uploaded to this server",
+                    version, node_id
+                ),
+                None => format!(
+                    "No image newer than {} has been uploaded for node {}",
+                    current_version, node_id
+                ),
+            })
+        })?;
+
+    // The device is about to invoke on this node, and an incoming invoke is
+    // access-controlled: without this it would be refused by its own
+    // controller.
+    context.server.matter.grant_ota_access(node_id).await?;
+
+    let fabric = context.server.fabric_info().await?;
+    context
+        .server
+        .matter
+        .invoke(
+            node_id,
+            OTA_REQUESTOR_ENDPOINT,
+            OTA_REQUESTOR_CLUSTER,
+            ANNOUNCE_OTA_PROVIDER_COMMAND,
+            TlvNode::Struct(vec![
+                (0, TlvNode::U64(fabric.node_id)),
+                (1, TlvNode::U64(fabric.vendor_id as u64)),
+                (2, TlvNode::U64(ANNOUNCEMENT_UPDATE_AVAILABLE)),
+                (
+                    4,
+                    TlvNode::U64(crate::matter::ota_provider::OTA_PROVIDER_ENDPOINT as u64),
+                ),
+            ]),
+            None,
+            BTreeMap::new(),
+        )
+        .await?;
+
+    log::info!(
+        "Node {} was told to fetch version {} from this server",
+        node_id,
+        offered.software_version
+    );
+    Ok(serde_json::to_value(offered).unwrap_or(Value::Null))
 }
 
 /// Reserve an id for an image upload over HTTP.
@@ -544,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn update_node_reports_the_documented_update_error() {
+    fn updating_a_node_that_was_never_interviewed_is_refused() {
         let context = test_context();
         context.nodes.upsert(StoredNode::new(MatterNodeData::new(
             1,
@@ -553,6 +639,65 @@ mod tests {
         let args = Args::new(json!({ "node_id": 1, "software_version": 2 }));
         let error = block_on(update_node(&args, call(&context))).unwrap_err();
         assert_eq!(error.code.as_i64(), 11);
+        assert!(error.details.contains("has not been interviewed"));
+    }
+
+    /// The ledger knowing about an update is not the same as this server
+    /// having the image: a device pointed at a provider with nothing to send
+    /// would retry against a promise.
+    #[test]
+    fn updating_to_a_version_no_image_was_uploaded_for_is_refused() {
+        let context = test_context();
+        let mut node = MatterNodeData::new(1, "2026-01-01T00:00:00.000Z".into());
+        node.attributes.insert("0/40/2".into(), json!(0xFFF1));
+        node.attributes.insert("0/40/4".into(), json!(0x8001));
+        node.attributes.insert("0/40/9".into(), json!(1));
+        context.nodes.upsert(StoredNode::new(node));
+
+        let error = block_on(update_node(
+            &Args::new(json!({ "node_id": 1, "software_version": 2 })),
+            call(&context),
+        ))
+        .unwrap_err();
+        assert_eq!(error.code.as_i64(), 11);
+        assert!(error.details.contains("has been uploaded"), "{}", error.details);
+
+        // An uploaded image for a *different* version is not a match either.
+        context.ota.store(StoredImage {
+            version: version(3),
+            bytes: vec![0; 4],
+        });
+        let error = block_on(update_node(
+            &Args::new(json!({ "node_id": 1, "software_version": 2 })),
+            call(&context),
+        ))
+        .unwrap_err();
+        assert_eq!(error.code.as_i64(), 11);
+    }
+
+    /// With an image in hand the flow reaches the device, and fails there:
+    /// this test has no Matter actor, which is as far as it can go without one.
+    #[test]
+    fn updating_with_an_uploaded_image_goes_on_to_the_device() {
+        let context = test_context();
+        let mut node = MatterNodeData::new(1, "2026-01-01T00:00:00.000Z".into());
+        node.attributes.insert("0/40/2".into(), json!(0xFFF1));
+        node.attributes.insert("0/40/4".into(), json!(0x8001));
+        node.attributes.insert("0/40/9".into(), json!(1));
+        context.nodes.upsert(StoredNode::new(node));
+        context.ota.store(StoredImage {
+            version: version(2),
+            bytes: vec![0; 4],
+        });
+
+        let error = block_on(update_node(
+            &Args::new(json!({ "node_id": 1, "software_version": 2 })),
+            call(&context),
+        ))
+        .unwrap_err();
+        // The SDK error from the absent actor, not the update error: the
+        // request got past everything this server decides on its own.
+        assert_eq!(error.code.as_i64(), 7);
     }
 
     #[test]

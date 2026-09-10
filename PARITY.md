@@ -53,7 +53,7 @@ The `every_advertised_command_is_routed` contract test enforces that against
 | `unregister_icd` | ✅ | `force` skips the peer round-trip. The stored check-in key is dropped either way. |
 | `resync_icd` | ✅ | Unregisters and reconnects; answers `null`. |
 | `check_node_update` | ✅ | Locally uploaded images first, then the CSA Distributed Compliance Ledger (cached for an hour). Test vendor ids use the test ledger only with `--enable-test-net-dcl`. A version with no published image is not reported as an update. |
-| `update_node` | ❌ | Reports error 11 with a reason. Delivering an image means hosting the OTA Provider cluster and streaming the bytes over BDX. rs-matter 0.3 ships both halves; what is missing here is a responder to host them — see the gaps below. |
+| `update_node` | ⚠️ | Grants the node access to this server's OTA Provider cluster and invokes `AnnounceOTAProvider` on it; the device then queries, downloads over BDX, and applies on its own schedule — visible as `attribute_updated` on the requestor's `UpdateState`. Only an image uploaded here can be served: an update the ledger merely knows about is refused with error 11 and a reason. |
 | `initiate_ota_upload` | ✅ | Single-use, client-bound, expiring ticket; the HTTP endpoint parses the OTA header and stores the image. |
 | `get_thread_border_routers` | ✅ | Passive `_meshcop._udp` browse reporting extended address, extended PAN id, network name, host name, addresses and vendor/model. |
 | `get_thread_diagnostics` | ❌ | Returns the documented "nothing cached" answers (`null` for one network, `[]` for all). MeshCoP/OTBR collection is not implemented. `ext_pan_id` is still validated. |
@@ -168,18 +168,20 @@ How these get closed, in what order, and what each one takes to verify is in
 4. **Thread diagnostics.** Border Routers are discovered, but collecting
    per-node diagnostics from one needs a MeshCoP (CoAP/DTLS) or OTBR REST
    client.
-5. **OTA distribution.** Update *discovery* is complete — the ledger is queried
-   and local uploads are stored — but nothing serves the image to the device.
-   The Matter half of that is in rs-matter 0.3 already: `dm::clusters::ota_prov`
-   has `OtaProviderHandler` and `OtaBdxHandler` over the `OtaImagesRegistry` and
-   `OtaImages` traits, and `bdx` is a complete transfer engine. What is missing
-   is this side: `matter::responder` hosts a data model with no endpoints, so
-   a device's `QueryImage` is told the endpoint does not exist. Closing this
-   means an endpoint carrying those two handlers over the existing image store,
-   an `AnnounceOTAProvider` invoke to point the device here, and the ACL entry
-   that lets it invoke back. Until then, if the ledger offers an update a
-   client will show it and installing it will fail with the documented update
-   error.
+5. **An update the ledger knows about cannot be installed.** The whole
+   provider side works — `matter::responder` hosts the OTA Software Update
+   Provider cluster, `update_node` grants the device access and announces this
+   server to it, and the image goes out over BDX — but only for an image that
+   was uploaded here through `POST /ota-upload/<id>`. `check_node_update` also
+   reports updates found in the CSA ledger, and those cannot be served: the
+   ledger says an image exists and where, not what is in it, so serving one
+   means fetching it from the vendor's CDN first and checking it against the
+   digest the ledger publishes. Until that exists, `update_node` refuses a
+   ledger-only version rather than announcing a provider with nothing to send.
+
+   None of this has run against a device. The image store, the designator
+   parsing and the access grant are unit-tested; the flow through a real
+   requestor is not.
 
    Note that a Matter update is not the same thing as a vendor update: a device
    can be current in the ledger while the vendor's own app offers newer
@@ -225,7 +227,7 @@ it cannot map to one release.
 cargo test --manifest-path server/Cargo.toml
 ```
 
-309 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
+311 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
 wire-naming registry, the SPAKE2+ verifier against the Matter test vector, the
 mDNS browser's message parsing, the update-ledger rules, storage and restart
 recovery, every command handler, 7 matterjs-server import tests that build a

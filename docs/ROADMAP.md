@@ -91,18 +91,21 @@ no readable sender otherwise, and a forged one fails the MIC — so
 Phase 2 is complete. None of it has been run against a device; the sleepy
 Thread sensor in the table below is what proves the ICD half.
 
-## Phase 3 — OTA distribution
+## Phase 3 — OTA distribution — done for uploaded images
 
-Needs **a minimal hosted data model** on top of the responder: a root endpoint
-with Descriptor and ACL, because an incoming invoke is access-controlled and a
-node that has not been granted anything can invoke nothing. Standing that up is
-the real cost of this phase and the next, and the reason both come last.
+`matter::responder` hosts the OTA Software Update Provider cluster on one
+endpoint, `matter::ota_provider` implements `OtaImagesRegistry` and `OtaImages`
+over the image store, and BDX is chained into the same responder. `update_node`
+grants the device access, announces this server, and answers with the image the
+device was told to fetch.
 
-On top of it: `OtaProviderHandler` and `OtaBdxHandler` over the image store
-`api::ota` already keeps, implementing `OtaImagesRegistry` and `OtaImages`
-against it; an `AnnounceOTAProvider` invoke pointing the device at this node;
-and the ACL entry that lets that node invoke back. `update_node` stops
-returning error 11.
+**What is left is the ledger half.** `check_node_update` reports updates the
+CSA ledger knows about, and those cannot be served: the ledger publishes a URL
+and a digest, not the image. Serving one means fetching it from the vendor's
+CDN, checking it against that digest, and storing it as though it had been
+uploaded — at which point everything above already works. rs-matter's
+`ota_prov::dcl` module is a worked example of exactly this, behind its
+`ota-dcl` feature, over a pluggable HTTPS client.
 
 ## Phase 4 — WebRTC signalling
 
