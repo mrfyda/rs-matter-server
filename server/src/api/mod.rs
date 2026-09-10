@@ -24,6 +24,7 @@ use async_channel::{Receiver, Sender};
 
 use crate::matter::actor::{FabricInfo, MatterHandle};
 use crate::matter::dcl::DclClient;
+use crate::matter::subscriptions;
 use crate::protocol::error::{ApiError, ApiResult};
 use crate::protocol::events::Event;
 use crate::protocol::message::Args;
@@ -133,6 +134,9 @@ pub struct ServerContext {
     pub events: Arc<EventBus>,
     pub runtime: RuntimeInfo,
     pub ota: ota::OtaUploadRegistry,
+    /// The subscriptions this controller holds, shared between the monitor
+    /// that establishes them and the report handler that receives them.
+    pub subscriptions: subscriptions::Registry,
     dcl: DclClient,
     test_dcl: Option<DclClient>,
     console_loglevel: Mutex<String>,
@@ -164,6 +168,7 @@ impl ServerContext {
             events: Arc::new(EventBus::new()),
             runtime,
             ota: ota::OtaUploadRegistry::new(),
+            subscriptions: subscriptions::Registry::new(),
             dcl: DclClient::main_net(),
             test_dcl,
             console_loglevel: Mutex::new(console_loglevel),

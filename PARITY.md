@@ -66,9 +66,9 @@ The `every_advertised_command_is_routed` contract test enforces that against
 | Event | Status | Notes |
 |---|---|---|
 | `node_added` | ✅ | After commissioning's first interview, and on test-node import. |
-| `node_updated` | ✅ | Interviews, polled changes, and availability transitions. |
+| `node_updated` | ✅ | Interviews, reported and polled changes, and availability transitions. |
 | `node_removed` | ✅ | Bare node id as the payload. |
-| `attribute_updated` | ✅ | `[node_id, path, value]`. Produced by reads, writes, interviews and polling. |
+| `attribute_updated` | ✅ | `[node_id, path, value]`. Produced by a node's own subscription reports, and by reads, writes, interviews and polling. |
 | `endpoint_added` / `endpoint_removed` | ✅ | Derived from the endpoints an interview or poll reports. |
 | `server_info_updated` | ✅ | After credential and fabric-label changes. |
 | `server_shutdown` | ✅ | Published before the listener closes. |
@@ -115,28 +115,23 @@ only real proof.
 How these get closed, in what order, and what each one takes to verify is in
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
-1. **Device-initiated subscriptions.** rs-matter 0.3 establishes a subscription
-   and then hands the caller nothing to consume it with: after the priming
-   chunks, reports arrive on device-initiated exchanges, and there is no
-   receiver abstraction upstream for them. The primitives are public, so the
-   receiver is buildable here, and rs-matter has the seat for it: the
-   Interaction Model routes an incoming report to a `ReportDataHandler` along
-   with the `(fabric, peer, subscription id)` it belongs to. `matter::responder`
-   now hosts that Interaction Model, so the seat exists and is empty — every
-   report is answered `InvalidSubscription`, which is what the default handler
-   does. What is missing is subscribing in the first place, and a handler that
-   turns a report into the events below. Until that exists, clients see the
-   same `attribute_updated` / `node_updated` events, produced two ways:
+1. **Subscriptions have never run against a device.** Every node is subscribed
+   to — a wildcard subscription established by `crate::monitor`, its reports
+   consumed by `matter::reports` and published as the same
+   `attribute_updated` / `node_updated` events as before — so a change made at
+   a device should now appear at once rather than within a poll interval. What
+   has not happened is a device doing it: the whole path is asserted by unit
+   tests and by construction, and the Shelly plug in the hardware table below
+   was measured against the polling build.
 
-   - **Changes this controller caused** are read back from the target endpoint
-     as soon as the command returns, so a client's view updates in about
-     110 ms (measured against a Shelly plug).
-   - **Changes made at the device** — a physical button press, or another
-     ecosystem — are found by polling (`--poll-interval-secs`, default 30 s),
-     so they can take up to that long to appear.
+   Polling remains, for the two cases where it is still the answer: a node that
+   will not subscribe (no slots left, or a refused wildcard) keeps being
+   polled, and a subscription that goes silent for twice its `max_interval` is
+   dropped and re-established. `--poll-interval-secs` still sets that cadence.
 
-   `crate::monitor` and `api::interaction::refresh_endpoint` are the two places
-   that change when a client-side subscription receiver exists.
+   Changes this controller *caused* are still read back from the target
+   endpoint as soon as the command returns (about 110 ms), which is quicker
+   than waiting for the device's own report.
 2. **Bluetooth commissioning is Linux-only, and has never run on hardware.**
    `commission_with_code` scans over Bluetooth when mDNS finds nothing. The
    device is reached over BTP, handed its Wi-Fi or Thread credentials over the
@@ -230,7 +225,7 @@ it cannot map to one release.
 cargo test --manifest-path server/Cargo.toml
 ```
 
-282 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
+289 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
 wire-naming registry, the SPAKE2+ verifier against the Matter test vector, the
 mDNS browser's message parsing, the update-ledger rules, storage and restart
 recovery, every command handler, 7 matterjs-server import tests that build a

@@ -1,23 +1,52 @@
 //! Attribute monitoring.
 //!
 //! The protocol promises `attribute_updated` events, and clients build their
-//! whole view of a device from them. rs-matter 0.3 establishes a subscription
-//! but offers no receiver for it: the ongoing reports arrive as
-//! device-initiated exchanges, and this server accepts none — so changes are
-//! discovered by polling instead.
+//! whole view of a device from them. A device that reports its own changes
+//! produces them the moment they happen, so this loop's first job is to get
+//! every node subscribed — and its second is to be the fallback for nodes that
+//! will not subscribe, and the watchdog for subscriptions that go quiet.
 //!
-//! The observable protocol behaviour is the same: a change produces an
-//! `attribute_updated` event, a node that stops answering produces a
-//! `node_updated` with `available: false`, and endpoints that come and go
-//! produce endpoint events. Only the transport differs, and this module is the
-//! single place that has to change when subscriptions become available.
+//! What it does for one node, in order:
+//!
+//! * **Reporting already?** Nothing to do. The device is pushing changes and
+//!   `crate::matter::reports` is turning them into events.
+//! * **Not subscribed?** Subscribe. The priming report that comes back is a
+//!   full snapshot, so this is also the read that would otherwise have been
+//!   done — one transaction, not two.
+//! * **Would not subscribe?** Poll it, exactly as before. A device with no
+//!   subscription slots left, or one that refuses a wildcard, still produces
+//!   the same events; only the latency differs.
+//! * **Went quiet?** A device owes a report every `max_interval` even when
+//!   nothing changes, so silence for twice that long means the subscription is
+//!   gone. It is forgotten and re-established from scratch.
+//!
+//! The observable protocol behaviour is identical either way: a change
+//! produces an `attribute_updated` event, a node that stops answering produces
+//! a `node_updated` with `available: false`, and endpoints that come and go
+//! produce endpoint events.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::api::ServerContext;
+use crate::protocol::error::{ApiError, ErrorCode as ProtocolError};
 use crate::protocol::events::Event;
+
+/// How soon a device may report a change: immediately.
+///
+/// Matter's floor is a rate limit, not a delay — a device may not report more
+/// often than this. Zero is what a controller that wants a button press
+/// reflected at once asks for, and it is what the reference asks for too.
+const MIN_REPORT_INTERVAL_SECS: u16 = 0;
+
+/// How long a device may stay silent before it owes a report anyway.
+///
+/// This is the subscription's keepalive, not its change latency: a change is
+/// reported when it happens. Five minutes is long enough that an idle device
+/// (and a sleepy one) is not woken for nothing, and short enough that a
+/// subscription which died silently is noticed within ten.
+const MAX_REPORT_INTERVAL_SECS: u16 = 300;
 
 /// How the monitor paces itself.
 #[derive(Clone, Copy, Debug)]
@@ -54,6 +83,11 @@ pub async fn run(context: Arc<ServerContext>, config: MonitorConfig) {
                 continue;
             }
 
+            // A node that is reporting for itself needs nothing from here.
+            if context.subscriptions.is_live(node.node_id) {
+                continue;
+            }
+
             let due = match last_polled.get(&node.node_id) {
                 Some(last) => {
                     let interval = if node.available {
@@ -70,15 +104,83 @@ pub async fn run(context: Arc<ServerContext>, config: MonitorConfig) {
             }
 
             last_polled.insert(node.node_id, Instant::now());
-            poll_node(&context, node.node_id).await;
+            maintain_node(&context, node.node_id).await;
             async_io::Timer::after(config.stagger).await;
         }
 
         // Forget nodes that have been removed, so the map cannot grow without
         // bound over a long run.
         last_polled.retain(|node_id, _| context.nodes.contains(*node_id));
+        // A subscription that stopped reporting is dropped here rather than
+        // where it is noticed, so the next pass treats the node as unsubscribed
+        // and starts again.
+        for node_id in context.subscriptions.forget_silent() {
+            log::info!("Node {} stopped reporting; will re-subscribe", node_id);
+        }
         async_io::Timer::after(config.stagger.max(Duration::from_secs(1))).await;
     }
+}
+
+/// Bring one node back under a subscription, or fall back to reading it.
+///
+/// A failure to *reach* the node is not followed by a read: opening the CASE
+/// session is the expensive part and it has just failed, and retrying it costs
+/// the whole retransmit budget again on an actor that serves one op at a time.
+pub async fn maintain_node(context: &Arc<ServerContext>, node_id: u64) {
+    // Whatever was recorded is not working, or this would not be running.
+    context.subscriptions.forget(node_id);
+
+    let first_read = context.nodes.awaiting_first_interview(node_id);
+    match context
+        .matter
+        .subscribe(node_id, MIN_REPORT_INTERVAL_SECS, MAX_REPORT_INTERVAL_SECS)
+        .await
+    {
+        Ok(subscription) => {
+            log::info!(
+                "Node {} is reporting on subscription {} (at least every {}s)",
+                node_id,
+                subscription.subscription_id,
+                subscription.max_interval_secs
+            );
+            context.subscriptions.established(
+                node_id,
+                subscription.subscription_id,
+                Duration::from_secs(subscription.max_interval_secs as u64),
+            );
+            // The priming report is a full read, so it is published the same
+            // way a poll's answer would have been.
+            if !subscription.attributes.is_empty() {
+                if first_read {
+                    publish_first_interview(context, node_id, subscription.attributes);
+                } else {
+                    publish_changes(context, node_id, subscription.attributes);
+                }
+            }
+            mark_available(context, node_id, true);
+        }
+        Err(error) if unreachable(&error) => {
+            log::debug!("Node {} could not be reached to subscribe: {}", node_id, error);
+            mark_available(context, node_id, false);
+        }
+        Err(error) => {
+            log::debug!(
+                "Node {} would not subscribe ({}); polling it instead",
+                node_id,
+                error
+            );
+            poll_node(context, node_id).await;
+        }
+    }
+}
+
+/// Whether an error means the node could not be reached at all, as opposed to
+/// having answered and declined.
+fn unreachable(error: &ApiError) -> bool {
+    matches!(
+        error.code,
+        ProtocolError::NodeNotResolving | ProtocolError::NodeNotReady
+    )
 }
 
 /// Read one node and publish whatever changed.
@@ -137,7 +239,7 @@ fn publish_first_interview(
     context.events.publish(Event::node_updated(&diff.node));
 }
 
-fn publish_changes(
+pub fn publish_changes(
     context: &Arc<ServerContext>,
     node_id: u64,
     attributes: crate::protocol::model::AttributesData,
@@ -209,6 +311,29 @@ mod tests {
             "2026-01-01T00:00:00.000Z".into(),
         )));
         Arc::new(context)
+    }
+
+    /// A node that is reporting for itself must not also be polled: the whole
+    /// point of subscribing is that the traffic stops.
+    #[test]
+    fn a_reporting_node_is_left_alone() {
+        let context = context_with_node();
+        assert!(!context.subscriptions.is_live(1));
+        context
+            .subscriptions
+            .established(1, 42, Duration::from_secs(300));
+        assert!(context.subscriptions.is_live(1));
+    }
+
+    /// Whether a failure means "could not reach it" — which must not be
+    /// followed by a read that would pay the same cost again — or "reached it
+    /// and it said no", which polling can still work around.
+    #[test]
+    fn only_a_session_failure_stops_the_fallback_read() {
+        assert!(unreachable(&ApiError::node_not_resolving(1)));
+        assert!(unreachable(&ApiError::node_not_ready(1)));
+        assert!(!unreachable(&ApiError::sdk("the device refused")));
+        assert!(!unreachable(&ApiError::invalid_args("bad path")));
     }
 
     #[test]

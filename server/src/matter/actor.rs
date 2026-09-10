@@ -106,6 +106,12 @@ pub enum MatterOp {
         paths: Vec<AttrPath>,
         fabric_filtered: bool,
     },
+    /// Ask a node to report changes as they happen, instead of being polled.
+    Subscribe {
+        node_id: u64,
+        min_interval_secs: u16,
+        max_interval_secs: u16,
+    },
     WriteAttribute {
         node_id: u64,
         endpoint: u16,
@@ -159,6 +165,7 @@ impl MatterOp {
             Self::Commission { .. } => "commission",
             Self::DiscoverCommissionable { .. } => "discover",
             Self::ReadAttributes { .. } => "read",
+            Self::Subscribe { .. } => "subscribe",
             Self::WriteAttribute { .. } => "write",
             Self::Invoke { .. } => "invoke",
             Self::Interview { .. } => "interview",
@@ -185,6 +192,7 @@ pub enum MatterOutcome {
         device_fabric_index: u8,
     },
     Discovered(Vec<CommissionableNodeData>),
+    Subscribed(interaction::Subscription),
 }
 
 /// One queued op and where its answer goes. Opaque to callers: it exists so
@@ -263,6 +271,29 @@ impl MatterHandle {
             .await?
         {
             MatterOutcome::Attributes(attributes) => Ok(attributes),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Subscribe to every attribute on a node.
+    ///
+    /// The answer carries the priming report, so a caller that would otherwise
+    /// have read the node can use this instead of doing both.
+    pub async fn subscribe(
+        &self,
+        node_id: u64,
+        min_interval_secs: u16,
+        max_interval_secs: u16,
+    ) -> Result<interaction::Subscription, ApiError> {
+        match self
+            .call(MatterOp::Subscribe {
+                node_id,
+                min_interval_secs,
+                max_interval_secs,
+            })
+            .await?
+        {
+            MatterOutcome::Subscribed(subscription) => Ok(subscription),
             other => Err(unexpected(other)),
         }
     }
@@ -519,6 +550,21 @@ async fn execute<C: Crypto + Clone>(
         )
         .await
         .map(MatterOutcome::Attributes),
+
+        MatterOp::Subscribe {
+            node_id,
+            min_interval_secs,
+            max_interval_secs,
+        } => interaction::subscribe(
+            matter,
+            context.crypto.clone(),
+            fabric_index,
+            node_id,
+            min_interval_secs,
+            max_interval_secs,
+        )
+        .await
+        .map(MatterOutcome::Subscribed),
 
         MatterOp::WriteAttribute {
             node_id,

@@ -130,7 +130,7 @@ pub async fn run(
         run_transport(&matter, &crypto, &matter_socket, &ble),
         futures_lite::future::or(
             run_mdns(&matter, &crypto, &mdns),
-            responder::run(&matter, &crypto, responder_storage),
+            responder::run(&matter, &crypto, responder_storage, context.clone()),
         ),
     );
     let work = futures_lite::future::or(

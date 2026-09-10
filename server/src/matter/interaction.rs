@@ -13,8 +13,8 @@ use serde_json::{Map, Value};
 
 use rs_matter::crypto::Crypto;
 use rs_matter::error::ErrorCode;
-use rs_matter::im::client::{ImClient, TxOutcome};
-use rs_matter::im::{AttrPath, AttrResp, CmdResp, IMStatusCode};
+use rs_matter::im::client::{ImClient, SubscribeOutcome, TxOutcome};
+use rs_matter::im::{AttrPath, AttrResp, CmdResp, IMStatusCode, ReportDataResp};
 use rs_matter::tlv::TLVTag;
 use rs_matter::transport::exchange::Exchange;
 use rs_matter::Matter;
@@ -98,24 +98,7 @@ pub async fn read_attributes<C: Crypto>(
     let mut first_status = None;
     loop {
         let response = chunk.response().map_err(|e| im_error("read response", e))?;
-        if let Some(reports) = response.attr_reports.as_ref() {
-            for report in reports.iter() {
-                match report.map_err(|e| im_error("attribute report", e))? {
-                    AttrResp::Data(data) => {
-                        let cluster = data.path.cluster.unwrap_or(0);
-                        let attribute = data.path.attr.unwrap_or(0);
-                        let path =
-                            format_path(data.path.endpoint.unwrap_or(0), cluster, attribute);
-                        let value = tlv_json::attribute_to_json(cluster, attribute, &data.data)
-                            .map_err(|e| im_error("attribute value", e))?;
-                        attributes.insert(path, value);
-                    }
-                    AttrResp::Status(status) => {
-                        first_status.get_or_insert(status.status.status);
-                    }
-                }
-            }
-        }
+        collect_attributes(&mut attributes, &response, &mut first_status)?;
         match chunk
             .complete()
             .await
@@ -132,6 +115,127 @@ pub async fn read_attributes<C: Crypto>(
         }
     }
     Ok(attributes)
+}
+
+/// What a device confirmed when it accepted a subscription, plus the snapshot
+/// it primed the subscription with.
+///
+/// The priming report is a full read of everything subscribed, so establishing
+/// a subscription doubles as an interview — the caller gets the node's current
+/// state without a second round-trip.
+#[derive(Debug)]
+pub struct Subscription {
+    pub subscription_id: u32,
+    /// The longest the device may stay silent before it owes a report. It
+    /// chooses this, within the ceiling the request asked for.
+    pub max_interval_secs: u16,
+    pub attributes: AttributesData,
+}
+
+/// Subscribe to every attribute on a node.
+///
+/// `keep_subscriptions` is deliberately *false*: this controller wants exactly
+/// one subscription per node, and a device that still holds one from a previous
+/// run of this server would otherwise keep pushing reports nothing here can
+/// match — while occupying one of the handful of subscription slots devices
+/// typically have. Asking the device to drop its others is how that is cleaned
+/// up, and it is safe because the slots being dropped are only those belonging
+/// to this controller on this fabric.
+pub async fn subscribe<C: Crypto>(
+    matter: &Matter<'_>,
+    crypto: C,
+    fabric_index: NonZeroU8,
+    node_id: u64,
+    min_interval_secs: u16,
+    max_interval_secs: u16,
+) -> Result<Subscription, ApiError> {
+    let paths = interview_paths();
+    let exchange = open(matter, crypto, fabric_index, node_id).await?;
+    let mut sender = exchange
+        .subscribe_sender()
+        .await
+        .map_err(|e| im_error("subscribe exchange", e))?;
+
+    let mut chunk = loop {
+        match sender
+            .tx()
+            .await
+            .map_err(|e| im_error("subscribe request", e))?
+        {
+            TxOutcome::BuildRequest(builder) => {
+                sender = builder
+                    .keep_subs(false)
+                    .map_err(|e| im_error("subscribe keep", e))?
+                    .min_int_floor(min_interval_secs)
+                    .map_err(|e| im_error("subscribe min interval", e))?
+                    .max_int_ceil(max_interval_secs)
+                    .map_err(|e| im_error("subscribe max interval", e))?
+                    .attr_requests_from(&paths)
+                    .map_err(|e| im_error("subscribe path", e))?
+                    .fabric_filtered(false)
+                    .map_err(|e| im_error("subscribe filter", e))?
+                    .end()
+                    .map_err(|e| im_error("subscribe build", e))?;
+            }
+            TxOutcome::GotResponse(chunk) => break chunk,
+        }
+    };
+
+    // The priming report arrives before the subscription is confirmed, in as
+    // many chunks as the node needs.
+    let mut attributes = AttributesData::new();
+    loop {
+        let response = chunk
+            .response()
+            .map_err(|e| im_error("subscribe report", e))?;
+        collect_attributes(&mut attributes, &response, &mut None)?;
+
+        match chunk
+            .complete()
+            .await
+            .map_err(|e| im_error("subscribe priming", e))?
+        {
+            SubscribeOutcome::NextChunk(next) => chunk = next,
+            SubscribeOutcome::Established(established) => {
+                return Ok(Subscription {
+                    subscription_id: established.subscription_id,
+                    max_interval_secs: established.max_int,
+                    attributes,
+                })
+            }
+        }
+    }
+}
+
+/// Fold one report's attribute entries into `attributes`.
+///
+/// Shared by the read path, the subscribe priming report, and the ongoing
+/// reports the responder receives, because all three carry the same shape and
+/// must decode it the same way — epoch conversion included.
+pub fn collect_attributes(
+    attributes: &mut AttributesData,
+    response: &ReportDataResp<'_>,
+    first_status: &mut Option<IMStatusCode>,
+) -> Result<(), ApiError> {
+    let Some(reports) = response.attr_reports.as_ref() else {
+        return Ok(());
+    };
+    for report in reports.iter() {
+        match report.map_err(|e| im_error("attribute report", e))? {
+            AttrResp::Data(data) => {
+                let cluster = data.path.cluster.unwrap_or(0);
+                let attribute = data.path.attr.unwrap_or(0);
+                let path = format_path(data.path.endpoint.unwrap_or(0), cluster, attribute);
+                let value = tlv_json::attribute_to_json(cluster, attribute, &data.data)
+                    .map_err(|e| im_error("attribute value", e))?;
+                attributes.insert(path, value);
+            }
+            AttrResp::Status(status) => {
+                first_status.get_or_insert(status.status.status);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Write one attribute, returning the Interaction Model status the node

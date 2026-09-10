@@ -23,10 +23,9 @@
 //! with it:
 //!
 //! * the Interaction Model's *report* side, which is how a controller consumes
-//!   the `ReportData` its subscriptions produce — rs-matter hands each one to a
-//!   [`ReportDataHandler`](rs_matter::dm::ReportDataHandler) with the
-//!   `(fabric, peer, subscription id)` it belongs to, which is the only way to
-//!   know which node a report came from;
+//!   the `ReportData` its subscriptions produce — rs-matter hands each one to
+//!   [`ReportReceiver`] with the `(fabric, peer, subscription id)` it belongs
+//!   to, which is the only way to know which node a report came from;
 //! * the Secure Channel handler, which lets a device establish CASE *to* this
 //!   node — needed by anything that calls back, an OTA requestor and a camera
 //!   among them.
@@ -34,6 +33,7 @@
 //! Endpoints get added to this node when there is something to serve on them.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use rs_matter::crypto::Crypto;
 use rs_matter::dm::clusters::net_comm::NetworkType;
@@ -45,6 +45,10 @@ use rs_matter::persist::DirKvBlobStore;
 use rs_matter::respond::Responder;
 use rs_matter::transport::exchange::MatterBuffers;
 use rs_matter::Matter;
+
+use crate::api::ServerContext;
+
+use super::reports::ReportReceiver;
 
 /// How many exchanges may be handled at once.
 ///
@@ -88,13 +92,19 @@ fn controller_data_model() -> ControllerDataModel {
 /// own. It has none to persist while this node serves no clusters, but the
 /// store is real rather than a stub so that adding one later does not change
 /// where its data lives.
-pub async fn run<'a, C: Crypto>(matter: &'a Matter<'a>, crypto: C, storage_path: PathBuf) {
+pub async fn run<'a, C: Crypto>(
+    matter: &'a Matter<'a>,
+    crypto: C,
+    storage_path: PathBuf,
+    context: Arc<ServerContext>,
+) {
     let buffers: MatterBuffers<BUFFER_POOL> = MatterBuffers::new();
     let state: InteractionModelState<EthNetwork<'_>, SUBSCRIPTIONS, EVENTS_BUFFER> =
         InteractionModelState::new(EthNetwork::new_default());
     let kv = matter.kv(DirKvBlobStore::new(storage_path));
 
-    let data_model = InteractionModel::new_with_net_ctl(
+    let reports = ReportReceiver::new(context);
+    let data_model = InteractionModel::new_with_reports(
         matter,
         crypto,
         &buffers,
@@ -104,6 +114,7 @@ pub async fn run<'a, C: Crypto>(matter: &'a Matter<'a>, crypto: C, storage_path:
         // NetworkCommissioning side of the Interaction Model has nothing to
         // drive.
         NoopWirelessNetCtl::new(NetworkType::Ethernet),
+        &reports,
         &state,
     );
 

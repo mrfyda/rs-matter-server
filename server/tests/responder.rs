@@ -20,6 +20,7 @@
 
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -33,8 +34,11 @@ use rs_matter::tlv::{TLVTag, TLVWrite};
 use rs_matter::transport::exchange::Exchange;
 use rs_matter::transport::network::Address;
 use rs_matter::utils::storage::ReadBuf;
+use rs_matter_server::api::{RuntimeInfo, ServerContext};
+use rs_matter_server::matter::actor;
 use rs_matter_server::matter::controller::{init_matter, FabricConfig};
 use rs_matter_server::matter::responder;
+use rs_matter_server::storage::{ConfigStore, NodeStore};
 
 /// `SCStatusCodes::NoSharedTrustRoots`: the initiator's destination id matched
 /// none of this node's fabrics. Asserted as a literal so the wire value is
@@ -46,6 +50,23 @@ const SIGMA1_INITIATOR_RANDOM: u8 = 1;
 const SIGMA1_INITIATOR_SESSION_ID: u8 = 2;
 const SIGMA1_DESTINATION_ID: u8 = 3;
 const SIGMA1_PEER_PUBLIC_KEY: u8 = 4;
+
+/// The shared state the responder publishes into. Nothing in this test reads
+/// it — no report can arrive without a subscription — but the responder holds
+/// it, so it has to be real.
+fn context() -> Arc<ServerContext> {
+    let (handle, requests) = actor::channel();
+    // Dropping the receiving end makes any Matter op fail fast rather than
+    // hang, which is what a test with no actor behind it wants.
+    drop(requests);
+    Arc::new(ServerContext::new(
+        handle,
+        Arc::new(NodeStore::new()),
+        Arc::new(ConfigStore::in_memory()),
+        RuntimeInfo::default(),
+        "info".to_string(),
+    ))
+}
 
 /// An ephemeral UDP port for a Matter stack to answer on.
 ///
@@ -72,7 +93,7 @@ fn serve(storage: String, socket: UdpSocket) {
             async {
                 let _ = matter.run(&crypto, &socket, &socket, &socket).await;
             },
-            responder::run(&matter, &crypto, PathBuf::from(&storage)),
+            responder::run(&matter, &crypto, PathBuf::from(&storage), context()),
         ));
     });
     // Let the transport reach its first poll before anything is sent to it.

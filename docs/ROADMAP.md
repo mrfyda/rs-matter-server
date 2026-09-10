@@ -68,28 +68,24 @@ What each arm does today, and what replaces it:
 
 ## Phase 2 — subscriptions, events, ICD
 
-All of this is handled at the exchange level. **No data model is needed**,
-which is what makes it much cheaper than phases 3 and 4.
+**Attributes: done.** Every node is subscribed to with a wildcard, and its
+reports are published as the events clients already know. `monitor.rs` demoted
+from the primary path to the thing that establishes subscriptions, falls back
+to polling for a node that will not take one, and re-establishes one that has
+gone silent. This needed the data model of phase 1's second commit: rs-matter
+routes a report to a `ReportDataHandler` *with the peer that sent it*, and
+nothing else in its public API says who opened an accepted exchange.
 
-Establish a subscription per node after its first interview, with a registry
-keyed by `(fabric, node, subscription id)` and a resubscribe when a node misses
-its committed `max_int`. Route the reports into the `attribute_updated`,
-`endpoint_added` and `endpoint_removed` paths that already exist — the event
-shapes do not change, only what feeds them. Event reports arriving on the same
-stream finally emit `node_event`, whose shape and `diagnostics` history are
-already implemented and unused.
+**Events: next.** The same reports carry `event_reports`, which is what
+`node_event` — shape and `diagnostics` history already implemented, nothing
+emitting it — is waiting for. The subscription already asks for attributes
+only, so this is an `event_requests_from` on the request and a second arm in
+the report handler.
 
-`monitor.rs` demotes from the primary path to a per-node fallback: a node whose
-subscribe fails keeps being polled, and the poll doubles as the liveness check
-for a subscription that has gone quiet. Keep `refresh_endpoint`'s read-back as
-the fast path for changes this controller caused — 110 ms is quicker than a
-device's own report.
-
-Check-ins want rs-matter's `SecureChannel` handler rather than the busy one:
-`sc::AsyncScHandler` exists precisely so a controller can react to the messages
-the accessory role drops, check-ins among them. Taking it means taking the CASE
-responder with it, which phase 3 needs anyway — so this is where the Secure
-Channel arm stops answering `Busy`.
+**ICD after that.** Check-ins want an `sc::AsyncScHandler`, which exists
+precisely so a controller can react to the Secure Channel messages the
+accessory role drops. `awake` and `next_expected_checkin` in `get_icd_state`
+are what it fills in.
 
 ## Phase 3 — OTA distribution
 
