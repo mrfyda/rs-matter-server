@@ -121,11 +121,14 @@ path under a real multi-kilobyte SDP, and whether a camera's node id resolves
 on the callback (rs-matter exposes no peer identity on an invoke, so it is
 matched against the known nodes).
 
-## Phase 5 — Thread diagnostics
+## Phase 5 — Thread diagnostics — the shape, not yet the substance
 
-Collect per-node diagnostics from the border routers
-`get_thread_border_routers` already discovers, and answer
-`get_thread_diagnostics` with them.
+The contract is implemented: the batch model, the per-network cache with its
+hour of validity, `force`, both forms of `get_thread_diagnostics`, and the
+`thread_diagnostics_updated` event. What is missing is a source, so every
+network answers with an empty batch and `no_credentials`.
+
+The rest of this section is what a source takes.
 
 The shape is `ThreadDiagnosticsBatch` in the reference's `model.ts`: one batch
 per network, keyed by `extPanIdHex`, carrying `networkName`, `collectedAt`, a
@@ -136,7 +139,16 @@ supports), and a `partialReason` while the batch is incomplete.
 Two ways in, and the reference prefers the first: **MeshCoP** over CoAP/DTLS,
 authenticated with the `pskc` and `networkKey` from a stored Thread dataset;
 or the **OpenThread REST API** where a discovered border router exposes it. A
-network with neither yields a partial batch with reason `no_credentials`.
+network with neither yields a partial batch with reason `no_credentials`, which
+is what every network gets today.
+
+MeshCoP is the bigger of the two and not only in code: nothing in this
+dependency tree speaks CoAP or DTLS, so it starts with choosing what should.
+The REST path needs no new dependency — `ureq` is already here — but the
+current OTBR API is a JSON:API task collection (post a
+`getNetworkDiagnosticTask`, poll it, read the referenced diagnostics item)
+rather than the single `GET /diagnostics` older documentation describes, so
+check what the border router in front of you actually serves.
 
 The behaviour around it matters as much as the shape: collection streams over
 about 20 seconds, with batches published as they fill in; results are cached

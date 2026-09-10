@@ -200,6 +200,278 @@ pub struct MatterNodeEvent {
     pub data: Value,
 }
 
+/// One Thread network's diagnostics, as `get_thread_diagnostics` answers and
+/// `thread_diagnostics_updated` streams.
+///
+/// A batch is a snapshot: collection runs over a window and publishes what it
+/// has, so `partial_reason` says why an answer is not the whole mesh — and its
+/// absence is what makes a batch complete, and cacheable.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ThreadDiagnosticsBatch {
+    /// 16-char uppercase hex of the network's extended PAN id.
+    #[serde(rename = "extPanIdHex")]
+    pub ext_pan_id_hex: String,
+    #[serde(rename = "networkName")]
+    pub network_name: String,
+    /// Epoch milliseconds the batch was assembled.
+    #[serde(rename = "collectedAt")]
+    pub collected_at: i64,
+    /// What produced it. `none` when nothing was attempted — no credentials
+    /// to speak MeshCoP with, and no border router offering the REST API.
+    pub source: ThreadDiagnosticsSource,
+    pub nodes: Vec<ThreadDiagnosticsNode>,
+    #[serde(rename = "partialReason", skip_serializing_if = "Option::is_none")]
+    pub partial_reason: Option<ThreadDiagnosticsPartial>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ThreadDiagnosticsSource {
+    Meshcop,
+    OtbrRest,
+    None,
+}
+
+/// Why a batch is not the whole mesh. Absent once it is.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadDiagnosticsPartial {
+    PetitionRejected,
+    DtlsFailed,
+    BorderRouterUnreachable,
+    /// No way in: no stored dataset to authenticate MeshCoP with, and no
+    /// border router offering the REST API.
+    NoCredentials,
+    NoSource,
+    RestUnreachable,
+    RestProtocol,
+    Timeout,
+    /// A collection is still running; more nodes may follow.
+    InProgress,
+    MeshcopNoResponsesYet,
+    RestNoResponsesYet,
+}
+
+/// One node's diagnostics, assembled from the TLVs it returned.
+///
+/// Every field is optional because a node answers with the TLVs it supports.
+/// The names are the reference's, which are the Thread specification's.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ThreadDiagnosticsNode {
+    /// 16-char uppercase hex of the 64-bit Thread MAC address.
+    #[serde(rename = "extMacAddress", skip_serializing_if = "Option::is_none")]
+    pub ext_mac_address: Option<String>,
+    /// Short 16-bit routing locator within the mesh.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rloc16: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ThreadMode>,
+    /// Polling/child timeout in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connectivity: Option<ThreadConnectivity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route64: Option<ThreadRoute64>,
+    #[serde(rename = "leaderData", skip_serializing_if = "Option::is_none")]
+    pub leader_data: Option<ThreadLeaderData>,
+    /// Hex-encoded raw Network Data blob.
+    #[serde(rename = "networkData", skip_serializing_if = "Option::is_none")]
+    pub network_data: Option<String>,
+    /// Each 16-byte address as uppercase hex.
+    #[serde(rename = "ipv6Addresses", skip_serializing_if = "Option::is_none")]
+    pub ipv6_addresses: Option<Vec<String>>,
+    #[serde(rename = "macCounters", skip_serializing_if = "Option::is_none")]
+    pub mac_counters: Option<ThreadMacCounters>,
+    #[serde(rename = "childTable", skip_serializing_if = "Option::is_none")]
+    pub child_table: Option<Vec<ThreadChildTableEntry>>,
+    #[serde(rename = "channelPages", skip_serializing_if = "Option::is_none")]
+    pub channel_pages: Option<Vec<u8>>,
+    #[serde(rename = "maxChildTimeout", skip_serializing_if = "Option::is_none")]
+    pub max_child_timeout: Option<u32>,
+    /// 16-char uppercase hex EUI-64.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eui64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<u16>,
+    #[serde(rename = "vendorName", skip_serializing_if = "Option::is_none")]
+    pub vendor_name: Option<String>,
+    #[serde(rename = "vendorModel", skip_serializing_if = "Option::is_none")]
+    pub vendor_model: Option<String>,
+    #[serde(rename = "vendorSwVersion", skip_serializing_if = "Option::is_none")]
+    pub vendor_sw_version: Option<String>,
+    #[serde(rename = "threadStackVersion", skip_serializing_if = "Option::is_none")]
+    pub thread_stack_version: Option<String>,
+    #[serde(rename = "vendorAppUrl", skip_serializing_if = "Option::is_none")]
+    pub vendor_app_url: Option<String>,
+    #[serde(rename = "mleCounters", skip_serializing_if = "Option::is_none")]
+    pub mle_counters: Option<ThreadMleCounters>,
+    /// Battery level as a percentage, and supply voltage in millivolts.
+    #[serde(rename = "batteryLevel", skip_serializing_if = "Option::is_none")]
+    pub battery_level: Option<u8>,
+    #[serde(rename = "supplyVoltage", skip_serializing_if = "Option::is_none")]
+    pub supply_voltage: Option<u16>,
+    /// TLVs this decoder does not model, kept verbatim as uppercase hex.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unknown: Option<Vec<ThreadUnknownTlv>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ThreadUnknownTlv {
+    #[serde(rename = "type")]
+    pub tlv_type: u8,
+    pub value: String,
+}
+
+/// MODE TLV: what a node is capable of.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ThreadMode {
+    /// Radio stays on when idle — a non-sleepy device.
+    #[serde(rename = "rxOnWhenIdle")]
+    pub rx_on_when_idle: bool,
+    /// Full Thread Device (router-eligible) rather than a minimal one.
+    pub ftd: bool,
+    /// Wants the full Network Data rather than the stable subset.
+    #[serde(rename = "fullNetworkData")]
+    pub full_network_data: bool,
+}
+
+/// CONNECTIVITY TLV: a node's view of its links.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ThreadConnectivity {
+    /// Suitability as a parent: -1 low, 0 medium, 1 high.
+    #[serde(rename = "parentPriority")]
+    pub parent_priority: i8,
+    /// Neighbours at each link quality, 3 being best.
+    #[serde(rename = "linkQuality3")]
+    pub link_quality3: u8,
+    #[serde(rename = "linkQuality2")]
+    pub link_quality2: u8,
+    #[serde(rename = "linkQuality1")]
+    pub link_quality1: u8,
+    #[serde(rename = "leaderCost")]
+    pub leader_cost: u8,
+    #[serde(rename = "idSequence")]
+    pub id_sequence: u8,
+    #[serde(rename = "activeRouters")]
+    pub active_routers: u8,
+    /// What a parent reserves for a sleepy child.
+    #[serde(rename = "sedBufferSize")]
+    pub sed_buffer_size: u16,
+    #[serde(rename = "sedDatagramCount")]
+    pub sed_datagram_count: u8,
+}
+
+/// One row of a ROUTE64 TLV.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ThreadRoute64Entry {
+    #[serde(rename = "routerId")]
+    pub router_id: u8,
+    #[serde(rename = "linkQualityIn")]
+    pub link_quality_in: u8,
+    #[serde(rename = "linkQualityOut")]
+    pub link_quality_out: u8,
+    #[serde(rename = "routeCost")]
+    pub route_cost: u8,
+}
+
+/// ROUTE64 TLV: the node's routing table to other routers.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ThreadRoute64 {
+    #[serde(rename = "idSequence")]
+    pub id_sequence: u8,
+    pub entries: Vec<ThreadRoute64Entry>,
+}
+
+/// LEADER_DATA TLV: who leads this partition.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ThreadLeaderData {
+    /// Changes when a partition splits or merges.
+    #[serde(rename = "partitionId")]
+    pub partition_id: u32,
+    pub weighting: u8,
+    #[serde(rename = "dataVersion")]
+    pub data_version: u8,
+    #[serde(rename = "stableDataVersion")]
+    pub stable_data_version: u8,
+    #[serde(rename = "leaderRouterId")]
+    pub leader_router_id: u8,
+}
+
+/// MAC_COUNTERS TLV: packet counters since the last reset.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ThreadMacCounters {
+    #[serde(rename = "ifInUnknownProtos")]
+    pub if_in_unknown_protos: u32,
+    #[serde(rename = "ifInErrors")]
+    pub if_in_errors: u32,
+    #[serde(rename = "ifOutErrors")]
+    pub if_out_errors: u32,
+    #[serde(rename = "ifInUcastPkts")]
+    pub if_in_ucast_pkts: u32,
+    #[serde(rename = "ifInBroadcastPkts")]
+    pub if_in_broadcast_pkts: u32,
+    #[serde(rename = "ifInDiscards")]
+    pub if_in_discards: u32,
+    #[serde(rename = "ifOutUcastPkts")]
+    pub if_out_ucast_pkts: u32,
+    #[serde(rename = "ifOutBroadcastPkts")]
+    pub if_out_broadcast_pkts: u32,
+    #[serde(rename = "ifOutDiscards")]
+    pub if_out_discards: u32,
+}
+
+/// One child attached to a router, from its CHILD_TABLE TLV.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ThreadChildTableEntry {
+    /// The timeout as its 2^exponent form and in seconds.
+    #[serde(rename = "timeoutExponent")]
+    pub timeout_exponent: u8,
+    #[serde(rename = "timeoutSeconds")]
+    pub timeout_seconds: u32,
+    #[serde(rename = "incomingLinkQuality")]
+    pub incoming_link_quality: u8,
+    #[serde(rename = "childId")]
+    pub child_id: u16,
+    pub mode: ThreadMode,
+}
+
+/// MLE_COUNTERS TLV: how often a node has changed role, and for how long.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ThreadMleCounters {
+    #[serde(rename = "disabledRole")]
+    pub disabled_role: u16,
+    #[serde(rename = "detachedRole")]
+    pub detached_role: u16,
+    #[serde(rename = "childRole")]
+    pub child_role: u16,
+    #[serde(rename = "routerRole")]
+    pub router_role: u16,
+    #[serde(rename = "leaderRole")]
+    pub leader_role: u16,
+    #[serde(rename = "attachAttempts")]
+    pub attach_attempts: u16,
+    #[serde(rename = "partitionIdChanges")]
+    pub partition_id_changes: u16,
+    #[serde(rename = "betterPartitionAttachAttempts")]
+    pub better_partition_attach_attempts: u16,
+    #[serde(rename = "parentChanges")]
+    pub parent_changes: u16,
+    /// Cumulative milliseconds, which is why these are 64-bit.
+    #[serde(rename = "trackedTime")]
+    pub tracked_time: u64,
+    #[serde(rename = "disabledTime")]
+    pub disabled_time: u64,
+    #[serde(rename = "detachedTime")]
+    pub detached_time: u64,
+    #[serde(rename = "childTime")]
+    pub child_time: u64,
+    #[serde(rename = "routerTime")]
+    pub router_time: u64,
+    #[serde(rename = "leaderTime")]
+    pub leader_time: u64,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum UpdateSource {

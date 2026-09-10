@@ -59,7 +59,7 @@ The `every_advertised_command_is_routed` contract test enforces that against
 | `update_node` | ⚠️ | Grants the node access to this server's OTA Provider cluster and invokes `AnnounceOTAProvider` on it; the device then queries, downloads over BDX, and applies on its own schedule — visible as `attribute_updated` on the requestor's `UpdateState`. Only an image uploaded here can be served: an update the ledger merely knows about is refused with error 11 and a reason. |
 | `initiate_ota_upload` | ✅ | Single-use, client-bound, expiring ticket; the HTTP endpoint parses the OTA header and stores the image. |
 | `get_thread_border_routers` | ✅ | Passive `_meshcop._udp` browse reporting extended address, extended PAN id, network name, host name, addresses and vendor/model. |
-| `get_thread_diagnostics` | ❌ | Returns the documented "nothing cached" answers (`null` for one network, `[]` for all). MeshCoP/OTBR collection is not implemented. `ext_pan_id` is still validated. |
+| `get_thread_diagnostics` | ⚠️ | Both forms answer in the reference's shape: `ext_pan_id` returns that network's `ThreadDiagnosticsBatch` (or `null` when no discovered Border Router claims it), and the bare form returns the cache for every known network at once and refreshes behind it. `force` bypasses the cache, and only a *complete* batch is ever a cache hit. Nothing collects yet, so every batch is `source: "none"` with `partialReason: "no_credentials"` — see the gaps below. |
 | `get_network_topology` | ✅ | Real graph derived from the nodes' Thread and Wi-Fi diagnostics: roles, neighbour links with per-direction LQI/RSSI, route-table fallback edges, unknown Thread neighbours, and synthetic Wi-Fi access points. `refresh` re-reads the diagnostics clusters. |
 | `send_webrtc_provider_command` | ⚠️ | `ProvideOffer` and `SolicitOffer` are invoked on the camera's provider cluster, with payload fields resolved by name through the same metadata `device_command` uses. The camera's reply arrives on the `WebRTCTransportRequestor` cluster this node hosts and reaches the client as `webrtc_callback`. No camera has ever been on the other end of it. |
 | `subscribe_attribute` | ❌ | Error 9, matching the reference implementation (its docs call it a stub, but its dispatcher rejects it). |
@@ -76,7 +76,7 @@ The `every_advertised_command_is_routed` contract test enforces that against
 | `server_info_updated` | ✅ | After credential and fabric-label changes. |
 | `server_shutdown` | ✅ | Published before the listener closes. |
 | `node_event` | ✅ | Emitted from the event reports a node's subscription produces, with the endpoint, cluster, event id, number, priority and timestamp the device sent. A delta-encoded timestamp is resolved against the previous event in the same report. |
-| `thread_diagnostics_updated` | ❌ | Gated opt-in is implemented; Border Routers are discovered but no collector produces diagnostics batches. |
+| `thread_diagnostics_updated` | ⚠️ | Published for each network as its batch is produced, gated as the reference gates it. Every batch is currently the empty one described above. |
 | `network_topology_updated` | ✅ | Published when a node change moves the graph — a node added or removed, one coming or going, or a poll bringing back different Thread or Wi-Fi diagnostics. A rebuild that produces the same graph is not announced, and `collected_at` is excluded from that comparison so a rebuild alone is not a change. |
 | `webrtc_callback` | ⚠️ | Raised for each of the four commands a camera invokes on the hosted `WebRTCTransportRequestor`: `offer`, `answer`, `ice_candidates` and `end`, carrying the session id, node, endpoint and fabric index, and the `data` object the reference's model defines for that type. Unverified against a camera. |
 
@@ -168,19 +168,24 @@ How these get closed, in what order, and what each one takes to verify is in
    Closing this means sending the same query from an IPv6 socket to `ff02::fb`
    and collecting both, which is additive — the IPv4 query is unaffected by an
    IPv6 one failing to send.
-4. **Thread diagnostics are not collected.** Border Routers are discovered and
-   reported; the per-node diagnostics behind them are not. The shape is
-   settled — `ThreadDiagnosticsBatch` and `ThreadDiagnosticsNode` in the
-   reference's `model.ts`, with an `extPanIdHex`-keyed batch, a `source` of
-   `meshcop` / `otbr-rest` / `none`, and a `partialReason` while a collection
-   is still filling in. What is missing is the collection itself: a MeshCoP
-   (CoAP/DTLS) client, which needs the `pskc` and `networkKey` from a stored
-   Thread dataset, or the OpenThread REST API where a discovered Border Router
-   exposes it.
+4. **Nothing collects Thread diagnostics yet.** The shape, the cache and the
+   answers are implemented — a network is named, its batch is cached for an
+   hour once complete, `force` bypasses that, and each batch is announced as
+   an event. What is missing is a source, so every batch says `no_credentials`
+   and carries no nodes.
 
-   The reference also caches a batch for about an hour, collects over a
-   ~20 second streaming window, and takes a `force` argument to bypass the
-   cache. None of that exists here yet.
+   Two sources exist, and the reference prefers the first. **MeshCoP** over
+   CoAP/DTLS, authenticated with the `pskc` and `networkKey` of a stored Thread
+   dataset: no CoAP or DTLS client is in this dependency tree, so this is a
+   dependency decision as much as a coding one. **OpenThread REST**, where a
+   Border Router exposes it on port 8081: ordinary HTTP against a client this
+   server already has, but the current API is a JSON:API task collection —
+   post an action, poll it, read the result — rather than the single GET older
+   documentation describes.
+
+   The reference also collects over a ~20 second streaming window, publishing
+   partial batches as nodes answer. The event and the `partialReason` that
+   carries are in place; nothing yet streams into them.
 5. **An update the ledger knows about cannot be installed.** The whole
    provider side works — `matter::responder` hosts the OTA Software Update
    Provider cluster, `update_node` grants the device access and announces this
@@ -249,7 +254,7 @@ it cannot map to one release.
 cargo test --manifest-path server/Cargo.toml
 ```
 
-320 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
+324 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
 wire-naming registry, the SPAKE2+ verifier against the Matter test vector, the
 mDNS browser's message parsing, the update-ledger rules, storage and restart
 recovery, every command handler, 7 matterjs-server import tests that build a

@@ -19,7 +19,7 @@ pub mod webrtc;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use async_channel::{Receiver, Sender};
 
@@ -29,7 +29,7 @@ use crate::matter::subscriptions;
 use crate::protocol::error::{ApiError, ApiResult};
 use crate::protocol::events::Event;
 use crate::protocol::message::Args;
-use crate::protocol::model::MatterNodeEvent;
+use crate::protocol::model::{MatterNodeEvent, ThreadDiagnosticsBatch};
 use crate::storage::{ConfigStore, NodeStore};
 
 /// How many Matter events `diagnostics` reports, matching the reference.
@@ -89,6 +89,59 @@ fn is_test_vendor(vendor_id: u16) -> bool {
     (0xFFF1..=0xFFF4).contains(&vendor_id)
 }
 
+/// Thread diagnostics, kept per network for as long as they are worth reusing.
+///
+/// **Only a complete batch is a cache hit.** A partial one records why it is
+/// partial, and every reason is something that can stop being true — a dataset
+/// stored, a border router coming back — so holding one for the full hour
+/// would keep answering with a failure that has since been fixed.
+pub struct ThreadDiagnosticsCache {
+    /// Keyed by uppercase extended PAN id.
+    batches: Mutex<BTreeMap<String, ThreadDiagnosticsBatch>>,
+}
+
+impl ThreadDiagnosticsCache {
+    /// How long a complete batch is reused. The reference's own hour: a mesh
+    /// does not change shape often, and collecting is slow enough to matter.
+    const TTL: Duration = Duration::from_secs(3600);
+
+    pub fn new() -> Self {
+        Self {
+            batches: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    pub fn store(&self, batch: ThreadDiagnosticsBatch) {
+        self.batches
+            .lock()
+            .unwrap()
+            .insert(batch.ext_pan_id_hex.clone(), batch);
+    }
+
+    /// A batch worth answering with without collecting again.
+    pub fn fresh(&self, ext_pan_id: &str) -> Option<ThreadDiagnosticsBatch> {
+        let batches = self.batches.lock().unwrap();
+        let batch = batches.get(ext_pan_id)?;
+        if batch.partial_reason.is_some() {
+            return None;
+        }
+        let age = chrono::Utc::now().timestamp_millis() - batch.collected_at;
+        (age >= 0 && (age as u128) < Self::TTL.as_millis()).then(|| batch.clone())
+    }
+
+    /// Everything held, fresh or not: what the no-argument form answers with
+    /// before a refresh has produced anything newer.
+    pub fn all(&self) -> Vec<ThreadDiagnosticsBatch> {
+        self.batches.lock().unwrap().values().cloned().collect()
+    }
+}
+
+impl Default for ThreadDiagnosticsCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Fan-out of events to listening connections.
 ///
 /// A subscriber that has stopped draining is dropped rather than allowed to
@@ -138,6 +191,8 @@ pub struct ServerContext {
     /// The subscriptions this controller holds, shared between the monitor
     /// that establishes them and the report handler that receives them.
     pub subscriptions: subscriptions::Registry,
+    /// The Thread networks' diagnostics, as last collected.
+    pub thread_diagnostics: ThreadDiagnosticsCache,
     /// When each intermittently connected device last checked in.
     ///
     /// In memory only: a check-in says a device was awake a moment ago, which
@@ -175,6 +230,7 @@ impl ServerContext {
             runtime,
             ota: ota::OtaUploadRegistry::new(),
             subscriptions: subscriptions::Registry::new(),
+            thread_diagnostics: ThreadDiagnosticsCache::new(),
             check_ins: Mutex::new(BTreeMap::new()),
             dcl: DclClient::main_net(),
             test_dcl,
