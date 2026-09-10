@@ -16,11 +16,16 @@
 //! Channel handler exactly as an accessory would.
 //!
 //! **A controller is a node too.** That pairing needs a data model to answer
-//! against, which is why one is built here — an empty one. A controller serves
-//! no clusters, so its node has no endpoints, and a device that reads or
-//! invokes on it is told the endpoint does not exist rather than being left to
-//! time out. What the data model is really for is the two things that come
-//! with it:
+//! against, so one is built here. It is deliberately small: a controller is not
+//! a commissionable device, and hosting the clusters one would need
+//! (Operational Credentials, Administrator Commissioning, Network
+//! Commissioning) would be surface serving nobody. What it does host is the one
+//! cluster a device must reach to be updated — the OTA Software Update Provider
+//! — plus the Descriptor every endpoint owes. Anything else a device asks for
+//! is answered "no such endpoint", which is the truth and is what a client SDK
+//! expects; the alternative was a timeout.
+//!
+//! The rest of what the data model is for comes with it:
 //!
 //! * the Interaction Model's *report* side, which is how a controller consumes
 //!   the `ReportData` its subscriptions produce — rs-matter hands each one to
@@ -32,17 +37,23 @@
 //!   Secure Channel message an accessory would drop and a controller wants:
 //!   an ICD's check-in.
 //!
-//! Endpoints get added to this node when there is something to serve on them.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use rs_matter::crypto::Crypto;
+use rand_core::OsRng;
+use rs_matter::bdx::{Bdx, BdxBuffer, PROTO_ID_BDX};
+use rs_matter::dm::clusters::desc::{ClusterHandler as _, DescHandler};
 use rs_matter::dm::clusters::net_comm::NetworkType;
+use rs_matter::dm::clusters::ota_prov::{self, OtaBdxHandler, OtaProviderHandler};
+use rs_matter::dm::devices::DEV_TYPE_OTA_PROVIDER;
 use rs_matter::dm::networks::eth::EthNetwork;
 use rs_matter::dm::networks::wireless::NoopWirelessNetCtl;
-use rs_matter::dm::{EmptyHandler, Node};
+use rs_matter::dm::{Async, Dataver, EmptyHandler, Endpoint, EpClMatcher, Node};
 use rs_matter::im::{InteractionModel, InteractionModelState, PROTO_ID_INTERACTION_MODEL};
+use rs_matter::utils::storage::pooled::PooledBuffers;
+use rs_matter::{clusters, devices};
 use rs_matter::persist::DirKvBlobStore;
 use rs_matter::respond::{ChainedExchangeHandler, Responder};
 use rs_matter::sc::SecureChannel;
@@ -52,6 +63,7 @@ use rs_matter::Matter;
 use crate::api::ServerContext;
 
 use super::checkin::CheckInReceiver;
+use super::ota_provider::{self, ImageStore};
 use super::reports::ReportReceiver;
 
 /// How many exchanges may be handled at once.
@@ -76,16 +88,22 @@ const SUBSCRIPTIONS: usize = 0;
 /// there are no clusters here to emit them.
 const EVENTS_BUFFER: usize = 0;
 
-/// The controller's own data model: a node with no endpoints.
+/// How many image downloads may run at once.
 ///
-/// Being addressable is the point, not being useful. Anything sent here is
-/// answered by the Interaction Model with "no such endpoint", which is the
-/// truth and is what a client SDK expects; the alternative was a timeout.
-type ControllerDataModel = (Node<'static>, EmptyHandler);
+/// Each holds one staging buffer for the BDX blocks it is sending. Updates are
+/// something a user starts one at a time; two is enough that a second device
+/// asking mid-transfer is not turned away.
+const CONCURRENT_DOWNLOADS: usize = 2;
 
-fn controller_data_model() -> ControllerDataModel {
-    (Node::new(&[]), EmptyHandler)
-}
+/// The controller as a Matter node: one endpoint, serving what a device must
+/// reach to be updated.
+const CONTROLLER_NODE: Node<'static> = Node {
+    endpoints: &[Endpoint::new(
+        ota_provider::OTA_PROVIDER_ENDPOINT,
+        devices!(DEV_TYPE_OTA_PROVIDER),
+        clusters!(DescHandler::CLUSTER, ota_prov::FULL_CLUSTER),
+    )],
+};
 
 /// Accept and answer device-initiated exchanges, forever.
 ///
@@ -108,12 +126,32 @@ pub async fn run<'a, C: Crypto + Clone>(
     let kv = matter.kv(DirKvBlobStore::new(storage_path));
 
     let reports = ReportReceiver::new(context.clone());
-    let check_ins = CheckInReceiver::new(context, crypto.clone());
+    let check_ins = CheckInReceiver::new(context.clone(), crypto.clone());
+    let images = ImageStore::new(context);
+
+    // Every endpoint owes a Descriptor, and the provider cluster is what a
+    // device invokes `QueryImage` on.
+    let handlers = EmptyHandler
+        .chain(
+            EpClMatcher::new(
+                Some(ota_provider::OTA_PROVIDER_ENDPOINT),
+                Some(DescHandler::CLUSTER.id),
+            ),
+            Async(DescHandler::new(Dataver::new_rand(&mut OsRng)).adapt()),
+        )
+        .chain(
+            EpClMatcher::new(
+                Some(ota_provider::OTA_PROVIDER_ENDPOINT),
+                Some(ota_prov::FULL_CLUSTER.id),
+            ),
+            OtaProviderHandler::new(Dataver::new_rand(&mut OsRng), &images).adapt(),
+        );
+
     let data_model = InteractionModel::new_with_reports(
         matter,
         crypto.clone(),
         &buffers,
-        controller_data_model(),
+        (CONTROLLER_NODE, handlers),
         &kv,
         // A controller does not commission itself onto a network, so the
         // NetworkCommissioning side of the Interaction Model has nothing to
@@ -126,16 +164,21 @@ pub async fn run<'a, C: Crypto + Clone>(
     // `Responder::new_default` builds this same pair, but with a Secure
     // Channel handler that drops check-ins. This is that construction with the
     // controller's handler in place of the accessory's silence.
-    let responder = Responder::new(
-        "controller",
-        ChainedExchangeHandler::new(
-            PROTO_ID_INTERACTION_MODEL,
-            &data_model,
-            SecureChannel::new_with_handler(crypto, &data_model, check_ins),
-        ),
-        matter,
-        0,
+    // The image bytes go out over BDX, a third protocol on the same responder:
+    // the device opens a BDX exchange once the cluster has told it where to
+    // look.
+    let download_buffers: PooledBuffers<BdxBuffer, CONCURRENT_DOWNLOADS> = PooledBuffers::new();
+    let handler = ChainedExchangeHandler::new(
+        PROTO_ID_INTERACTION_MODEL,
+        &data_model,
+        SecureChannel::new_with_handler(crypto, &data_model, check_ins),
+    )
+    .chain(
+        PROTO_ID_BDX,
+        Bdx::new(OtaBdxHandler::new(&download_buffers, &images)),
     );
+
+    let responder = Responder::new("controller", handler, matter, 0);
     if let Err(error) = responder.run::<HANDLERS>().await {
         log::error!("The responder stopped: {:?}", error);
     }

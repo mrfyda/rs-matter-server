@@ -40,6 +40,15 @@ pub struct StoredImage {
     pub bytes: Vec<u8>,
 }
 
+impl StoredImage {
+    /// Whether this is the image a device asking for that exact version wants.
+    fn matches(&self, vendor_id: u16, product_id: u16, software_version: u64) -> bool {
+        self.version.vid == vendor_id
+            && self.version.pid == product_id
+            && self.version.software_version == software_version
+    }
+}
+
 /// Upload reservations plus the images they produced.
 ///
 /// A reservation is single use and bound to the client that made it, so a
@@ -145,6 +154,44 @@ impl OtaUploadRegistry {
 
     pub fn image_count(&self) -> usize {
         self.images.lock().unwrap().len()
+    }
+
+    /// The size of one stored image, if it is held.
+    pub fn image_size(&self, vendor_id: u16, product_id: u16, software_version: u64) -> Option<u64> {
+        self.images
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|image| image.matches(vendor_id, product_id, software_version))
+            .map(|image| image.bytes.len() as u64)
+    }
+
+    /// Copy part of a stored image into `buf`, returning how much was copied.
+    ///
+    /// A read that starts at or past the end returns zero, which is how a BDX
+    /// transfer learns it is finished. `None` means no such image, which is a
+    /// different answer from "no bytes left".
+    pub fn read_image(
+        &self,
+        vendor_id: u16,
+        product_id: u16,
+        software_version: u64,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Option<usize> {
+        let images = self.images.lock().unwrap();
+        let image = images
+            .iter()
+            .find(|image| image.matches(vendor_id, product_id, software_version))?;
+
+        let offset = usize::try_from(offset).ok()?;
+        if offset >= image.bytes.len() {
+            return Some(0);
+        }
+        let remaining = &image.bytes[offset..];
+        let len = remaining.len().min(buf.len());
+        buf[..len].copy_from_slice(&remaining[..len]);
+        Some(len)
     }
 }
 
@@ -320,6 +367,51 @@ mod tests {
             release_notes_url: None,
             update_source: UpdateSource::Local,
         }
+    }
+
+    /// What a BDX transfer walks: the whole image, in the block sizes the
+    /// transfer happens to use, and a clean end.
+    #[test]
+    fn a_stored_image_reads_back_in_pieces() {
+        let registry = OtaUploadRegistry::new();
+        let bytes: Vec<u8> = (0..=255u8).collect();
+        registry.store(StoredImage {
+            version: version(2),
+            bytes: bytes.clone(),
+        });
+
+        assert_eq!(registry.image_size(0xFFF1, 0x8001, 2), Some(256));
+
+        let mut read = Vec::new();
+        let mut buf = [0u8; 100];
+        loop {
+            let len = registry
+                .read_image(0xFFF1, 0x8001, 2, read.len() as u64, &mut buf)
+                .expect("the image is there");
+            if len == 0 {
+                break;
+            }
+            read.extend_from_slice(&buf[..len]);
+        }
+        assert_eq!(read, bytes);
+    }
+
+    #[test]
+    fn an_image_that_is_not_held_is_told_apart_from_one_that_has_ended() {
+        let registry = OtaUploadRegistry::new();
+        registry.store(StoredImage {
+            version: version(2),
+            bytes: vec![1, 2, 3],
+        });
+
+        let mut buf = [0u8; 8];
+        // Past the end of an image that exists: no bytes, but it exists.
+        assert_eq!(registry.read_image(0xFFF1, 0x8001, 2, 99, &mut buf), Some(0));
+        // A version, product or vendor that was never stored.
+        assert_eq!(registry.read_image(0xFFF1, 0x8001, 3, 0, &mut buf), None);
+        assert_eq!(registry.read_image(0xFFF1, 0x8002, 2, 0, &mut buf), None);
+        assert_eq!(registry.read_image(0xFFF2, 0x8001, 2, 0, &mut buf), None);
+        assert_eq!(registry.image_size(0xFFF1, 0x8001, 3), None);
     }
 
     #[test]
