@@ -16,9 +16,10 @@ pub mod ota;
 pub mod server_info;
 pub mod webrtc;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use async_channel::{Receiver, Sender};
 
@@ -137,6 +138,11 @@ pub struct ServerContext {
     /// The subscriptions this controller holds, shared between the monitor
     /// that establishes them and the report handler that receives them.
     pub subscriptions: subscriptions::Registry,
+    /// When each intermittently connected device last checked in.
+    ///
+    /// In memory only: a check-in says a device was awake a moment ago, which
+    /// stops being true while this server is not running.
+    check_ins: Mutex<BTreeMap<u64, SystemTime>>,
     dcl: DclClient,
     test_dcl: Option<DclClient>,
     console_loglevel: Mutex<String>,
@@ -169,6 +175,7 @@ impl ServerContext {
             runtime,
             ota: ota::OtaUploadRegistry::new(),
             subscriptions: subscriptions::Registry::new(),
+            check_ins: Mutex::new(BTreeMap::new()),
             dcl: DclClient::main_net(),
             test_dcl,
             console_loglevel: Mutex::new(console_loglevel),
@@ -241,6 +248,16 @@ impl ServerContext {
             return self.test_dcl.as_ref()?.vendor_name(vendor_id);
         }
         self.dcl.vendor_name(vendor_id)
+    }
+
+    /// Record that a node checked in.
+    pub fn note_check_in(&self, node_id: u64, at: SystemTime) {
+        self.check_ins.lock().unwrap().insert(node_id, at);
+    }
+
+    /// When a node last checked in, if it has since this server started.
+    pub fn last_check_in(&self, node_id: u64) -> Option<SystemTime> {
+        self.check_ins.lock().unwrap().get(&node_id).copied()
     }
 
     pub fn console_loglevel(&self) -> String {

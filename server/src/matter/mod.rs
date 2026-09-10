@@ -3,6 +3,7 @@ pub mod actor;
 // Linux.
 #[cfg(all(feature = "bluetooth", target_os = "linux"))]
 pub mod ble;
+pub mod checkin;
 pub mod clusters;
 pub mod commissioning;
 pub mod controller;

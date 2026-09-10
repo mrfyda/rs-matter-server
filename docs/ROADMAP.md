@@ -66,7 +66,7 @@ What each arm does today, and what replaces it:
   rs-matter's real `SecureChannel` handler.
 - Any other protocol → dropped.
 
-## Phase 2 — subscriptions, events, ICD
+## Phase 2 — subscriptions, events, ICD — done
 
 **Attributes: done.** Every node is subscribed to with a wildcard, and its
 reports are published as the events clients already know. `monitor.rs` demoted
@@ -80,10 +80,16 @@ nothing else in its public API says who opened an accepted exchange.
 the report handler turns each one into the `node_event` that had a shape, a
 `diagnostics` history, and nothing emitting it.
 
-**ICD next.** Check-ins want an `sc::AsyncScHandler`, which exists
-precisely so a controller can react to the Secure Channel messages the
-accessory role drops. `awake` and `next_expected_checkin` in `get_icd_state`
-are what it fills in.
+**ICD: done.** Check-ins arrive through `sc::AsyncScHandler`, the hook
+rs-matter provides for the Secure Channel messages an accessory drops. The
+sender is identified by which registered key decrypts the message — there is
+no readable sender otherwise, and a forged one fails the MIC — so
+`register_icd` now keeps the key it issues. `awake` and
+`next_expected_checkin` follow from the check-in time and the device's own
+`ActiveModeDuration` / `IdleModeDuration`.
+
+Phase 2 is complete. None of it has been run against a device; the sleepy
+Thread sensor in the table below is what proves the ICD half.
 
 ## Phase 3 — OTA distribution
 

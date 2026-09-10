@@ -48,9 +48,9 @@ The `every_advertised_command_is_routed` contract test enforces that against
 | `remove_matter_fabric` | ✅ | `RemoveFabric` invoke. |
 | `set_acl_entry` | ✅ | Writes the fabric-scoped ACL; returns the snake_case `AttributeWriteResult`. |
 | `set_node_binding` | ✅ | Writes the endpoint's binding list; a target must name a node or a group, not both. |
-| `get_icd_state` | ✅ | From `IcdManagement`; a node without the cluster reports `supported: false`. `awake` and `next_expected_checkin` are `null` — check-in traffic is not tracked. |
-| `register_icd` | ✅ | Rejects other-vendor administrators with error 100 and the vendor list unless `allow_multi_admin`. |
-| `unregister_icd` | ✅ | `force` skips the peer round-trip. |
+| `get_icd_state` | ✅ | From `IcdManagement`; a node without the cluster reports `supported: false`. `awake` and `next_expected_checkin` are derived from the device's own check-ins, against `ActiveModeDuration` and `IdleModeDuration`; both are `null` until it has checked in since this server started. |
+| `register_icd` | ✅ | Rejects other-vendor administrators with error 100 and the vendor list unless `allow_multi_admin`. The check-in key is kept, with the other credentials, because it is the only thing that can read — or attribute — a check-in from that device. |
+| `unregister_icd` | ✅ | `force` skips the peer round-trip. The stored check-in key is dropped either way. |
 | `resync_icd` | ✅ | Unregisters and reconnects; answers `null`. |
 | `check_node_update` | ✅ | Locally uploaded images first, then the CSA Distributed Compliance Ledger (cached for an hour). Test vendor ids use the test ledger only with `--enable-test-net-dcl`. A version with no published image is not reported as an update. |
 | `update_node` | ❌ | Reports error 11 with a reason. Delivering an image means hosting the OTA Provider cluster and streaming the bytes over BDX. rs-matter 0.3 ships both halves; what is missing here is a responder to host them — see the gaps below. |
@@ -225,7 +225,7 @@ it cannot map to one release.
 cargo test --manifest-path server/Cargo.toml
 ```
 
-294 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
+302 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
 wire-naming registry, the SPAKE2+ verifier against the Matter test vector, the
 mDNS browser's message parsing, the update-ledger rules, storage and restart
 recovery, every command handler, 7 matterjs-server import tests that build a

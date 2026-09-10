@@ -28,7 +28,9 @@
 //!   to, which is the only way to know which node a report came from;
 //! * the Secure Channel handler, which lets a device establish CASE *to* this
 //!   node — needed by anything that calls back, an OTA requestor and a camera
-//!   among them.
+//!   among them — and which carries the hook rs-matter provides for the one
+//!   Secure Channel message an accessory would drop and a controller wants:
+//!   an ICD's check-in.
 //!
 //! Endpoints get added to this node when there is something to serve on them.
 
@@ -40,14 +42,16 @@ use rs_matter::dm::clusters::net_comm::NetworkType;
 use rs_matter::dm::networks::eth::EthNetwork;
 use rs_matter::dm::networks::wireless::NoopWirelessNetCtl;
 use rs_matter::dm::{EmptyHandler, Node};
-use rs_matter::im::{InteractionModel, InteractionModelState};
+use rs_matter::im::{InteractionModel, InteractionModelState, PROTO_ID_INTERACTION_MODEL};
 use rs_matter::persist::DirKvBlobStore;
-use rs_matter::respond::Responder;
+use rs_matter::respond::{ChainedExchangeHandler, Responder};
+use rs_matter::sc::SecureChannel;
 use rs_matter::transport::exchange::MatterBuffers;
 use rs_matter::Matter;
 
 use crate::api::ServerContext;
 
+use super::checkin::CheckInReceiver;
 use super::reports::ReportReceiver;
 
 /// How many exchanges may be handled at once.
@@ -92,7 +96,7 @@ fn controller_data_model() -> ControllerDataModel {
 /// own. It has none to persist while this node serves no clusters, but the
 /// store is real rather than a stub so that adding one later does not change
 /// where its data lives.
-pub async fn run<'a, C: Crypto>(
+pub async fn run<'a, C: Crypto + Clone>(
     matter: &'a Matter<'a>,
     crypto: C,
     storage_path: PathBuf,
@@ -103,10 +107,11 @@ pub async fn run<'a, C: Crypto>(
         InteractionModelState::new(EthNetwork::new_default());
     let kv = matter.kv(DirKvBlobStore::new(storage_path));
 
-    let reports = ReportReceiver::new(context);
+    let reports = ReportReceiver::new(context.clone());
+    let check_ins = CheckInReceiver::new(context, crypto.clone());
     let data_model = InteractionModel::new_with_reports(
         matter,
-        crypto,
+        crypto.clone(),
         &buffers,
         controller_data_model(),
         &kv,
@@ -118,7 +123,19 @@ pub async fn run<'a, C: Crypto>(
         &state,
     );
 
-    let responder = Responder::new_default(&data_model);
+    // `Responder::new_default` builds this same pair, but with a Secure
+    // Channel handler that drops check-ins. This is that construction with the
+    // controller's handler in place of the accessory's silence.
+    let responder = Responder::new(
+        "controller",
+        ChainedExchangeHandler::new(
+            PROTO_ID_INTERACTION_MODEL,
+            &data_model,
+            SecureChannel::new_with_handler(crypto, &data_model, check_ins),
+        ),
+        matter,
+        0,
+    );
     if let Err(error) = responder.run::<HANDLERS>().await {
         log::error!("The responder stopped: {:?}", error);
     }
