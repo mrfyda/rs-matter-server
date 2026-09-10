@@ -176,8 +176,12 @@ at the destination, and connecting to *that* fails with `EACCES` rather than
 `ENOENT`, because the kernel checks write permission before it checks the
 target is a socket. Nothing in this project's compose fixes that — the bus has
 to be passed into the DinD container itself, which on umbrelOS means editing
-the Portainer app's own compose and redoing it after every update. A host
-where the bus cannot be reached is the case BLE proxy mode exists for.
+the Portainer app's own compose and redoing it after every update. On a host
+where the bus cannot be reached there is no fallback: `server_info` carries a
+`ble_proxy_enabled` field because the reference's model has one, and this
+server always reports it `false`. Nothing here proxies a radio elsewhere. A
+Wi-Fi or Ethernet device is still commissionable over mDNS; a Thread device
+that has never joined a network is not reachable at all.
 
 **What is not proven.** All of it compiles and none of it has commissioned a
 real device. Testing needs a factory-reset device — which means removing one

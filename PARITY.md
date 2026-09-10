@@ -224,6 +224,10 @@ What closing each one takes, and what it takes to prove closed, is in
 
 ## Hardware validation
 
+The procedure for extending this table — the rig each claim needs, the
+commands, and what counts as a pass — is
+[docs/HARDWARE-TESTING.md](docs/HARDWARE-TESTING.md).
+
 Run against a Shelly Plug S Gen3 (vendor 5264, product 1) on a live network:
 
 | Step | Result |

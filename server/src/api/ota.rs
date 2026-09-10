@@ -1,11 +1,19 @@
 //! Firmware updates.
 //!
-//! Update *discovery* works against the local image store: an image uploaded
-//! through `POST /ota-upload/<id>` is matched to a node by the vendor id,
-//! product id and software version parsed from its header. Distribution — the
-//! OTA Provider cluster and the BDX transfer that follow — is not implemented,
-//! so `update_node` reports the documented update error rather than silently
-//! doing nothing.
+//! Update *discovery* works against two sources: the local image store, where
+//! an image uploaded through `POST /ota-upload/<id>` is matched to a node by
+//! the vendor id, product id and software version parsed from its header, and
+//! the CSA ledger, which names versions it does not hold. Distribution follows
+//! only for the first: `update_node` grants the node access to the OTA
+//! Provider cluster `matter::responder` hosts and announces this server to it,
+//! and the device fetches the image over BDX on its own schedule. A version
+//! only the ledger knows about is refused with the documented update error
+//! rather than announcing a provider with nothing to send.
+//!
+//! The store is in memory. Images are held for the life of the process, are
+//! not written to the storage directory, and are not evicted once a device has
+//! taken one — so a restart between the upload and the update means uploading
+//! again, and a long-running server holds every image it was ever given.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -22,7 +30,10 @@ use super::{require_node, CallContext};
 
 /// How long a reserved upload id stays valid.
 const UPLOAD_TTL: Duration = Duration::from_secs(60);
-/// Default upload size limit (`--ota-upload-max-size-mb`).
+/// The largest image the upload endpoint accepts.
+///
+/// Held whole in memory, both while it is being received and afterwards, so
+/// this is a memory bound as much as a request one.
 pub const MAX_UPLOAD_SIZE: u64 = 64 * 1024 * 1024;
 /// How many uploads may be in flight at once.
 const MAX_IN_FLIGHT_UPLOADS: usize = 4;
@@ -65,6 +76,7 @@ const ANNOUNCEMENT_UPDATE_AVAILABLE: u64 = 1;
 /// leaked id cannot be redeemed from elsewhere.
 pub struct OtaUploadRegistry {
     reservations: Mutex<BTreeMap<String, Reservation>>,
+    /// In memory, for the life of the process: see the module header.
     images: Mutex<Vec<StoredImage>>,
 }
 

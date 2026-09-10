@@ -17,6 +17,9 @@ That is the single most valuable thing left to do, and it is worth doing before
 building more: it is the only thing that can say whether the shape of what is
 already there is right.
 
+The procedure — the rig, the commands, and what counts as a pass for each
+claim below — is [HARDWARE-TESTING.md](HARDWARE-TESTING.md).
+
 Most of it needs no purchase. The
 [connectedhomeip](https://github.com/project-chip/connectedhomeip) example apps
 run as ordinary Linux processes on the same network and behave like real
@@ -46,6 +49,42 @@ ephemeral one it never listened on. If a matterjs-server or
 python-matter-server still holds that port on the same host, this one refuses
 to start rather than advertise an address nothing answers on. That is
 deliberate, and it is the first thing a migration will hit.
+
+### And four things only a device generates enough of
+
+None of these is a protocol gap — every one is code that works, and none is
+waiting on a decision. They are places where the load a real device puts on
+the server differs in kind from the load a test puts on it, which means the
+first honest measurement of each will come from the rig rather than from
+reasoning. They belong here rather than in the list below because what to do
+about them depends on what the rig says, and possibly nothing.
+
+- **A large interview closes the connection that asked for it.** A first
+  interview publishes one `attribute_updated` per attribute, and the
+  connection that issued it is not draining its 256-slot event channel while
+  its own command runs. The Shelly's 179 fit. A bridge, a multi-endpoint
+  `all-clusters-app`, or anything larger does not, and the server drops that
+  connection from the event stream and closes it so the client re-syncs. What
+  the rig settles is whether that is a real client experience or an
+  arithmetic worry: a bridge is the device to point at it.
+- **One connection handles one command at a time.** A `commission_with_code` —
+  5.4 s against the Shelly — blocks every other command on that connection,
+  and its event delivery, for the duration. Home Assistant uses one
+  connection, and the reference is asynchronous here, so this may be a parity
+  difference as well as a latency one. It is also what makes the previous
+  item reachable.
+- **Every changed report rewrites the whole node store.** A subscription
+  report that changes an attribute serializes all of `nodes.json` and fsyncs
+  it. Polling bounded that to once per node per 30 s; subscriptions do not, so
+  a device that reports often writes as often as it reports. The rig that
+  matters is the one most installs run — Home Assistant on a Pi with an SD
+  card — with a chatty device such as a power meter subscribed. `Could not
+  persist polled attributes` in the log is the symptom, and it has been seen
+  once already.
+- **Memory over days.** Uploaded firmware images are held in memory for the
+  life of the process and never evicted, at up to 64 MiB each; the ICD
+  check-in map and the Thread diagnostics cache are in memory too. Idle
+  footprint is 11.4 MiB. A week of real traffic is the measurement.
 
 ## Left to build
 
@@ -128,6 +167,11 @@ matterjs-server reports unavailable with no attributes until its first
 subscription or poll fills it in. Copying matter.js's decoded cache would
 shorten that window on first boot and nothing else.
 
+**matter.js's `sqlite` storage driver.** `--import-matterjs` reads the `wal`,
+`file` and `json` drivers. A source written by `sqlite` is detected and
+reported with the matter.js command that converts it to one of those, which
+is a shorter path than teaching this reader SQL for a one-time import.
+
 **Bluetooth anywhere but Linux.** rs-matter's BTP Central backends are
 `target_os = "linux"`, so macOS needs a CoreBluetooth backend upstream — and
 even with one, a plain CLI binary could not use it without an app bundle and
@@ -153,3 +197,9 @@ there ever was. PARITY.md is the contract; `git log` is the reasoning.
 - **Smaller things.** Nested payload fields by name, epoch attributes as Unix
   time, operational addresses over mDNS, vendor names from the ledger, the
   network topology as a push, and a Matter port that is actually listened on.
+- **A debug build that starts.** The server runs on a 64 MiB thread of its
+  own: the Matter stack's future is laid out across the stack of whatever
+  executes it, and unoptimized it overflowed the 8 MiB main thread and aborted
+  before the listener came up. Release fitted, by a margin nobody had
+  measured. Both builds now start the same way, which is what makes `cargo
+  run` usable next to a device.

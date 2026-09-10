@@ -43,8 +43,10 @@ services:
       # There is no fix at this level: the bus has to be passed into the DinD
       # container first. On umbrelOS that means adding this same mount to the
       # `docker` service of the Portainer app's compose, which an app update
-      # reverts. Where the bus cannot be reached, BLE proxy mode is the way in
-      # — the radio lives elsewhere and the server needs no adapter at all.
+      # reverts. Where the bus cannot be reached there is no way in over
+      # Bluetooth — this server proxies no radio, and reports
+      # `ble_proxy_enabled: false` always. Wi-Fi and Ethernet devices are
+      # unaffected; they are commissioned over mDNS and never need BLE.
       - /run/dbus:/run/dbus
       # Migrating from matterjs-server: mount its storage directory read-only
       # and set IMPORT_MATTERJS below. The first start adopts that fabric, so
