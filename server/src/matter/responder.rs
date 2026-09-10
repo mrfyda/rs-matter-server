@@ -9,30 +9,41 @@
 //! the device retransmitted its message until MRP gave up, and learned nothing
 //! from the silence.
 //!
-//! This is the accept side. `rs-matter`'s [`Responder`] owns the loop — accept
-//! an exchange, hand it to a handler, log what happened, go again — with a
-//! fixed number of handlers running concurrently as one future, so it needs no
-//! executor of its own and can share the thread that owns the `!Send` `Matter`.
+//! This is the accept side, and it is rs-matter's own: [`Responder`] owns the
+//! loop (accept, hand to a handler, log, repeat, several handlers at once as a
+//! single future, so it shares the thread that owns the `!Send` `Matter`), and
+//! [`Responder::new_default`] pairs the Interaction Model with the Secure
+//! Channel handler exactly as an accessory would.
 //!
-//! What each protocol gets is a routing decision, kept in [`Disposition`] so it
-//! can be read and tested in one place. Phase by phase the arms move from
-//! "answer honestly that we cannot" to real handling: the subscription
-//! receiver, the ICD check-in tracker, and the hosted OTA Provider and WebRTC
-//! Requestor clusters each replace one of them.
+//! **A controller is a node too.** That pairing needs a data model to answer
+//! against, which is why one is built here — an empty one. A controller serves
+//! no clusters, so its node has no endpoints, and a device that reads or
+//! invokes on it is told the endpoint does not exist rather than being left to
+//! time out. What the data model is really for is the two things that come
+//! with it:
 //!
-//! **Why answer at all, rather than keep ignoring them.** A status response is
-//! what the peer is entitled to: `Busy` names a condition it can retry after,
-//! and `InvalidSubscription` tells a device its subscription is gone so it can
-//! stop reporting into a void. Silence says the same thing only after a
-//! retransmit budget expires, and says it less precisely.
+//! * the Interaction Model's *report* side, which is how a controller consumes
+//!   the `ReportData` its subscriptions produce — rs-matter hands each one to a
+//!   [`ReportDataHandler`](rs_matter::dm::ReportDataHandler) with the
+//!   `(fabric, peer, subscription id)` it belongs to, which is the only way to
+//!   know which node a report came from;
+//! * the Secure Channel handler, which lets a device establish CASE *to* this
+//!   node — needed by anything that calls back, an OTA requestor and a camera
+//!   among them.
+//!
+//! Endpoints get added to this node when there is something to serve on them.
 
-use rs_matter::error::Error;
-use rs_matter::im::busy::BusyInteractionModel;
-use rs_matter::im::{IMStatusCode, OpCode, StatusResp, PROTO_ID_INTERACTION_MODEL};
-use rs_matter::respond::{ExchangeHandler, Responder};
-use rs_matter::sc::busy::BusySecureChannel;
-use rs_matter::sc::{OpCode as ScOpCode, PROTO_ID_SECURE_CHANNEL};
-use rs_matter::transport::exchange::Exchange;
+use std::path::PathBuf;
+
+use rs_matter::crypto::Crypto;
+use rs_matter::dm::clusters::net_comm::NetworkType;
+use rs_matter::dm::networks::eth::EthNetwork;
+use rs_matter::dm::networks::wireless::NoopWirelessNetCtl;
+use rs_matter::dm::{EmptyHandler, Node};
+use rs_matter::im::{InteractionModel, InteractionModelState};
+use rs_matter::persist::DirKvBlobStore;
+use rs_matter::respond::Responder;
+use rs_matter::transport::exchange::MatterBuffers;
 use rs_matter::Matter;
 
 /// How many exchanges may be handled at once.
@@ -43,158 +54,61 @@ use rs_matter::Matter;
 /// behind each one is short.
 const HANDLERS: usize = 4;
 
-/// What to do with an exchange a device opened.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Disposition {
-    /// An ongoing subscription's `ReportData`. Nothing here subscribes yet, so
-    /// any report is for a subscription this server does not have — most
-    /// likely one belonging to the matterjs-server installation whose fabric
-    /// was imported, which the device still believes in.
-    UnknownSubscription,
-    /// An ICD check-in: a sleepy device saying it is briefly awake. Sent
-    /// sessionlessly and unreliably, so it wants no answer.
-    CheckIn,
-    /// An Interaction Model request. A controller hosts no clusters yet, so
-    /// there is nothing to read, write or invoke on it.
-    BusyInteractionModel,
-    /// A Secure Channel handshake. A device establishing CASE to this node
-    /// wants to reach a cluster server that does not exist yet.
-    BusySecureChannel,
-    /// A protocol this node does not speak at all.
-    Ignore,
-}
+/// Exchange-sized buffers to keep for the Interaction Model. Two per handler:
+/// one for the message being read and one for the answer being written.
+/// rs-matter's own default is ten, sized for an accessory that also serves
+/// subscriptions to several controllers at once, which this node does not.
+const BUFFER_POOL: usize = HANDLERS * 2;
 
-/// Route an exchange by the protocol and opcode of its first message.
+/// How many subscriptions this node would serve as a publisher: none. A
+/// controller subscribes, it is not subscribed to.
+const SUBSCRIPTIONS: usize = 0;
+
+/// How much room to keep for events this node would emit. It emits none —
+/// there are no clusters here to emit them.
+const EVENTS_BUFFER: usize = 0;
+
+/// The controller's own data model: a node with no endpoints.
 ///
-/// Split out from the handler because it is the whole policy: everything else
-/// in this module is plumbing, and this is the part worth reading and
-/// asserting on.
-pub fn disposition(proto_id: u16, opcode: u8) -> Disposition {
-    match proto_id {
-        PROTO_ID_INTERACTION_MODEL if opcode == OpCode::ReportData as u8 => {
-            Disposition::UnknownSubscription
-        }
-        PROTO_ID_INTERACTION_MODEL => Disposition::BusyInteractionModel,
-        PROTO_ID_SECURE_CHANNEL if opcode == ScOpCode::CheckIn as u8 => Disposition::CheckIn,
-        PROTO_ID_SECURE_CHANNEL => Disposition::BusySecureChannel,
-        _ => Disposition::Ignore,
-    }
-}
+/// Being addressable is the point, not being useful. Anything sent here is
+/// answered by the Interaction Model with "no such endpoint", which is the
+/// truth and is what a client SDK expects; the alternative was a timeout.
+type ControllerDataModel = (Node<'static>, EmptyHandler);
 
-/// Applies [`disposition`] to each accepted exchange.
-pub struct ControllerExchangeHandler;
-
-impl ExchangeHandler for ControllerExchangeHandler {
-    async fn handle(&self, mut exchange: Exchange<'_>) -> Result<(), Error> {
-        // Peek without consuming: the handlers below fetch the same message
-        // again, which is how rs-matter's own chained handler works.
-        exchange.recv_fetch().await?;
-        let meta = exchange.rx()?.meta();
-
-        match disposition(meta.proto_id, meta.proto_opcode) {
-            Disposition::UnknownSubscription => {
-                log::debug!(
-                    "Exchange {}: a report arrived for a subscription this server does not have",
-                    exchange.id()
-                );
-                // Naming the reason is what lets the device tear the
-                // subscription down instead of reporting into a void until its
-                // own timeout.
-                status(exchange, IMStatusCode::InvalidSubscription).await
-            }
-            Disposition::CheckIn => {
-                log::debug!("Exchange {}: an ICD check-in", exchange.id());
-                // Unreliable and sessionless: dropping the exchange is the
-                // whole of the protocol's expectation.
-                Ok(())
-            }
-            Disposition::BusyInteractionModel => {
-                BusyInteractionModel::new().handle(exchange).await
-            }
-            Disposition::BusySecureChannel => BusySecureChannel::new().handle(exchange).await,
-            Disposition::Ignore => {
-                log::debug!(
-                    "Exchange {}: protocol {:#06x} is not one this node speaks",
-                    exchange.id(),
-                    meta.proto_id
-                );
-                Ok(())
-            }
-        }
-    }
-}
-
-/// Send a bare Interaction Model status and end the exchange.
-async fn status(mut exchange: Exchange<'_>, status: IMStatusCode) -> Result<(), Error> {
-    exchange
-        .send_with(|_, wb| {
-            StatusResp::write(wb, status)?;
-            Ok(Some(OpCode::StatusResponse.meta()))
-        })
-        .await
+fn controller_data_model() -> ControllerDataModel {
+    (Node::new(&[]), EmptyHandler)
 }
 
 /// Accept and answer device-initiated exchanges, forever.
 ///
 /// Runs alongside the transport on the Matter thread. It never returns: a
 /// failed exchange is logged by the responder and the next one is accepted.
-pub async fn run(matter: &Matter<'_>) {
-    let responder = Responder::new("controller", ControllerExchangeHandler, matter, 0);
+///
+/// `storage_path` is where the Interaction Model would persist state of its
+/// own. It has none to persist while this node serves no clusters, but the
+/// store is real rather than a stub so that adding one later does not change
+/// where its data lives.
+pub async fn run<'a, C: Crypto>(matter: &'a Matter<'a>, crypto: C, storage_path: PathBuf) {
+    let buffers: MatterBuffers<BUFFER_POOL> = MatterBuffers::new();
+    let state: InteractionModelState<EthNetwork<'_>, SUBSCRIPTIONS, EVENTS_BUFFER> =
+        InteractionModelState::new(EthNetwork::new_default());
+    let kv = matter.kv(DirKvBlobStore::new(storage_path));
+
+    let data_model = InteractionModel::new_with_net_ctl(
+        matter,
+        crypto,
+        &buffers,
+        controller_data_model(),
+        &kv,
+        // A controller does not commission itself onto a network, so the
+        // NetworkCommissioning side of the Interaction Model has nothing to
+        // drive.
+        NoopWirelessNetCtl::new(NetworkType::Ethernet),
+        &state,
+    );
+
+    let responder = Responder::new_default(&data_model);
     if let Err(error) = responder.run::<HANDLERS>().await {
         log::error!("The responder stopped: {:?}", error);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reports_are_recognised_as_belonging_to_no_subscription() {
-        assert_eq!(
-            disposition(PROTO_ID_INTERACTION_MODEL, OpCode::ReportData as u8),
-            Disposition::UnknownSubscription
-        );
-    }
-
-    #[test]
-    fn interaction_model_requests_are_answered_busy() {
-        for opcode in [
-            OpCode::ReadRequest,
-            OpCode::WriteRequest,
-            OpCode::InvokeRequest,
-            OpCode::SubscribeRequest,
-        ] {
-            assert_eq!(
-                disposition(PROTO_ID_INTERACTION_MODEL, opcode as u8),
-                Disposition::BusyInteractionModel,
-                "{:?}",
-                opcode
-            );
-        }
-    }
-
-    #[test]
-    fn a_check_in_is_told_apart_from_a_handshake() {
-        assert_eq!(
-            disposition(PROTO_ID_SECURE_CHANNEL, ScOpCode::CheckIn as u8),
-            Disposition::CheckIn
-        );
-        assert_eq!(
-            disposition(PROTO_ID_SECURE_CHANNEL, ScOpCode::CASESigma1 as u8),
-            Disposition::BusySecureChannel
-        );
-        assert_eq!(
-            disposition(PROTO_ID_SECURE_CHANNEL, ScOpCode::PBKDFParamRequest as u8),
-            Disposition::BusySecureChannel
-        );
-    }
-
-    /// BDX and the User Directed Commissioning protocol both exist and neither
-    /// is spoken here; nothing should be sent back to one.
-    #[test]
-    fn an_unknown_protocol_is_left_alone() {
-        assert_eq!(disposition(0x0002, 0x01), Disposition::Ignore);
-        assert_eq!(disposition(0x0003, 0x00), Disposition::Ignore);
     }
 }

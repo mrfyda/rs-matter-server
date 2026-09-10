@@ -32,9 +32,10 @@ WebSocket / HTTP client
   Model client, the TLV↔JSON codec, the cluster registry, the mDNS browser, the
   SPAKE2+ verifier, the update-ledger client.
 - `server/src/matter/responder.rs` — the accept side: the exchanges a *device*
-  opens, routed by protocol and opcode. It runs on the Matter thread beside the
-  transport, because rs-matter's responder is a single future running several
-  handlers concurrently and `Matter` is `!Send`.
+  opens, answered by rs-matter's own Interaction Model and Secure Channel
+  handlers over a controller-shaped data model (a node with no endpoints). It
+  runs on the Matter thread beside the transport, because that responder is a
+  single future running several handlers concurrently and `Matter` is `!Send`.
 - `server/src/storage/` — nodes, credentials, fabric label, node-id counter.
 - `server/src/migrate/` — reading a matterjs-server storage directory into that
   state: `value` decodes matter.js's tagged JSON, `store` normalises its three

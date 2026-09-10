@@ -99,6 +99,9 @@ pub async fn run(
     // rs-matter's crypto backend is not `Clone`, but `&C` implements `Crypto`
     // and is `Copy`, so the actor holds a reference and the transport keeps
     // the backend itself.
+    // The responder persists into the same directory, so the actor takes a
+    // clone rather than the only copy.
+    let responder_storage = storage_path.clone();
     let actor_context = ActorContext {
         matter: &matter,
         crypto: &crypto,
@@ -125,7 +128,10 @@ pub async fn run(
     // thread or executor of its own.
     let network = futures_lite::future::or(
         run_transport(&matter, &crypto, &matter_socket, &ble),
-        futures_lite::future::or(run_mdns(&matter, &crypto, &mdns), responder::run(&matter)),
+        futures_lite::future::or(
+            run_mdns(&matter, &crypto, &mdns),
+            responder::run(&matter, &crypto, responder_storage),
+        ),
     );
     let work = futures_lite::future::or(
         actor::run(actor_context, requests),

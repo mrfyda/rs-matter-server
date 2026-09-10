@@ -119,14 +119,14 @@ How these get closed, in what order, and what each one takes to verify is in
    and then hands the caller nothing to consume it with: after the priming
    chunks, reports arrive on device-initiated exchanges, and there is no
    receiver abstraction upstream for them. The primitives are public, so the
-   receiver is buildable here. Half of it now is: `matter::responder` accepts
-   those exchanges and routes them, and a report for a subscription this
-   server does not have is answered `InvalidSubscription` rather than ignored.
-   What is missing is the other half — subscribing in the first place, and a
-   registry keyed by `(fabric, node, subscription id)` to match reports to,
-   with a resubscribe when a node misses its committed `max_int`. Until that
-   exists, clients see the same `attribute_updated` / `node_updated` events,
-   produced two ways:
+   receiver is buildable here, and rs-matter has the seat for it: the
+   Interaction Model routes an incoming report to a `ReportDataHandler` along
+   with the `(fabric, peer, subscription id)` it belongs to. `matter::responder`
+   now hosts that Interaction Model, so the seat exists and is empty — every
+   report is answered `InvalidSubscription`, which is what the default handler
+   does. What is missing is subscribing in the first place, and a handler that
+   turns a report into the events below. Until that exists, clients see the
+   same `attribute_updated` / `node_updated` events, produced two ways:
 
    - **Changes this controller caused** are read back from the target endpoint
      as soon as the command returns, so a client's view updates in about
@@ -178,18 +178,18 @@ How these get closed, in what order, and what each one takes to verify is in
    The Matter half of that is in rs-matter 0.3 already: `dm::clusters::ota_prov`
    has `OtaProviderHandler` and `OtaBdxHandler` over the `OtaImagesRegistry` and
    `OtaImages` traits, and `bdx` is a complete transfer engine. What is missing
-   is this side: `matter::responder` accepts the exchange a device opens, but
-   this node hosts no data model, so a `QueryImage` is answered `Busy` rather
-   than served. Closing this means a minimal hosted data model, those two
-   handlers over the existing image store, an `AnnounceOTAProvider` invoke to
-   point the device here, and the ACL entry that lets it invoke back. Until then, if the ledger offers an update a
+   is this side: `matter::responder` hosts a data model with no endpoints, so
+   a device's `QueryImage` is told the endpoint does not exist. Closing this
+   means an endpoint carrying those two handlers over the existing image store,
+   an `AnnounceOTAProvider` invoke to point the device here, and the ACL entry
+   that lets it invoke back. Until then, if the ledger offers an update a
    client will show it and installing it will fail with the documented update
    error.
 
    Note that a Matter update is not the same thing as a vendor update: a device
    can be current in the ledger while the vendor's own app offers newer
    firmware over its own channel, which Matter cannot see.
-6. **WebRTC.** No camera signalling is relayed. The blocker is the same missing
+6. **WebRTC.** No camera signalling is relayed. The blocker is the same empty
    data model as gap 5, not a missing transport: rs-matter 0.3 has both
    signalling clusters (`dm::clusters::app::webrtc_prov`, `webrtc_req`) and a
    TCP transport for the SDP payloads too large for MRP. A controller invokes

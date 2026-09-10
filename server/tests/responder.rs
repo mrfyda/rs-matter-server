@@ -8,16 +8,18 @@
 //! The probe is a plaintext `CASESigma1`, because that is the one thing a
 //! stranger may legitimately send unencrypted: rs-matter's transport creates a
 //! new unsecured session only for `PBKDFParamRequest` and `CASESigma1`. It is
-//! also the exchange a real device opens when it wants to reach a cluster on
-//! this node, so what comes back is what a device would get.
+//! also the exchange a real device opens when it wants to reach this node, so
+//! what comes back is what a device would get.
 //!
-//! That same rule is why the Interaction Model arms are not asserted here.
-//! Reaching them needs a secured session, and this node answers `Busy` to the
-//! handshake that would establish one — so until it hosts a data model there
-//! is no legitimate way to put an IM message in front of it. The routing for
-//! those arms is asserted directly, in `matter::responder`.
+//! The handshake is from a fabric this server has never heard of, which is the
+//! one thing that can be arranged without commissioning: two stacks, two
+//! fabrics, no shared root. The spec's answer to that is a specific status —
+//! not silence, and not a generic failure — so asserting it proves the whole
+//! path: the exchange was accepted, the Secure Channel handler read it, the
+//! fabric table was consulted, and the answer was sent back over UDP.
 
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket};
+use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
@@ -27,16 +29,23 @@ use rand_core::OsRng;
 use rs_matter::crypto::default_crypto;
 use rs_matter::dm::devices::test::DAC_PRIVKEY;
 use rs_matter::sc::{GeneralCode, OpCode, StatusReport, PROTO_ID_SECURE_CHANNEL};
+use rs_matter::tlv::{TLVTag, TLVWrite};
 use rs_matter::transport::exchange::Exchange;
 use rs_matter::transport::network::Address;
 use rs_matter::utils::storage::ReadBuf;
 use rs_matter_server::matter::controller::{init_matter, FabricConfig};
 use rs_matter_server::matter::responder;
 
-/// `SCStatusCodes::Busy`, the "try again later" a node with no cluster server
-/// to reach owes an initiator. Asserted as a literal so the wire value is
+/// `SCStatusCodes::NoSharedTrustRoots`: the initiator's destination id matched
+/// none of this node's fabrics. Asserted as a literal so the wire value is
 /// pinned here rather than restated from the enum under test.
-const SC_BUSY: u16 = 4;
+const SC_NO_SHARED_TRUST_ROOTS: u16 = 1;
+
+/// Sigma1's TLV context tags, which start at 1.
+const SIGMA1_INITIATOR_RANDOM: u8 = 1;
+const SIGMA1_INITIATOR_SESSION_ID: u8 = 2;
+const SIGMA1_DESTINATION_ID: u8 = 3;
+const SIGMA1_PEER_PUBLIC_KEY: u8 = 4;
 
 /// An ephemeral UDP port for a Matter stack to answer on.
 ///
@@ -63,7 +72,7 @@ fn serve(storage: String, socket: UdpSocket) {
             async {
                 let _ = matter.run(&crypto, &socket, &socket, &socket).await;
             },
-            responder::run(&matter),
+            responder::run(&matter, &crypto, PathBuf::from(&storage)),
         ));
     });
     // Let the transport reach its first poll before anything is sent to it.
@@ -71,7 +80,7 @@ fn serve(storage: String, socket: UdpSocket) {
 }
 
 #[test]
-fn a_handshake_this_node_cannot_host_is_answered_rather_than_ignored() {
+fn a_handshake_from_an_unknown_fabric_is_answered_rather_than_ignored() {
     let server_dir = tempfile::tempdir().expect("tempdir");
     let client_dir = tempfile::tempdir().expect("tempdir");
     let (server_socket, port) = udp_socket();
@@ -93,10 +102,24 @@ fn a_handshake_this_node_cannot_host_is_answered_rather_than_ignored() {
             .await
             .expect("open an exchange to the server");
 
-        // The payload is never read: what is being tested is that something
-        // accepts the exchange and answers the opcode.
+        // A well-formed Sigma1 whose destination id belongs to no fabric this
+        // server holds. The randoms and the key are never examined: the
+        // responder consults the fabric table first and answers before it
+        // looks at them.
         exchange
-            .send_with(|_, _wb| Ok(Some(OpCode::CASESigma1.meta())))
+            .send_with(|_, wb| {
+                wb.start_struct(&TLVTag::Anonymous)?;
+                wb.str(&TLVTag::Context(SIGMA1_INITIATOR_RANDOM), &[0u8; 32])?;
+                wb.u16(&TLVTag::Context(SIGMA1_INITIATOR_SESSION_ID), 1)?;
+                wb.str(&TLVTag::Context(SIGMA1_DESTINATION_ID), &[0u8; 32])?;
+                // 0x04 marks an uncompressed EC point, which is the shape a
+                // real key has.
+                let mut key = [0u8; 65];
+                key[0] = 0x04;
+                wb.str(&TLVTag::Context(SIGMA1_PEER_PUBLIC_KEY), &key)?;
+                wb.end_container()?;
+                Ok(Some(OpCode::CASESigma1.meta()))
+            })
             .await
             .expect("send Sigma1");
 
@@ -112,9 +135,13 @@ fn a_handshake_this_node_cannot_host_is_answered_rather_than_ignored() {
 
         let mut payload = ReadBuf::new(rx.payload());
         let report = StatusReport::read(&mut payload).expect("a readable status report");
-        assert_eq!(report.general_code, GeneralCode::Busy);
         assert_eq!(report.proto_id, PROTO_ID_SECURE_CHANNEL as u32);
-        assert_eq!(report.proto_code, SC_BUSY);
+        assert_eq!(
+            report.proto_code, SC_NO_SHARED_TRUST_ROOTS,
+            "expected NoSharedTrustRoots, got {:?}",
+            report
+        );
+        assert_eq!(report.general_code, GeneralCode::Failure);
     };
 
     // The transport has to be polled for the exchange to make progress, and a
