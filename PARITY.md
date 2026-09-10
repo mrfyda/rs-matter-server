@@ -150,36 +150,45 @@ What closing each one takes, and what it takes to prove closed, is in
    establishing a subscription always looked right, and why 324 tests missed
    it. Absent paths now mean different things depending on where the values
    came from; see `storage::nodes::Coverage`.
-2. **A device that reboots is not recovered until this server restarts.**
-   Found on hardware, and the worst thing on this list: power-cycling the
-   Shelly plug left it unreachable for the ten minutes it was tried, and only
-   restarting the server fixed it.
+2. **A device that reboots is unreachable until this server restarts.**
+   Found on hardware: power-cycling the Shelly plug left it unreachable for
+   the ten minutes it was tried, and only restarting the server fixed it.
 
-   What is established. The device rebooted at 22:24:08 by its own uptime
-   attribute and was healthy throughout — it pinged in 5 ms. From 22:25 every
-   `read_attribute` failed with a 45 s timeout, and
-   `rs_matter::transport::mrp` reported `Too many retransmissions. Giving up`
-   for the `ReadRequest`, so this server was talking on a CASE session the
-   device had forgotten. No reports arrived and the stored attributes froze.
-   The monitor, whose job is to notice a silent subscription and re-subscribe,
-   printed nothing for 100 s at debug level, while the Matter actor stayed
-   healthy and answered `discover` and `ping_node` immediately. A restart
-   established a fresh CASE in 3 s and everything worked again.
+   The cause is a CASE session that outlives the peer that forgot it. A
+   rebooted device has no memory of the session; rs-matter keeps its side in
+   the session table, and nothing takes it out. MRP noticing the silence —
+   `Too many retransmissions. Giving up` — clears only that exchange's
+   retransmission and ACK state (`transport/mrp.rs`), leaving the session
+   itself untouched. `Exchange::initiate` reuses an existing session whenever
+   there is one and establishes a fresh CASE only when there is not, so every
+   later operation is sent on a session the device will not answer. Sessions
+   are removed on explicit close, on fabric removal, when marked expired, or
+   as the LRU victim when the table is *full* — none of which happens to one
+   dead session on a small fabric. A restart empties the table in memory,
+   which is why it recovers.
 
-   What is not. Where the monitor blocks. `maintain_node` calls
-   `subscriptions.forget()` and then awaits `subscribe()`, which has the 45 s
-   actor timeout, so a failing subscribe should log and retry — and does not.
-   That `forget()` is also why nothing ever logs `stopped reporting`: the
-   entry is gone before `forget_silent` could name it, which removes the one
-   diagnostic that would have made this obvious.
+   Nothing in this repository can fix it. rs-matter exposes no per-peer
+   session eviction, `Matter::transport` is a private field, and
+   `TransportMgr::reset` clears only the RX and TX buffers. It belongs
+   upstream: a session whose MRP has given up should be marked expired, or
+   eviction should be reachable.
 
-   Two smaller things fall out of the same run. `ping_node` answered `true` in
-   3.2 ms throughout, and availability stayed `true`, because `ping` opens an
-   exchange through `open()` and rs-matter hands back the cached session
-   without a round trip — so the probe proves a session object exists, not
-   that the device answers. And `set_loglevel` takes `console_loglevel`; a
-   request naming an argument it does not know changes nothing and still
-   reports success.
+   **The monitor is not at fault**, though an earlier version of this entry
+   said it was. It notices the silent subscription and retries on schedule —
+   subscribe, then poll, each ending in `RxTimeout`, then a 300 s backoff once
+   the node is marked unavailable. The retries cannot succeed because they
+   reuse the same dead session. What made it look wedged is that every one of
+   those failure paths logs at `debug`, so at the default level a node in this
+   state produces silence.
+
+   Two smaller findings from the same run, both fixable here. `ping_node`
+   answered `true` in 3.2 ms throughout, and availability followed it, because
+   `ping` opens an exchange through `open()` and gets the cached session back
+   without a round trip: the probe proves a session object exists, not that
+   the device answers, which is exactly backwards in the case it exists to
+   catch. And `maintain_node` calls `subscriptions.forget()` before awaiting
+   `subscribe()`, so the entry is gone before `forget_silent` could name it
+   and `stopped reporting` can never be logged.
 
 3. **Bluetooth commissioning is Linux-only, and has never run on hardware.**
    `commission_with_code` scans over Bluetooth when mDNS finds nothing. The
