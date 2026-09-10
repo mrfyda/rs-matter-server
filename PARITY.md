@@ -115,7 +115,7 @@ only real proof.
 
 ## Known gaps
 
-How these get closed, in what order, and what each one takes to verify is in
+What closing each one takes, and what it takes to prove closed, is in
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
 1. **Subscriptions have never run against a device.** Every node is subscribed
