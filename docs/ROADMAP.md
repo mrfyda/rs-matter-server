@@ -31,12 +31,13 @@ with the independent work pulled forward so it is not held behind the keystone.
 Nothing here touches the transport, and each item flips a PARITY.md row on its
 own.
 
-**Operational address** (gap 3, and the `get_node_ip_addresses` caveat). Browse
-`_matter._tcp` for `<compressed-fabric-id>-<node-id>` with
-`matter::mdns_browser` after a Bluetooth commissioning completes, and on
-`prefer_cache: false`. Re-resolve rather than store once: nothing else refreshes
-that field, which is why a stored address goes stale and a stored BLE MAC would
-be wrong permanently.
+**A dual-stack mDNS browser** (gap 3). The one-shot browser asks over IPv4
+only, so everything it finds depends on an IPv4 answer — fine for Wi-Fi and
+Ethernet, and true of a Thread device only because its border router
+re-advertises it. Send the same query from an IPv6 socket to `ff02::fb` as
+well and merge the answers. Additive by construction: the IPv4 query keeps
+working if the IPv6 one cannot be sent, which is what makes it safe to do
+without a Thread network to test on.
 
 **`get_vendor_names` from the ledger.** Static table first, the DCL for a miss,
 through the existing `matter::dcl` client and its hour cache.

@@ -25,7 +25,7 @@ The `every_advertised_command_is_routed` contract test enforces that against
 | `get_loglevel` / `set_loglevel` | ✅ | Accepts the matter.js aliases `fatal` and `warn`; applies the level to the running process. |
 | `start_listening` | ✅ | Returns all nodes and turns on this connection's event stream. |
 | `get_nodes` / `get_node` | ✅ | `only_available` honoured. |
-| `get_node_ip_addresses` | ⚠️ | Returns the address commissioning recorded. rs-matter resolves operational addresses internally and exposes no lookup, so `prefer_cache: false` performs a reachability check rather than a fresh mDNS resolve. |
+| `get_node_ip_addresses` | ✅ | `prefer_cache` answers from the record; without it the node's operational instance (`<compressed-fabric-id>-<node-id>._matter._tcp`) is resolved over mDNS, ordered as Matter dials them — link-local IPv6 first — and stored. A resolve nothing answers falls back to the record and a reachability check, so a node answering CASE is not reported as address-less. |
 | `remove_node` | ✅ | Sends `RemoveFabric` to the device, then forgets it locally. A node that cannot be reached is still removed locally (and logged), so an unplugged device is not undeletable. |
 | `interview_node` | ✅ | Wildcard read of every endpoint; publishes the attribute, endpoint and node events it produced. |
 | `ping_node` | ✅ | CASE probe with `attempts`; keyed by the node's known addresses. Updates availability. |
@@ -37,7 +37,7 @@ The `every_advertised_command_is_routed` contract test enforces that against
 | `get_all_credentials` | ✅ | `{ wifi: [{id, ssid}], thread: [{id, networkName, extPanId}] }`, `default` always present. |
 | `set_default_fabric_label` | ✅ | Per-connection ownership, `--default-fabric-label` pinning, null/blank resets to `HomeAssistant`, answers `null`. The label is pushed to commissioned nodes so other ecosystems display it. |
 | `get_fabric_label` | ✅ | `{ fabric_label }`. |
-| `commission_with_code` | ⚠️ | QR and manual codes, mDNS discovery, PASE → AddNOC → CASE → CommissioningComplete, first interview, `node_added`. Bluetooth is tried when mDNS finds nothing, on a Linux build with the `bluetooth` feature and an adapter present; a Bluetooth-commissioned node records no IP address — see the gaps below. |
+| `commission_with_code` | ⚠️ | QR and manual codes, mDNS discovery, PASE → AddNOC → CASE → CommissioningComplete, first interview, `node_added`. Bluetooth is tried when mDNS finds nothing, on a Linux build with the `bluetooth` feature and an adapter present — see the gaps below. A node commissioned that way has no address of its own to record, so it is resolved from `_matter._tcp` once it has joined its network. |
 | `commission_on_network` | ✅ | Explicit `ip_addr`, or `filter_type`/`filter` (none / short discriminator / long discriminator / vendor / device type). |
 | `open_commissioning_window` | ✅ | Enhanced window: a fresh passcode, a SPAKE2+ verifier computed here (validated against the Matter test vector), and manual + QR codes in the response. |
 | `discover` / `discover_commissionable_nodes` | ✅ | Browses `_matterc._udp` directly and reports the full TXT record: discriminator, vendor, product, device type and name, pairing hint and instruction, MRP intervals, TCP support, addresses. Filters are applied to the results. |
@@ -157,14 +157,16 @@ How these get closed, in what order, and what each one takes to verify is in
      commissioning still be refused. The compose file says how.
    - **No hardware run.** Every part of this is verified by compilation only.
      It has never commissioned a real device.
-3. **A Bluetooth-commissioned node records no IP address.**
-   `get_node_ip_addresses` returns `[]` for it. rs-matter resolves the
-   operational address inside `complete_via_case_operational` and does not
-   expose it, and a Bluetooth MAC is not an operational address — storing one
-   would be wrong permanently, since nothing re-resolves that field after
-   commissioning. Closing this means browsing `_matter._tcp` for the node's
-   operational instance, which `matter::mdns_browser` is already equipped to
-   do.
+3. **mDNS queries go out over IPv4 only.** The one-shot browser binds an IPv4
+   socket and asks the IPv4 group, so every discovery this server does —
+   `discover`, `get_thread_border_routers`, and the operational resolve behind
+   `get_node_ip_addresses` — depends on something answering over IPv4. A
+   Wi-Fi or Ethernet device does. A Thread device has no IPv4 address at all
+   and is found only because its border router advertises it on the
+   infrastructure link; on an IPv6-only network nothing would be found.
+   Closing this means sending the same query from an IPv6 socket to `ff02::fb`
+   and collecting both, which is additive — the IPv4 query is unaffected by an
+   IPv6 one failing to send.
 4. **Thread diagnostics.** Border Routers are discovered, but collecting
    per-node diagnostics from one needs a MeshCoP (CoAP/DTLS) or OTBR REST
    client.
@@ -225,7 +227,7 @@ it cannot map to one release.
 cargo test --manifest-path server/Cargo.toml
 ```
 
-268 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
+273 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
 wire-naming registry, the SPAKE2+ verifier against the Matter test vector, the
 mDNS browser's message parsing, the update-ledger rules, storage and restart
 recovery, every command handler, 7 matterjs-server import tests that build a
