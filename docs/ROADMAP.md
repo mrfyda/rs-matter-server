@@ -107,25 +107,19 @@ uploaded — at which point everything above already works. rs-matter's
 `ota_prov::dcl` module is a worked example of exactly this, behind its
 `ota-dcl` feature, over a pluggable HTTPS client.
 
-## Phase 4 — WebRTC signalling
+## Phase 4 — WebRTC signalling — done, unverified
 
-Host `WebRTCTransportRequestor`, relay the invokes it receives out as
-`webrtc_callback`, let `send_webrtc_provider_command` perform the invoke it
-already validates, and chain `TcpNetwork` alongside UDP because an SDP payload
-does not fit in MRP.
+`TcpNetwork` is chained alongside UDP, the `WebRTCTransportRequestor` cluster is
+hosted on the controller's endpoint, its four commands become `webrtc_callback`
+events in the shape `WebRtcCallbackData` defines, and
+`send_webrtc_provider_command` invokes `ProvideOffer` / `SolicitOffer` on the
+camera.
 
-Both shapes are in the reference. `send_webrtc_provider_command` takes
-`{ node_id, endpoint_id, command_name: "ProvideOffer" | "SolicitOffer",
-payload }`, and the event carries `WebRtcCallbackData`: `webrtc_session_id`,
-`node_id`, `endpoint_id`, `fabric_index`, an `event_type` of `offer` /
-`answer` / `ice_candidates` / `end`, and a `data` object per type (`sdp` for
-an offer or answer, an `ice_candidates` array of
-`{ candidate, sdpMid, sdpMLineIndex }`, a numeric `reason` for an end) that may
-be null.
-
-Both halves land together: an offer sent without the requestor hosted leaves a
-client with a session id and no answer. Verifiable against connectedhomeip's
-`camera-app`.
+What has not happened is a camera. connectedhomeip's `camera-app` is the target
+to verify against, and the two things most worth watching there are the TCP
+path under a real multi-kilobyte SDP, and whether a camera's node id resolves
+on the callback (rs-matter exposes no peer identity on an invoke, so it is
+matched against the known nodes).
 
 ## Phase 5 — Thread diagnostics
 

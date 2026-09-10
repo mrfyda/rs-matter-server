@@ -17,4 +17,5 @@ pub mod responder;
 pub mod spake2p_verifier;
 pub mod subscriptions;
 pub mod tlv_json;
+pub mod webrtc;
 pub mod wire_naming;

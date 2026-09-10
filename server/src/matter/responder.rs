@@ -19,11 +19,12 @@
 //! against, so one is built here. It is deliberately small: a controller is not
 //! a commissionable device, and hosting the clusters one would need
 //! (Operational Credentials, Administrator Commissioning, Network
-//! Commissioning) would be surface serving nobody. What it does host is the one
-//! cluster a device must reach to be updated — the OTA Software Update Provider
-//! — plus the Descriptor every endpoint owes. Anything else a device asks for
-//! is answered "no such endpoint", which is the truth and is what a client SDK
-//! expects; the alternative was a timeout.
+//! Commissioning) would be surface serving nobody. What it hosts is what a
+//! device has to reach to talk *to* a controller — the OTA Software Update
+//! Provider for an update, the WebRTC Transport Requestor for a camera's
+//! answer — plus the Descriptor every endpoint owes. Anything else a device
+//! asks for is answered "no such endpoint", which is the truth and is what a
+//! client SDK expects; the alternative was a timeout.
 //!
 //! The rest of what the data model is for comes with it:
 //!
@@ -46,6 +47,7 @@ use rand_core::OsRng;
 use rs_matter::bdx::{Bdx, BdxBuffer, PROTO_ID_BDX};
 use rs_matter::dm::clusters::desc::{ClusterHandler as _, DescHandler};
 use rs_matter::dm::clusters::net_comm::NetworkType;
+use rs_matter::dm::clusters::app::webrtc_req;
 use rs_matter::dm::clusters::ota_prov::{self, OtaBdxHandler, OtaProviderHandler};
 use rs_matter::dm::devices::DEV_TYPE_OTA_PROVIDER;
 use rs_matter::dm::networks::eth::EthNetwork;
@@ -65,6 +67,7 @@ use crate::api::ServerContext;
 use super::checkin::CheckInReceiver;
 use super::ota_provider::{self, ImageStore};
 use super::reports::ReportReceiver;
+use super::webrtc::{self, WebRtcRequestor};
 
 /// How many exchanges may be handled at once.
 ///
@@ -101,7 +104,11 @@ const CONTROLLER_NODE: Node<'static> = Node {
     endpoints: &[Endpoint::new(
         ota_provider::OTA_PROVIDER_ENDPOINT,
         devices!(DEV_TYPE_OTA_PROVIDER),
-        clusters!(DescHandler::CLUSTER, ota_prov::FULL_CLUSTER),
+        clusters!(
+            DescHandler::CLUSTER,
+            ota_prov::FULL_CLUSTER,
+            webrtc_req::FULL_CLUSTER
+        ),
     )],
 };
 
@@ -127,6 +134,7 @@ pub async fn run<'a, C: Crypto + Clone>(
 
     let reports = ReportReceiver::new(context.clone());
     let check_ins = CheckInReceiver::new(context.clone(), crypto.clone());
+    let webrtc_context = context.clone();
     let images = ImageStore::new(context);
 
     // Every endpoint owes a Descriptor, and the provider cluster is what a
@@ -145,6 +153,13 @@ pub async fn run<'a, C: Crypto + Clone>(
                 Some(ota_prov::FULL_CLUSTER.id),
             ),
             OtaProviderHandler::new(Dataver::new_rand(&mut OsRng), &images).adapt(),
+        )
+        .chain(
+            EpClMatcher::new(
+                Some(webrtc::WEBRTC_REQUESTOR_ENDPOINT),
+                Some(webrtc_req::FULL_CLUSTER.id),
+            ),
+            WebRtcRequestor::new(webrtc_context, Dataver::new_rand(&mut OsRng)).adapt(),
         );
 
     let data_model = InteractionModel::new_with_reports(

@@ -61,7 +61,7 @@ The `every_advertised_command_is_routed` contract test enforces that against
 | `get_thread_border_routers` | ✅ | Passive `_meshcop._udp` browse reporting extended address, extended PAN id, network name, host name, addresses and vendor/model. |
 | `get_thread_diagnostics` | ❌ | Returns the documented "nothing cached" answers (`null` for one network, `[]` for all). MeshCoP/OTBR collection is not implemented. `ext_pan_id` is still validated. |
 | `get_network_topology` | ✅ | Real graph derived from the nodes' Thread and Wi-Fi diagnostics: roles, neighbour links with per-direction LQI/RSSI, route-table fallback edges, unknown Thread neighbours, and synthetic Wi-Fi access points. `refresh` re-reads the diagnostics clusters. |
-| `send_webrtc_provider_command` | ❌ | Validates its arguments, then reports error 7 with a reason. Invoking the provider command is the easy half; the answer and ICE candidates come back as invokes on a `WebRTCTransportRequestor` server this node does not host — see the gaps below. |
+| `send_webrtc_provider_command` | ⚠️ | `ProvideOffer` and `SolicitOffer` are invoked on the camera's provider cluster, with payload fields resolved by name through the same metadata `device_command` uses. The camera's reply arrives on the `WebRTCTransportRequestor` cluster this node hosts and reaches the client as `webrtc_callback`. No camera has ever been on the other end of it. |
 | `subscribe_attribute` | ❌ | Error 9, matching the reference implementation (its docs call it a stub, but its dispatcher rejects it). |
 
 ## Events
@@ -78,7 +78,7 @@ The `every_advertised_command_is_routed` contract test enforces that against
 | `node_event` | ✅ | Emitted from the event reports a node's subscription produces, with the endpoint, cluster, event id, number, priority and timestamp the device sent. A delta-encoded timestamp is resolved against the previous event in the same report. |
 | `thread_diagnostics_updated` | ❌ | Gated opt-in is implemented; Border Routers are discovered but no collector produces diagnostics batches. |
 | `network_topology_updated` | ✅ | Published when a node change moves the graph — a node added or removed, one coming or going, or a poll bringing back different Thread or Wi-Fi diagnostics. A rebuild that produces the same graph is not announced, and `collected_at` is excluded from that comparison so a rebuild alone is not a change. |
-| `webrtc_callback` | ❌ | A device raises these by invoking `WebRTCTransportRequestor` on the controller; nothing here hosts that cluster. |
+| `webrtc_callback` | ⚠️ | Raised for each of the four commands a camera invokes on the hosted `WebRTCTransportRequestor`: `offer`, `answer`, `ice_candidates` and `end`, carrying the session id, node, endpoint and fabric index, and the `data` object the reference's model defines for that type. Unverified against a camera. |
 
 Event gating matches the reference: nothing is delivered before
 `start_listening`, and the Thread, topology and WebRTC events additionally
@@ -199,22 +199,23 @@ How these get closed, in what order, and what each one takes to verify is in
    Note that a Matter update is not the same thing as a vendor update: a device
    can be current in the ledger while the vendor's own app offers newer
    firmware over its own channel, which Matter cannot see.
-6. **WebRTC signalling is not relayed.** rs-matter 0.3 has both signalling
-   clusters (`dm::clusters::app::webrtc_prov`, `webrtc_req`) and a TCP
-   transport for the SDP payloads too large for MRP. What is missing is this
-   side: `send_webrtc_provider_command` invokes `SolicitOffer` / `ProvideOffer`
-   on the camera, and the camera answers by invoking on a
-   `WebRTCTransportRequestor` this node would host — which becomes the
-   `webrtc_callback` event (`WebRtcCallbackData` in the reference's `model.ts`:
-   a session id, node, endpoint and fabric index, plus an `event_type` of
-   `offer` / `answer` / `ice_candidates` / `end` and its data).
+6. **WebRTC signalling has never met a camera.** Both halves are implemented —
+   the offer goes out to the camera's provider cluster, and the
+   `WebRTCTransportRequestor` this node hosts turns what comes back into
+   `webrtc_callback` — and neither has run against a device. Matter cameras are
+   rare; connectedhomeip's `camera-app` is what this should be verified
+   against.
 
-   Both halves land together or neither does: sending an offer without hosting
-   the requestor would leave a client with a session id and no answer, which is
-   worse than the error it gets today.
+   Two things are known to be untested rather than merely unverified. The
+   payloads large enough to need the TCP transport (an SDP is kilobytes, MRP
+   carries about one) are exercised only by a handshake in the test suite, not
+   by a real offer. And the node id on a callback is resolved by asking the
+   accessor to match each known node, because rs-matter exposes no peer
+   identity on an invoke; a camera whose node id is not in the store would
+   report `null` there.
 
    Media itself never touches this server; the reference relays signalling
-   only, as would this.
+   only, as does this.
 
 ## Hardware validation
 
@@ -248,7 +249,7 @@ it cannot map to one release.
 cargo test --manifest-path server/Cargo.toml
 ```
 
-313 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
+320 tests: protocol models and envelopes, TLV↔JSON round trips, the cluster and
 wire-naming registry, the SPAKE2+ verifier against the Matter test vector, the
 mDNS browser's message parsing, the update-ledger rules, storage and restart
 recovery, every command handler, 7 matterjs-server import tests that build a
