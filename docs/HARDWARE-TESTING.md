@@ -283,6 +283,18 @@ catch this on is the one most installs run: Home Assistant on a Raspberry Pi
 with an SD card. Watch for `Could not persist polled attributes` in the log,
 and watch the write rate with `iostat` while a chatty device is subscribed.
 
+**A device that reboots stays unreachable.** Expect this, rather than
+debugging it again: power-cycle a device and it never comes back on its own.
+Reads time out at 45 s, the stored attributes freeze, and the monitor retries
+correctly but always on the CASE session the device forgot. Restart the server
+and it recovers in three seconds. Two things make it confusing in the moment —
+`ping_node` keeps answering `true`, because it is handed the cached session
+without a round trip, and every relevant monitor line is at `debug`, so at the
+default level the server looks idle. Raise the level with
+`set_loglevel console_loglevel=debug` (the argument is `console_loglevel`; a
+name it does not know is ignored and still reports success). The cause and why
+it cannot be fixed here are in PARITY.md's gap 2.
+
 **Memory over days, not minutes.** Uploaded firmware images are held in memory
 for the life of the process and are never evicted, at up to 64 MiB each. The
 idle footprint is 11.4 MiB; leave the rig running for a week with real traffic

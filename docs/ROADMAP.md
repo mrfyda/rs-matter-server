@@ -172,6 +172,29 @@ shorten that window on first boot and nothing else.
 reported with the matter.js command that converts it to one of those, which
 is a shorter path than teaching this reader SQL for a one-time import.
 
+**Recovering a node whose device rebooted.** The most serious thing hardware
+testing found, and not fixable here. A device that reboots forgets its CASE
+session; rs-matter keeps its side and never removes it, because MRP giving up
+clears only that exchange's retransmission state, and `Exchange::initiate`
+reuses an existing session rather than establishing a fresh one. Every
+retry — including the monitor's, which fires correctly — then goes out on a
+session the device will not answer, and the node stays unreachable until this
+server restarts and the in-memory table is empty. There is no per-peer
+eviction in rs-matter's public API, `Matter::transport` is private, and
+`TransportMgr::reset` touches only the RX and TX buffers, so the fix belongs
+upstream: mark a session expired once its MRP has given up. PARITY.md's gap 2
+carries the full trace.
+
+Two smaller things around it *are* fixable here, and are worth doing whenever
+that gap is next opened, because both cost real time during the run that found
+it. `ping_node` reports a dead node as reachable — `ping` goes through
+`open()` and is handed the cached session with no round trip, so it proves a
+session object exists rather than that the device answers, and availability
+follows it. And `maintain_node` calls `subscriptions.forget()` before awaiting
+`subscribe()`, so the entry is gone before `forget_silent` could name it and
+`stopped reporting` can never be logged — removing the one line that would
+have explained the whole failure at a glance.
+
 **Bluetooth anywhere but Linux.** rs-matter's BTP Central backends are
 `target_os = "linux"`, so macOS needs a CoreBluetooth backend upstream — and
 even with one, a plain CLI binary could not use it without an app bundle and
