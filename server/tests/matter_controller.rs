@@ -22,6 +22,23 @@ fn test_create_fabric() {
     assert_eq!(fabric_id, Some(config.fabric_id));
 }
 
+/// The port a device will be told to come back to has to be the one this node
+/// is listening on, so it is configured rather than assumed.
+#[test]
+fn the_configured_port_is_the_one_the_node_advertises() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let path = tmp.path().to_str().unwrap().to_string();
+    let config = FabricConfig {
+        port: 5999,
+        ..FabricConfig::default()
+    };
+
+    let matter = init_matter(&path, &config).expect("init_matter");
+    assert_eq!(matter.port(), 5999);
+    // The default is Matter's own port, not an ephemeral one.
+    assert_eq!(FabricConfig::default().port, 5540);
+}
+
 /// Test 2: Reload an existing fabric from disk.
 #[test]
 fn test_reload_fabric() {

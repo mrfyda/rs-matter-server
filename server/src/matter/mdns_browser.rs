@@ -1,10 +1,12 @@
 //! A one-shot mDNS browser.
 //!
 //! rs-matter's responder browses only the Matter commissionable service and
-//! hands back an address, not the TXT record. Two protocol commands need more
-//! than that: `get_thread_border_routers` browses `_meshcop._udp`, which
-//! rs-matter does not know about at all, and `discover` is supposed to report
-//! the vendor, product and device name a commissionable device advertises.
+//! hands back an address, not the TXT record. Three things need more than
+//! that: `get_thread_border_routers` browses `_meshcop._udp`, which rs-matter
+//! does not know about at all; `discover` is supposed to report the vendor,
+//! product and device name a commissionable device advertises; and
+//! `get_node_ip_addresses` needs a *commissioned* node's operational address,
+//! which rs-matter resolves internally and does not expose.
 //!
 //! This is a *legacy* (one-shot) browser: the query goes out from an ephemeral
 //! port, so responders answer by unicast and no multicast group has to be
@@ -113,6 +115,54 @@ pub async fn browse(service: &str, timeout: Duration) -> std::io::Result<Vec<Ser
         .into_values()
         .filter(|instance| instance.port.is_some() || !instance.addresses.is_empty())
         .collect())
+}
+
+/// The service a commissioned node announces itself on.
+pub const OPERATIONAL_SERVICE: &str = "_matter._tcp.local";
+
+/// The instance a node announces under, as the Matter spec spells it:
+/// two 64-bit ids as uppercase, zero-padded hex.
+pub fn operational_instance_name(compressed_fabric_id: u64, node_id: u64) -> String {
+    format!("{:016X}-{:016X}", compressed_fabric_id, node_id)
+}
+
+/// Resolve one commissioned node's operational addresses.
+///
+/// This is a browse of `_matter._tcp` filtered to the node's own instance
+/// rather than a targeted SRV query: every commissioned device answers the
+/// same query, and picking the one instance out of the answers costs nothing
+/// next to a second query type to maintain.
+///
+/// Addresses come back in the order Matter itself prefers to dial them —
+/// link-local IPv6 first — so a caller reporting only the first one reports
+/// the useful one.
+pub async fn resolve_operational(
+    compressed_fabric_id: u64,
+    node_id: u64,
+    timeout: Duration,
+) -> std::io::Result<Vec<IpAddr>> {
+    let wanted = operational_instance_name(compressed_fabric_id, node_id);
+    let instances = browse(OPERATIONAL_SERVICE, timeout).await?;
+    Ok(operational_addresses(instances, &wanted))
+}
+
+/// Pick one instance's addresses out of a browse and order them for dialling.
+fn operational_addresses(instances: Vec<ServiceInstance>, wanted: &str) -> Vec<IpAddr> {
+    let mut addresses: Vec<IpAddr> = instances
+        .into_iter()
+        .filter(|instance| instance.instance_name.eq_ignore_ascii_case(wanted))
+        .flat_map(|instance| instance.addresses)
+        .collect();
+    addresses.sort_by_key(|address| {
+        // Descending by Matter's own preference, then by address so the
+        // answer does not depend on the order packets happened to arrive.
+        (
+            u8::MAX - rs_matter::transport::network::mdns::score_ip_address(address),
+            address.to_string(),
+        )
+    });
+    addresses.dedup();
+    addresses
 }
 
 /// Build a PTR query with the unicast-response bit set.
@@ -398,6 +448,66 @@ mod tests {
 
     /// The plain `IN` class, which responses carry.
     const CLASS_IN: u16 = 1;
+
+    fn instance(name: &str, addresses: &[&str]) -> ServiceInstance {
+        ServiceInstance {
+            instance_name: name.to_string(),
+            addresses: addresses.iter().map(|a| a.parse().unwrap()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn operational_instances_are_named_as_the_spec_spells_them() {
+        assert_eq!(
+            operational_instance_name(0x1234_5678_9ABC_DEF0, 1),
+            "123456789ABCDEF0-0000000000000001"
+        );
+        assert_eq!(
+            operational_instance_name(0, u64::MAX),
+            "0000000000000000-FFFFFFFFFFFFFFFF"
+        );
+    }
+
+    #[test]
+    fn only_the_wanted_node_contributes_addresses() {
+        let instances = vec![
+            instance("123456789ABCDEF0-0000000000000001", &["fd00::1"]),
+            instance("123456789ABCDEF0-0000000000000002", &["fd00::2"]),
+        ];
+        assert_eq!(
+            operational_addresses(instances, "123456789ABCDEF0-0000000000000001"),
+            vec!["fd00::1".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    /// Responders differ on the case of hex in an instance name, and mDNS
+    /// names are case-insensitive.
+    #[test]
+    fn the_instance_match_ignores_hex_case() {
+        let instances = vec![instance("123456789abcdef0-0000000000000001", &["fd00::1"])];
+        assert_eq!(
+            operational_addresses(instances, "123456789ABCDEF0-0000000000000001").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn addresses_come_back_in_the_order_matter_dials_them() {
+        let instances = vec![
+            instance("A-1", &["192.168.1.7", "2001:db8::1", "fe80::1", "fd00::1"]),
+            // The same address seen twice, as two packets can report it.
+            instance("A-1", &["fe80::1"]),
+        ];
+        let addresses: Vec<String> = operational_addresses(instances, "A-1")
+            .iter()
+            .map(|address| address.to_string())
+            .collect();
+        assert_eq!(
+            addresses,
+            vec!["fe80::1", "fd00::1", "2001:db8::1", "192.168.1.7"]
+        );
+    }
 
     /// Build a response carrying PTR, SRV, TXT and A records for one instance.
     fn sample_response(service: &str, instance: &str, txt: &[(&str, &[u8])]) -> Vec<u8> {

@@ -11,11 +11,18 @@ use crate::protocol::message::Args;
 use crate::protocol::model::{AttributesData, MatterNodeData, NodePingResult, TEST_NODE_START};
 use crate::storage::StoredNode;
 
+use crate::matter::mdns_browser;
+
 use super::{now_iso, require_node, CallContext, ServerContext};
 
 /// Vendor names, keyed by decimal vendor id exactly as the reference reports
 /// them. Lifted from the reference's own static table.
 const VENDOR_JSON: &str = include_str!("vendors.json");
+
+/// How long to wait for a node's own answer to an operational mDNS query. It
+/// is answered by the device (or, for a Thread node, by its border router's
+/// advertisement), so it is a local round-trip and not worth waiting long for.
+const OPERATIONAL_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// OperationalCredentials cluster: the fabric index the *node* assigned to us.
 const OPERATIONAL_CREDENTIALS_CLUSTER: u32 = 62;
@@ -47,25 +54,70 @@ pub async fn get_node(args: &Args, context: CallContext<'_>) -> ApiResult {
     Ok(serde_json::to_value(node).unwrap_or(Value::Null))
 }
 
-/// Report the addresses the node was last reached on.
+/// Report the addresses the node can be reached on.
 ///
-/// rs-matter resolves operational addresses internally and does not expose the
-/// result, so the answer is the address commissioning used. `prefer_cache` is
-/// therefore always effectively true; a caller asking for a fresh lookup still
-/// gets a reachability check, so an unreachable node reports no addresses
-/// rather than a stale one.
+/// `prefer_cache` answers from what was last recorded. Without it the node's
+/// operational instance is resolved over mDNS, which is both the fresher
+/// answer and the only one a Bluetooth-commissioned node ever had: rs-matter
+/// resolves that address internally during commissioning and does not expose
+/// it, so nothing else ever learns it.
+///
+/// A resolve that comes back empty falls back to the recorded addresses and a
+/// reachability check rather than reporting none: a device that is answering
+/// CASE but did not answer this one query is reachable, whatever mDNS says.
 pub async fn get_node_ip_addresses(args: &Args, context: CallContext<'_>) -> ApiResult {
     let node_id = require_node(args, context)?;
     let prefer_cache = args.bool_or("prefer_cache", false)?;
-    let addresses = context.server.nodes.ip_addresses(node_id);
 
-    if !prefer_cache && !addresses.is_empty() {
-        match context.server.matter.ping(node_id).await {
-            Ok(()) => {}
-            Err(_) => return Ok(json!([])),
-        }
+    if prefer_cache {
+        return Ok(json!(context.server.nodes.ip_addresses(node_id)));
+    }
+
+    if let Some(resolved) = resolve_addresses(context.server, node_id).await {
+        return Ok(json!(resolved));
+    }
+
+    let addresses = context.server.nodes.ip_addresses(node_id);
+    if !addresses.is_empty() && context.server.matter.ping(node_id).await.is_err() {
+        return Ok(json!([]));
     }
     Ok(json!(addresses))
+}
+
+/// Resolve a node's operational addresses over mDNS and record them.
+///
+/// `None` means nothing answered — a sleepy device, a node that is off, or an
+/// answer that did not reach this host — which is not the same as a node with
+/// no addresses, so the caller decides what to report.
+pub async fn resolve_addresses(context: &ServerContext, node_id: u64) -> Option<Vec<String>> {
+    // An imported test node has no device behind it, so there is nothing on
+    // the network to answer for it.
+    if node_id >= TEST_NODE_START {
+        return None;
+    }
+    let fabric = context.fabric_info().await.ok()?;
+    let addresses = mdns_browser::resolve_operational(
+        fabric.compressed_fabric_id,
+        node_id,
+        OPERATIONAL_RESOLVE_TIMEOUT,
+    )
+    .await
+    .unwrap_or_default();
+    if addresses.is_empty() {
+        return None;
+    }
+
+    let addresses: Vec<String> = addresses
+        .into_iter()
+        .map(|address| address.to_string())
+        .collect();
+    if context.nodes.ip_addresses(node_id) != addresses {
+        context.nodes.set_ip_addresses(node_id, addresses.clone());
+        if let Err(error) = context.nodes.save() {
+            log::warn!("Could not persist node {}'s addresses: {}", node_id, error);
+        }
+    }
+    Some(addresses)
 }
 
 pub async fn ping_node(args: &Args, context: CallContext<'_>) -> ApiResult {
@@ -340,7 +392,6 @@ fn extract_dump_nodes(dump: &Value) -> Option<Vec<&Value>> {
 /// vendor-registry client the static table is what this server has, so a very
 /// new vendor may be missing rather than wrong.
 pub async fn get_vendor_names(args: &Args, context: CallContext<'_>) -> ApiResult {
-    let _ = context;
     let all = vendors();
     let Some(filter) = args.u64_array("filter_vendors")? else {
         return Ok(serde_json::to_value(all).unwrap_or(Value::Null));
@@ -353,6 +404,16 @@ pub async fn get_vendor_names(args: &Args, context: CallContext<'_>) -> ApiResul
         let key = vendor_id.to_string();
         if let Some(name) = all.get(&key) {
             result.insert(key, name.clone());
+            continue;
+        }
+        // Not in the table the reference ships. A vendor id is assigned in the
+        // ledger, so a vendor that shipped after that table was cut is still
+        // nameable — and an id nobody holds is simply absent from the answer,
+        // exactly as it is today.
+        if let Ok(vendor_id) = u16::try_from(vendor_id) {
+            if let Some(name) = context.server.vendor_name_from_dcl(vendor_id) {
+                result.insert(key, name);
+            }
         }
     }
     Ok(serde_json::to_value(result).unwrap_or(Value::Null))
@@ -418,6 +479,18 @@ mod tests {
         assert_eq!(result[0]["node_id"], json!(4));
         // The wire model must not leak the controller's internal fields.
         assert!(result[0].get("ip_addresses").is_none());
+    }
+
+    /// A test node has no device, so the lookup must not reach the network —
+    /// which is also what keeps this test from depending on one.
+    #[test]
+    fn a_test_node_is_never_resolved_over_mdns() {
+        let context = test_context();
+        let node_id = TEST_NODE_START + 1;
+        context
+            .nodes
+            .upsert(StoredNode::new(MatterNodeData::new(node_id, now_iso())));
+        assert_eq!(block_on(resolve_addresses(&context, node_id)), None);
     }
 
     #[test]
@@ -530,5 +603,18 @@ mod tests {
         let all = block_on(get_vendor_names(&Args::default(), call(&context))).unwrap();
         assert!(all.as_object().unwrap().len() > 1000);
         assert_eq!(all["0"], json!("[Matter Standard]"));
+    }
+
+    /// Hits the real CSA ledger; run with `--ignored` when online. 161 vendor
+    /// ids the ledger has assigned are missing from the reference's table,
+    /// and this is one of them.
+    #[test]
+    #[ignore]
+    fn a_vendor_missing_from_the_static_table_is_named_from_the_ledger() {
+        let context = test_context();
+        assert!(!vendors().contains_key("5687"));
+        let args = Args::new(json!({ "filter_vendors": [5687] }));
+        let result = block_on(get_vendor_names(&args, call(&context))).unwrap();
+        assert_eq!(result["5687"], json!("NVIDIA"));
     }
 }

@@ -75,7 +75,17 @@ jobs:
         run: |
           cargo build --manifest-path server/Cargo.toml --release
           generated=$(ls -d server/target/release/build/rs-matter-*/out/clusters_generated | head -1)
-          python3 tools/build_registry.py "$generated" /tmp/clusters-check.json
+          # The generator also reads rs-matter-codegen's IDL, for the one thing
+          # the generated Rust can no longer say: whether an attribute is
+          # `epoch_us` or `epoch_s`. Resolved rather than globbed inline so a
+          # miss fails here, naming itself, instead of reaching Python as a
+          # literal glob.
+          codegen=$(ls -d "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/rs-matter-codegen-* | head -1)
+          if [ ! -d "$codegen" ]; then
+            echo "::error::could not find rs-matter-codegen's source in the cargo registry"
+            exit 1
+          fi
+          python3 tools/build_registry.py "$generated" /tmp/clusters-check.json "$codegen"
           if ! cmp -s /tmp/clusters-check.json server/src/matter/clusters.json; then
             echo "::error file=server/src/matter/clusters.json::Out of date. Regenerate with tools/build_registry.py"
             diff <(python3 -m json.tool /tmp/clusters-check.json) \

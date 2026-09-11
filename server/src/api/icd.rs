@@ -5,6 +5,7 @@
 //! reachable; the commands here read and change that registration on the peer.
 
 use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
@@ -17,6 +18,8 @@ use crate::protocol::paths::parse_path;
 use super::{require_node, CallContext};
 
 const ICD_MANAGEMENT_CLUSTER: u32 = 70;
+const IDLE_MODE_DURATION_ATTRIBUTE: u32 = 0;
+const ACTIVE_MODE_DURATION_ATTRIBUTE: u32 = 1;
 const REGISTERED_CLIENTS_ATTRIBUTE: u32 = 3;
 const OPERATING_MODE_ATTRIBUTE: u32 = 8;
 const FEATURE_MAP_ATTRIBUTE: u32 = 65532;
@@ -84,17 +87,42 @@ async fn read_icd_state(node_id: u64, context: CallContext<'_>) -> Result<IcdSta
 
     let available = context.server.nodes.get(node_id).map(|node| node.available);
 
+    // `IdleModeDuration` is seconds, `ActiveModeDuration` milliseconds — the
+    // cluster mixes units, and getting it wrong would put the next check-in a
+    // thousand times too far away.
+    let idle_secs = attribute(IDLE_MODE_DURATION_ATTRIBUTE).and_then(Value::as_u64);
+    let active_ms = attribute(ACTIVE_MODE_DURATION_ATTRIBUTE).and_then(Value::as_u64);
+    let last_check_in = context.server.last_check_in(node_id);
+
     Ok(IcdStateData {
         supported: true,
         lit_supported: feature_map & FEATURE_LONG_IDLE_TIME != 0,
         registered,
         operating_mode,
-        // The controller does not track check-in traffic, so whether the peer
-        // is awake right now, and when it will next check in, are unknown.
-        awake: None,
+        awake: awake(last_check_in, active_ms),
         available,
-        next_expected_checkin: None,
+        next_expected_checkin: next_expected_checkin(last_check_in, idle_secs),
     })
+}
+
+/// Whether the device is still inside the window it stays awake for after
+/// checking in.
+///
+/// `None` when it has not checked in since this server started, or when the
+/// device does not say how long it stays awake: guessing would be worse than
+/// admitting the answer is not known.
+fn awake(last_check_in: Option<SystemTime>, active_ms: Option<u64>) -> Option<bool> {
+    let elapsed = last_check_in?.elapsed().ok()?;
+    Some(elapsed < Duration::from_millis(active_ms?))
+}
+
+/// When the device is next due to check in: one idle period after the last
+/// one, in epoch milliseconds.
+fn next_expected_checkin(last_check_in: Option<SystemTime>, idle_secs: Option<u64>) -> Option<u64> {
+    let next = last_check_in? + Duration::from_secs(idle_secs?);
+    next.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|since| since.as_millis() as u64)
 }
 
 /// Register this controller as a check-in client.
@@ -129,12 +157,23 @@ pub async fn register_icd(args: &Args, context: CallContext<'_>) -> ApiResult {
             TlvNode::Struct(vec![
                 (0, TlvNode::U64(fabric.node_id)),
                 (1, TlvNode::U64(fabric.node_id)),
-                (2, TlvNode::Bytes(key)),
+                (2, TlvNode::Bytes(key.clone())),
             ]),
             None,
             BTreeMap::new(),
         )
         .await?;
+
+    // Kept because a check-in carries no readable sender: this key is both the
+    // only way to read one from this device and the only way to know it was
+    // this device that sent it. Stored only after the device accepted it.
+    if let Err(error) = context.server.config.set_icd_registration(node_id, &key) {
+        log::warn!(
+            "Node {} was registered but its check-in key could not be stored: {}",
+            node_id,
+            error
+        );
+    }
 
     let state = read_icd_state(node_id, context).await?;
     Ok(serde_json::to_value(state).unwrap_or(Value::Null))
@@ -147,6 +186,13 @@ pub async fn unregister_icd(args: &Args, context: CallContext<'_>) -> ApiResult 
     let node_id = require_node(args, context)?;
     let force = args.bool_or("force", false)?;
     let fabric = context.server.fabric_info().await?;
+
+    // The key stops being useful the moment the device forgets it, and a
+    // forced unregistration means the device is gone; either way, keeping a
+    // secret nobody will ever send is worse than dropping it.
+    if let Err(error) = context.server.config.remove_icd_registration(node_id) {
+        log::warn!("Could not drop node {}'s check-in key: {}", node_id, error);
+    }
 
     if !force {
         context
@@ -272,6 +318,38 @@ mod tests {
             "2026-01-01T00:00:00.000Z".into(),
         )));
         context
+    }
+
+    /// A device is awake for its active period after checking in, and not
+    /// after that.
+    #[test]
+    fn awake_follows_the_active_mode_duration() {
+        let just_now = SystemTime::now();
+        assert_eq!(awake(Some(just_now), Some(4_000)), Some(true));
+
+        let a_while_ago = just_now - Duration::from_secs(30);
+        assert_eq!(awake(Some(a_while_ago), Some(4_000)), Some(false));
+    }
+
+    /// Not knowing is reported as not knowing: a device that has not checked
+    /// in since this server started, or one that does not say how long it
+    /// stays awake, must not be guessed at.
+    #[test]
+    fn awake_is_unknown_without_a_check_in_or_a_duration() {
+        assert_eq!(awake(None, Some(4_000)), None);
+        assert_eq!(awake(Some(SystemTime::now()), None), None);
+    }
+
+    #[test]
+    fn the_next_check_in_is_one_idle_period_after_the_last() {
+        // 2026-01-01T00:00:00Z, in epoch milliseconds.
+        let last = UNIX_EPOCH + Duration::from_secs(1_767_225_600);
+        assert_eq!(
+            next_expected_checkin(Some(last), Some(3_600)),
+            Some((1_767_225_600 + 3_600) * 1_000)
+        );
+        assert_eq!(next_expected_checkin(None, Some(3_600)), None);
+        assert_eq!(next_expected_checkin(Some(last), None), None);
     }
 
     #[test]

@@ -86,12 +86,13 @@ the absolute figures.
 | RSS, after the workload | 200.6 MiB | **13.8 MiB** | 14.5x smaller |
 | Throughput | 1505 req/s | **3365 req/s** | 2.2x faster |
 
-Read fairly: some of the reference's footprint buys features this server does
-not have. At startup it seeds a DCL certificate store, fetches a vendor list,
-and stands up a WebRTC camera-controller endpoint; this server ships a static
-vendor table and has no WebRTC. The throughput figure is not a Matter
-measurement either — those commands are served from cache, so it compares
-protocol and serialization overhead rather than radio work.
+Read fairly: some of the reference's footprint is work this server does later
+or not at all. At startup the reference seeds a DCL certificate store and
+fetches a vendor list; this server serves the reference's own static vendor
+table and reaches the ledger only for an id that table does not cover. The
+throughput figure is not a Matter measurement either — those commands are
+served from cache, so it compares protocol and serialization overhead rather
+than radio work.
 
 ## Configuration
 
@@ -101,6 +102,7 @@ Every option is a flag or an environment variable.
 |---|---|---|---|
 | `--listen` | `LISTEN_ADDRESS` | `0.0.0.0:5580` | WebSocket and HTTP listen address |
 | `--storage-path` | `STORAGE_PATH` | `/data` | Fabric, nodes, credentials, config |
+| `--matter-port` | `MATTER_PORT` | `5540` | The port Matter traffic is answered on and advertised to devices |
 | `--import-matterjs` | `IMPORT_MATTERJS` | — | Adopt a matterjs-server installation on first start |
 | `--import-matterjs-namespace` | `IMPORT_MATTERJS_NAMESPACE` | — | Which storage namespace to import, for a multi-fabric source |
 | `--import-matterjs-dry-run` | — | — | Report what would be imported, then exit |
@@ -214,6 +216,11 @@ interview results, Wi-Fi and Thread credentials, the fabric label, and the
 node-id counter. State is written
 through a temporary file and renamed, so an interrupted write cannot truncate
 what was already there.
+
+Three things deliberately do not, because none of them is still true of the
+world after a restart: a device's ICD check-ins, which say it was awake a
+moment ago; the collected Thread diagnostics; and an uploaded firmware image,
+which is held in memory only — reserve and upload it again after a restart.
 
 `STORAGE_PATH` holds fabric signing material. Treat it like a private key —
 back it up, and do not commit it.

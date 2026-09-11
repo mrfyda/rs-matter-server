@@ -12,6 +12,7 @@ use rs_matter::cert::MAX_CERT_TLV_AND_ASN1_LEN;
 use rs_matter::crypto::{
     default_crypto, CanonAeadKey, CanonPkcSecretKey, Crypto, SecretKey, SigningSecretKey,
 };
+use rs_matter::dm::clusters::basic_info::BasicInfoConfig;
 use rs_matter::dm::devices::test::{TEST_DEV_ATT, TEST_DEV_COMM, TEST_DEV_DET};
 use rs_matter::error::ErrorCode;
 use rs_matter::fabric::FabricPersist;
@@ -28,7 +29,32 @@ pub struct FabricConfig {
     pub vendor_id: u16,
     pub fabric_id: u64,
     pub node_id: u64,
+    /// The port this node answers Matter traffic on, and advertises in mDNS.
+    ///
+    /// A controller is a node others reach — a device fetching a firmware
+    /// image, an ICD following up a check-in — and they find it by resolving
+    /// its operational instance, which carries this number. It has to be a
+    /// port this server is actually listening on, and a stable one: a device
+    /// caches what it resolved.
+    pub port: u16,
 }
+
+/// The port Matter reserves for operational traffic.
+pub const MATTER_PORT: u16 = 5540;
+
+/// What this node says about itself.
+///
+/// rs-matter's test device details, with one change: this node accepts TCP.
+/// That is advertised in the operational mDNS record as the `T` key, and it is
+/// how a peer knows it may send a payload too large for MRP — a camera's SDP
+/// offer being the case that needs it. Everything else here describes a device
+/// this node is not; none of it is read by anything, because a controller
+/// hosts no Basic Information cluster and never advertises itself as
+/// commissionable.
+pub const CONTROLLER_DEV_DET: BasicInfoConfig = BasicInfoConfig {
+    tcp_supported: true,
+    ..TEST_DEV_DET
+};
 
 impl Default for FabricConfig {
     fn default() -> Self {
@@ -36,6 +62,7 @@ impl Default for FabricConfig {
             vendor_id: 0xFFF1,
             fabric_id: 1,
             node_id: 112233,
+            port: MATTER_PORT,
         }
     }
 }
@@ -103,7 +130,12 @@ pub fn init_controller_with_import(
     config: &FabricConfig,
     imported: Option<&ImportedFabric>,
 ) -> Result<MatterController> {
-    let matter = Matter::new(&TEST_DEV_DET, TEST_DEV_COMM, &TEST_DEV_ATT, 0);
+    let matter = Matter::new(
+        &CONTROLLER_DEV_DET,
+        TEST_DEV_COMM,
+        &TEST_DEV_ATT,
+        config.port,
+    );
 
     let storage_path = Path::new(storage_path);
     fs::create_dir_all(storage_path)

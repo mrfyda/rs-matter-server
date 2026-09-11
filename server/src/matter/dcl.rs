@@ -1,11 +1,14 @@
-//! Firmware update lookups against the Distributed Compliance Ledger.
+//! Lookups against the Distributed Compliance Ledger.
 //!
-//! The DCL is the CSA's public registry of certified Matter products and the
-//! firmware images published for them. It is the only way to know whether a
-//! Matter OTA update exists for a device — and it is deliberately separate from
-//! a vendor's own update channel, so a product can have newer firmware
-//! available through the vendor's app while having no newer *Matter* image
-//! here.
+//! The DCL is the CSA's public registry of certified Matter products, the
+//! firmware images published for them, and the vendors who make them. It is
+//! the only way to know whether a Matter OTA update exists for a device — and
+//! it is deliberately separate from a vendor's own update channel, so a product
+//! can have newer firmware available through the vendor's app while having no
+//! newer *Matter* image here.
+//!
+//! It is also the registry a vendor id is assigned in, so it can name a vendor
+//! that shipped after the reference's static table was last cut.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -104,6 +107,27 @@ pub struct DclClient {
     base_url: String,
     source: UpdateSource,
     cache: Mutex<Vec<CacheEntry>>,
+    vendors: Mutex<Vec<VendorEntry>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VendorInfoResponse {
+    #[serde(rename = "vendorInfo")]
+    vendor_info: VendorInfo,
+}
+
+#[derive(Debug, Deserialize)]
+struct VendorInfo {
+    #[serde(rename = "vendorName", default)]
+    vendor_name: String,
+}
+
+struct VendorEntry {
+    vendor_id: u16,
+    fetched_at: Instant,
+    /// `None` records a vendor the ledger does not know, so a client asking
+    /// about it repeatedly does not re-ask the CSA every time.
+    name: Option<String>,
 }
 
 struct CacheEntry {
@@ -128,6 +152,64 @@ impl DclClient {
             base_url: base_url.into(),
             source,
             cache: Mutex::new(Vec::new()),
+            vendors: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The name the ledger has for a vendor id, if it has one.
+    ///
+    /// A vendor the ledger does not know is `Ok(None)`, and so is a ledger
+    /// that cannot be reached: naming a vendor is decoration, and a client
+    /// asking for 40 of them should not lose the 39 that are known because
+    /// one lookup timed out. The failure is logged rather than returned.
+    ///
+    /// This performs blocking HTTP, so it must be called from a connection
+    /// thread and never from the Matter executor.
+    pub fn vendor_name(&self, vendor_id: u16) -> Option<String> {
+        if let Some(cached) = self.cached_vendor(vendor_id) {
+            return cached;
+        }
+        let name = match self.fetch_vendor_name(vendor_id) {
+            Ok(name) => name,
+            Err(error) => {
+                log::debug!("Vendor {} could not be looked up: {}", vendor_id, error);
+                return None;
+            }
+        };
+        let mut vendors = self.vendors.lock().unwrap();
+        vendors.retain(|entry| entry.vendor_id != vendor_id);
+        vendors.push(VendorEntry {
+            vendor_id,
+            fetched_at: Instant::now(),
+            name: name.clone(),
+        });
+        name
+    }
+
+    fn cached_vendor(&self, vendor_id: u16) -> Option<Option<String>> {
+        let mut vendors = self.vendors.lock().unwrap();
+        vendors.retain(|entry| entry.fetched_at.elapsed() < CACHE_TTL);
+        vendors
+            .iter()
+            .find(|entry| entry.vendor_id == vendor_id)
+            .map(|entry| entry.name.clone())
+    }
+
+    fn fetch_vendor_name(&self, vendor_id: u16) -> Result<Option<String>, ApiError> {
+        let url = format!("{}/dcl/vendorinfo/vendors/{}", self.base_url, vendor_id);
+        match ureq::get(&url).timeout(REQUEST_TIMEOUT).call() {
+            Ok(response) => {
+                let parsed: VendorInfoResponse = response.into_json().map_err(|error| {
+                    ApiError::sdk(format!("The vendor registry replied unreadably: {}", error))
+                })?;
+                Ok(Some(parsed.vendor_info.vendor_name).filter(|name| !name.is_empty()))
+            }
+            // An unassigned vendor id is not an error; nobody has one.
+            Err(ureq::Error::Status(404, _)) => Ok(None),
+            Err(error) => Err(ApiError::sdk(format!(
+                "Could not reach the vendor registry: {}",
+                error
+            ))),
         }
     }
 
@@ -326,6 +408,41 @@ mod tests {
         assert_eq!(client.cached(1, 2, 3), Some(None));
         // A device on a different version is a different question.
         assert!(client.cached(1, 2, 4).is_none());
+    }
+
+    /// A captured `/dcl/vendorinfo/vendors/<vid>` answer, so a change to the
+    /// shape the ledger sends is caught here rather than in production.
+    #[test]
+    fn a_vendor_info_answer_yields_the_vendor_name() {
+        let body = r#"{"vendorInfo":{"vendorID":5264,"vendorName":"Shelly",
+            "companyLegalName":"Shelly Europe Ltd.","companyPreferredName":"Shelly",
+            "vendorLandingPageURL":"https://www.shelly.com/","schemaVersion":0}}"#;
+        let parsed: VendorInfoResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed.vendor_info.vendor_name, "Shelly");
+    }
+
+    #[test]
+    fn an_unknown_vendor_is_remembered_as_unknown() {
+        let client = DclClient::new("https://example.invalid", UpdateSource::MainNetDcl);
+        assert!(client.cached_vendor(5264).is_none());
+        // Reaching an unreachable ledger caches nothing, so the next caller
+        // still gets to try.
+        assert_eq!(client.vendor_name(5264), None);
+        assert!(client.cached_vendor(5264).is_none());
+    }
+
+    /// Hits the real CSA ledger; run with `--ignored` when online.
+    #[test]
+    #[ignore]
+    fn the_ledger_names_a_vendor_by_id() {
+        let client = DclClient::main_net();
+        assert_eq!(client.vendor_name(5264).as_deref(), Some("Shelly"));
+        // Answered from the cache the second time, which is not observable
+        // here beyond it still being right.
+        assert_eq!(client.vendor_name(5264).as_deref(), Some("Shelly"));
+        // 0xFFF4 is a test vendor id, which the production ledger does not
+        // carry.
+        assert_eq!(client.vendor_name(0xFFF4), None);
     }
 
     /// Hits the real CSA ledger; run with `--ignored` when online.

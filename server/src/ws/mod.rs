@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_io::Async;
 use futures_lite::future::block_on;
 
@@ -26,12 +26,13 @@ use rs_matter::transport::network::btp::Btp;
 use rs_matter::transport::network::mdns::astro::AstroMdns;
 #[cfg(not(target_os = "macos"))]
 use rs_matter::transport::network::mdns::builtin::{BuiltinMdns, Host};
-#[cfg(all(feature = "bluetooth", target_os = "linux"))]
+use rs_matter::transport::network::tcp::TcpNetwork;
 use rs_matter::transport::network::{Address, ChainedNetwork};
 
 use crate::api::{RuntimeInfo, ServerContext};
 use crate::matter::actor::{self, ActorContext};
 use crate::matter::controller::MatterController;
+use crate::matter::responder;
 use crate::monitor::{self, MonitorConfig};
 use crate::protocol::events::Event;
 use crate::storage::{ConfigStore, NodeStore};
@@ -62,8 +63,29 @@ pub async fn run(
         origin: _,
     } = controller;
 
+    // The port a device will look for. It is what mDNS advertises for this
+    // node, so binding anything else — an ephemeral port, say — would publish
+    // an address nothing answers on, and every device-initiated exchange (an
+    // OTA download, an ICD following up) would arrive nowhere.
+    let matter_port = matter.port();
     let matter_socket =
-        Async::<UdpSocket>::bind(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0))?;
+        Async::<UdpSocket>::bind(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, matter_port, 0, 0))
+            .with_context(|| {
+                format!(
+                    "binding the Matter port {}. Another Matter stack — a matterjs-server \
+             or python-matter-server on this host — may already have it; \
+             --matter-port moves this one",
+                    matter_port
+                )
+            })?;
+
+    // The same port over TCP, which is what the operational record advertises
+    // and what a peer uses for a payload MRP cannot carry: a camera's SDP
+    // offer is several kilobytes against MRP's roughly one.
+    let matter_tcp = MatterTcp::new(
+        Async::<TcpListener>::bind(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, matter_port, 0, 0))
+            .with_context(|| format!("binding the Matter port {} for TCP", matter_port))?,
+    );
     let crypto = default_crypto(OsRng, DAC_PRIVKEY);
 
     let (handle, requests) = actor::channel();
@@ -83,6 +105,13 @@ pub async fn run(
         thread::spawn(move || block_on(monitor::run(context, monitor_config)));
     }
 
+    // The topology watcher only reads the node store and the event stream, so
+    // it needs neither Matter nor a connection.
+    {
+        let context = context.clone();
+        thread::spawn(move || block_on(crate::api::network::watch_topology(context)));
+    }
+
     // Prepared before the actor context, which borrows the BTP state machine
     // out of it.
     let ble = prepare_ble();
@@ -91,6 +120,9 @@ pub async fn run(
     // rs-matter's crypto backend is not `Clone`, but `&C` implements `Crypto`
     // and is `Copy`, so the actor holds a reference and the transport keeps
     // the backend itself.
+    // The responder persists into the same directory, so the actor takes a
+    // clone rather than the only copy.
+    let responder_storage = storage_path.clone();
     let actor_context = ActorContext {
         matter: &matter,
         crypto: &crypto,
@@ -107,11 +139,20 @@ pub async fn run(
     let mdns = prepare_mdns()?;
 
     // `or` polls both branches and returns when either finishes. The transport,
-    // mDNS, actor, and accept loops are all long-lived, so any of them exiting
-    // ends the server — which is what should happen if the radio stops.
+    // mDNS, responder, actor, and accept loops are all long-lived, so any of
+    // them exiting ends the server — which is what should happen if the radio
+    // stops.
+    //
+    // The responder shares this thread with the transport and the actor
+    // deliberately: `Matter` is `!Send`, and rs-matter's responder is written
+    // as one future running several handlers concurrently, so it needs no
+    // thread or executor of its own.
     let network = futures_lite::future::or(
-        run_transport(&matter, &crypto, &matter_socket, &ble),
-        run_mdns(&matter, &crypto, &mdns),
+        run_transport(&matter, &crypto, &matter_socket, &matter_tcp, &ble),
+        futures_lite::future::or(
+            run_mdns(&matter, &crypto, &mdns),
+            responder::run(&matter, &crypto, responder_storage, context.clone()),
+        ),
     );
     let work = futures_lite::future::or(
         actor::run(actor_context, requests),
@@ -126,24 +167,34 @@ pub async fn run(
     Ok(())
 }
 
-/// Run the Matter transport with BTP chained in next to UDP.
+/// Run the Matter transport with BTP and TCP chained in next to UDP.
 ///
-/// Chaining is what keeps commissioning transport-agnostic: a device reached
-/// over Bluetooth is just another `Address` to everything above the transport,
-/// so the flow in `matter::commissioning` does not care which it is.
-/// Multicast stays on the UDP socket alone — `Btp` has no `NetworkMulticast`
-/// impl, and mDNS has no business on a GATT link.
+/// Chaining is what keeps everything above the transport transport-agnostic: a
+/// device reached over Bluetooth, or a peer that answered over TCP, is just
+/// another `Address`, so the flow in `matter::commissioning` does not care
+/// which it is. Multicast stays on the UDP socket alone — neither `Btp` nor
+/// `TcpNetwork` has a `NetworkMulticast` impl, and mDNS has no business on a
+/// GATT link or a stream.
 #[cfg(all(feature = "bluetooth", target_os = "linux"))]
 async fn run_transport<C: Crypto>(
     matter: &rs_matter::Matter<'_>,
     crypto: &C,
     socket: &Async<UdpSocket>,
+    tcp: &MatterTcp,
     ble: &BleSetup,
 ) {
     // Two chains rather than one: `run` takes send and receive separately, and
     // each needs its own value to borrow mutably.
-    let send = ChainedNetwork::new(Address::is_btp, &ble.btp, socket);
-    let recv = ChainedNetwork::new(Address::is_btp, &ble.btp, socket);
+    let send = ChainedNetwork::new(
+        Address::is_btp,
+        &ble.btp,
+        ChainedNetwork::new(Address::is_tcp, tcp, socket),
+    );
+    let recv = ChainedNetwork::new(
+        Address::is_btp,
+        &ble.btp,
+        ChainedNetwork::new(Address::is_tcp, tcp, socket),
+    );
 
     if let Err(error) = matter.run(crypto, send, recv, socket).await {
         log::error!("Matter transport stopped: {:?}", error);
@@ -155,12 +206,23 @@ async fn run_transport<C: Crypto>(
     matter: &rs_matter::Matter<'_>,
     crypto: &C,
     socket: &Async<UdpSocket>,
+    tcp: &MatterTcp,
     _ble: &BleSetup,
 ) {
-    if let Err(error) = matter.run(crypto, socket, socket, socket).await {
+    let send = ChainedNetwork::new(Address::is_tcp, tcp, socket);
+    let recv = ChainedNetwork::new(Address::is_tcp, tcp, socket);
+
+    if let Err(error) = matter.run(crypto, send, recv, socket).await {
         log::error!("Matter transport stopped: {:?}", error);
     }
 }
+
+/// How many TCP connections this node keeps at once.
+///
+/// A stream is opened per peer that needs one, and only for a payload too
+/// large for MRP — a camera's SDP, in practice. Four is more cameras than a
+/// home has and still a bounded amount of buffer.
+type MatterTcp = TcpNetwork<4>;
 
 /// What the Bluetooth transport needs before the run loop starts.
 ///

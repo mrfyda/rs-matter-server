@@ -1,0 +1,118 @@
+# Build a testable image from a branch, without releasing anything.
+#
+# release.yml refuses any branch but main, deliberately: a release derives a
+# version, moves tags and cuts a GitHub Release, and none of that should
+# happen for work in progress. But hardware testing needs the opposite — a
+# real image, on real hardware, built from a branch nobody has merged yet.
+#
+# So this builds one architecture, tags it by branch and commit, and stops.
+# No version derivation, no git tag, no release, and nothing that moves
+# `latest`. An image from here can only be pulled by a name that names the
+# commit it came from, which is what makes it safe to leave lying around.
+name: Branch image
+
+# Pushing to `build/**` is the trigger, not a dispatch. A `workflow_dispatch`
+# is only offered for workflow files that are already on the default branch,
+# and putting this one there would run CI on main and cut a release of main —
+# a release of code that does not contain whatever is being tested. A push
+# trigger runs the copy of this file that is in the branch being pushed, which
+# is exactly what is wanted and costs main nothing.
+#
+# So: `git push origin HEAD:build/<whatever>` builds an image of that commit.
+# The dispatch entry below does nothing until this file reaches main, and is
+# kept so that it works once it does.
+on:
+  push:
+    branches: ['build/**']
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Which architecture to build
+        type: choice
+        default: linux/arm64
+        options: [linux/arm64, linux/amd64]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    name: Build ${{ inputs.platform || 'linux/arm64' }}
+    # A native runner per architecture, as release.yml does: rs-matter under
+    # QEMU takes long enough to be impractical.
+    # On a push there is no input, so this defaults to arm64 — the
+    # architecture the hardware rig actually runs.
+    runs-on: ${{ inputs.platform == 'linux/amd64' && 'ubuntu-latest' || 'ubuntu-24.04-arm' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Name the image after the commit
+        id: name
+        # A branch name may contain characters a tag may not, so it is
+        # reduced to something a registry accepts. The short SHA is what
+        # actually identifies the build; the branch is there to make the tag
+        # legible in a listing.
+        run: |
+          branch=$(echo "${GITHUB_REF_NAME}" | tr '/' '-' | tr -cd '[:alnum:]._-' | cut -c1-60)
+          echo "tag=branch-${branch}-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        # CARGO_JOBS=2 for the same reason release.yml pins it: rs-matter with
+        # the `zbus` feature wants well over 8 GB in a single rustc, and one
+        # per core gets the compiler OOM-killed on a 16 GB runner.
+        #
+        # The cache is shared with release.yml's scope for this architecture.
+        # Reading it makes the first branch build cheap; writing to it is
+        # deliberately left off, so an unmerged branch cannot evict the layers
+        # a release depends on.
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ inputs.platform || 'linux/arm64' }}
+          build-args: |
+            CARGO_JOBS=2
+            VERSION=0.0.0-${{ steps.name.outputs.tag }}
+          tags: ${{ env.IMAGE }}:${{ steps.name.outputs.tag }}
+          labels: |
+            org.opencontainers.image.title=rs-matter-server
+            org.opencontainers.image.description=Branch build for hardware testing - not a release
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          push: true
+          cache-from: type=gha,scope=${{ inputs.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+
+      - name: Smoke test it
+        # Same check release.yml makes: that the binary runs on this
+        # architecture rather than merely having compiled.
+        run: |
+          image="$IMAGE:${{ steps.name.outputs.tag }}"
+          docker run --rm "$image" --help > /dev/null
+          docker run --rm "$image" --version
+
+      - name: Say how to run it
+        run: |
+          {
+            echo "## Branch image"
+            echo
+            echo '```'
+            echo "docker pull $IMAGE:${{ steps.name.outputs.tag }}"
+            echo '```'
+            echo
+            echo "Built from \`${GITHUB_REF_NAME}\` at \`${GITHUB_SHA}\`."
+            echo "Not a release: nothing here moves \`latest\` or cuts a tag."
+          } >> "$GITHUB_STEP_SUMMARY"

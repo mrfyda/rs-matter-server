@@ -15,6 +15,10 @@ WebSocket / HTTP client
    matter::actor   storage      the only path to Matter; persistent state
         |
    rs-matter           transport, mDNS, commissioner, TLV
+        |
+   matter::responder   the other direction: the exchanges a device opens
+        |
+   a Matter device
 ```
 
 ## Modules
@@ -27,6 +31,16 @@ WebSocket / HTTP client
 - `server/src/matter/` — the controller actor, commissioning, the Interaction
   Model client, the TLV↔JSON codec, the cluster registry, the mDNS browser, the
   SPAKE2+ verifier, the update-ledger client.
+- `server/src/ws/mod.rs` — listener, connection lifecycle, HTTP endpoints, and
+  the run loop that owns the Matter stack: the transport (UDP, TCP and, on
+  Linux, BTP chained together), mDNS, the responder and the actor, all as one
+  future on one thread because `Matter` is `!Send`.
+- `server/src/matter/responder.rs` — the accept side: the exchanges a *device*
+  opens, answered by rs-matter's own Interaction Model, Secure Channel and BDX
+  handlers over a controller-shaped data model — one endpoint, hosting the OTA
+  Provider cluster a device must reach to be updated. It runs on the Matter
+  thread beside the transport, because that responder is a single future
+  running several handlers concurrently and `Matter` is `!Send`.
 - `server/src/storage/` — nodes, credentials, fabric label, node-id counter.
 - `server/src/migrate/` — reading a matterjs-server storage directory into that
   state: `value` decodes matter.js's tagged JSON, `store` normalises its three
@@ -34,7 +48,6 @@ WebSocket / HTTP client
   nodes and settings, and `mod` writes them. Read-only towards the source.
 - `server/src/monitor.rs` — attribute polling; the single place that changes if
   rs-matter gains a client-side subscription receiver.
-- `server/src/ws/` — listener, connection lifecycle, HTTP endpoints.
 
 ## Design decisions
 
@@ -163,8 +176,12 @@ at the destination, and connecting to *that* fails with `EACCES` rather than
 `ENOENT`, because the kernel checks write permission before it checks the
 target is a socket. Nothing in this project's compose fixes that — the bus has
 to be passed into the DinD container itself, which on umbrelOS means editing
-the Portainer app's own compose and redoing it after every update. A host
-where the bus cannot be reached is the case BLE proxy mode exists for.
+the Portainer app's own compose and redoing it after every update. On a host
+where the bus cannot be reached there is no fallback: `server_info` carries a
+`ble_proxy_enabled` field because the reference's model has one, and this
+server always reports it `false`. Nothing here proxies a radio elsewhere. A
+Wi-Fi or Ethernet device is still commissionable over mDNS; a Thread device
+that has never joined a network is not reachable at all.
 
 **What is not proven.** All of it compiles and none of it has commissioned a
 real device. Testing needs a factory-reset device — which means removing one

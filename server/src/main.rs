@@ -29,6 +29,16 @@ struct Args {
     #[arg(long, env = "STORAGE_PATH", default_value = "/data")]
     storage_path: String,
 
+    /// The port this node answers Matter traffic on, and advertises to
+    /// devices.
+    ///
+    /// The default is Matter's own port. Move it only if something else on
+    /// this host has it — another Matter server, most likely — remembering
+    /// that a device caches what it resolved, so changing it after
+    /// commissioning makes this node briefly unreachable.
+    #[arg(long, env = "MATTER_PORT", default_value_t = rs_matter_server::matter::controller::MATTER_PORT)]
+    matter_port: u16,
+
     /// Adopt the fabric, nodes and settings of a matterjs-server installation
     /// on first start, so its devices do not have to be re-commissioned.
     ///
@@ -212,6 +222,44 @@ fn main() -> anyhow::Result<()> {
 
     rs_matter_server::storage::private::tighten_existing(std::path::Path::new(&args.storage_path));
 
+    // A dry run reports and stops, so it never reaches the fabric and does not
+    // need the server thread below.
+    if args.import_matterjs_dry_run {
+        let Some(source) = &args.import_matterjs else {
+            anyhow::bail!("--import-matterjs-dry-run needs --import-matterjs");
+        };
+        let import =
+            rs_matter_server::migrate::read(source, args.import_matterjs_namespace.as_deref())?;
+        print!("{}", import.summary());
+        return Ok(());
+    }
+
+    // The server runs on a thread of its own, with a stack far larger than
+    // the default.
+    //
+    // `serve`'s future holds the whole Matter stack — the actor, the
+    // responder, the transport chain and rs-matter's own state machines — and
+    // a future that large is laid out across the stack of whatever executes
+    // it. A debug build, where no await state is optimized away, overflows
+    // the 8 MiB main thread during startup and aborts before the listener is
+    // up. Release fits, but by a margin nobody has measured, which is not a
+    // margin to rely on: both builds should start the same way.
+    //
+    // It has to be a thread rather than a bigger main stack because the main
+    // thread's size is fixed by the time this runs. Nothing crosses into it
+    // but `Args` — the Matter stack is not `Send`, so it is built over there.
+    const SERVER_STACK_SIZE: usize = 64 * 1024 * 1024;
+    std::thread::Builder::new()
+        .name("rs-matter-server".into())
+        .stack_size(SERVER_STACK_SIZE)
+        .spawn(move || serve(args))
+        .map_err(|error| anyhow::anyhow!("starting the server thread: {}", error))?
+        .join()
+        .map_err(|_| anyhow::anyhow!("the server thread panicked"))?
+}
+
+/// Everything from the fabric onwards, on the server thread.
+fn serve(args: Args) -> anyhow::Result<()> {
     // Read the source before touching our own storage: a source that cannot be
     // imported must not leave a freshly created fabric of our own behind,
     // because that is the state a retry would then refuse to import into.
@@ -223,17 +271,12 @@ fn main() -> anyhow::Result<()> {
         None => None,
     };
 
-    if args.import_matterjs_dry_run {
-        match &import {
-            Some(import) => print!("{}", import.summary()),
-            None => anyhow::bail!("--import-matterjs-dry-run needs --import-matterjs"),
-        }
-        return Ok(());
-    }
-
     let controller = init_controller_with_import(
         &args.storage_path,
-        &FabricConfig::default(),
+        &FabricConfig {
+            port: args.matter_port,
+            ..FabricConfig::default()
+        },
         import.as_ref().map(|import| &import.fabric),
     )
     .map_err(|e| {

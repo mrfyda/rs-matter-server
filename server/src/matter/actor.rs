@@ -35,6 +35,7 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use super::commissioning::{commission_at_address, CasePath, Completion, NetworkCredentials};
 use super::controller::persist_fabric;
 use super::interaction;
+use super::ota_provider;
 use super::tlv_json::TlvNode;
 
 /// How long a caller waits for the actor before giving up. Matter's own
@@ -106,6 +107,16 @@ pub enum MatterOp {
         paths: Vec<AttrPath>,
         fabric_filtered: bool,
     },
+    /// Let a node reach this server's OTA Provider cluster.
+    GrantOtaAccess {
+        node_id: u64,
+    },
+    /// Ask a node to report changes as they happen, instead of being polled.
+    Subscribe {
+        node_id: u64,
+        min_interval_secs: u16,
+        max_interval_secs: u16,
+    },
     WriteAttribute {
         node_id: u64,
         endpoint: u16,
@@ -159,6 +170,8 @@ impl MatterOp {
             Self::Commission { .. } => "commission",
             Self::DiscoverCommissionable { .. } => "discover",
             Self::ReadAttributes { .. } => "read",
+            Self::GrantOtaAccess { .. } => "grant_ota_access",
+            Self::Subscribe { .. } => "subscribe",
             Self::WriteAttribute { .. } => "write",
             Self::Invoke { .. } => "invoke",
             Self::Interview { .. } => "interview",
@@ -185,6 +198,7 @@ pub enum MatterOutcome {
         device_fabric_index: u8,
     },
     Discovered(Vec<CommissionableNodeData>),
+    Subscribed(interaction::Subscription),
 }
 
 /// One queued op and where its answer goes. Opaque to callers: it exists so
@@ -263,6 +277,36 @@ impl MatterHandle {
             .await?
         {
             MatterOutcome::Attributes(attributes) => Ok(attributes),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Let a node invoke on this server's OTA Provider cluster.
+    pub async fn grant_ota_access(&self, node_id: u64) -> Result<(), ApiError> {
+        self.call(MatterOp::GrantOtaAccess { node_id })
+            .await
+            .map(|_| ())
+    }
+
+    /// Subscribe to every attribute on a node.
+    ///
+    /// The answer carries the priming report, so a caller that would otherwise
+    /// have read the node can use this instead of doing both.
+    pub async fn subscribe(
+        &self,
+        node_id: u64,
+        min_interval_secs: u16,
+        max_interval_secs: u16,
+    ) -> Result<interaction::Subscription, ApiError> {
+        match self
+            .call(MatterOp::Subscribe {
+                node_id,
+                min_interval_secs,
+                max_interval_secs,
+            })
+            .await?
+        {
+            MatterOutcome::Subscribed(subscription) => Ok(subscription),
             other => Err(unexpected(other)),
         }
     }
@@ -519,6 +563,34 @@ async fn execute<C: Crypto + Clone>(
         )
         .await
         .map(MatterOutcome::Attributes),
+
+        MatterOp::GrantOtaAccess { node_id } => {
+            let added = ota_provider::grant_ota_access(matter, fabric_index, node_id)
+                .map_err(|e| ApiError::sdk(format!("Failed to grant OTA access: {:?}", e)))?;
+            if added {
+                // The access list lives in the fabric, so a grant that is not
+                // persisted is one the next restart forgets.
+                persist_fabric(matter, &context.storage_path).map_err(|e| {
+                    ApiError::sdk(format!("Failed to persist the OTA access grant: {:?}", e))
+                })?;
+            }
+            Ok(MatterOutcome::Empty)
+        }
+
+        MatterOp::Subscribe {
+            node_id,
+            min_interval_secs,
+            max_interval_secs,
+        } => interaction::subscribe(
+            matter,
+            context.crypto.clone(),
+            fabric_index,
+            node_id,
+            min_interval_secs,
+            max_interval_secs,
+        )
+        .await
+        .map(MatterOutcome::Subscribed),
 
         MatterOp::WriteAttribute {
             node_id,

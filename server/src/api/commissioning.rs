@@ -157,9 +157,11 @@ async fn commission(
 
     let node = MatterNodeData::new(node_id, now_iso());
     let mut stored = StoredNode::new(node);
-    // Bluetooth commissioning reports no address: a BT MAC is not an
-    // operational address, and a wrong entry here would be permanent, since
-    // nothing re-resolves it later.
+    // Bluetooth commissioning reports no address of its own: a BT MAC is not
+    // an operational address, and rs-matter does not expose the one it
+    // resolved to finish over CASE. The node is announcing by now, so it is
+    // resolved below — but the record has to exist first for that to have
+    // somewhere to go.
     stored.ip_addresses = if address.is_empty() {
         Vec::new()
     } else {
@@ -172,6 +174,15 @@ async fn commission(
         .nodes
         .save()
         .map_err(|e| ApiError::sdk(format!("Failed to persist the new node: {}", e)))?;
+
+    // A node commissioned over Bluetooth has just joined its network, so this
+    // is the first moment it can be found by the name it will keep. Best
+    // effort: an address that cannot be resolved now is resolved by the next
+    // `get_node_ip_addresses`, and commissioning has already succeeded either
+    // way.
+    if context.server.nodes.ip_addresses(node_id).is_empty() {
+        nodes::resolve_addresses(context.server, node_id).await;
+    }
 
     // Tell the device what to call this fabric, so a user listing fabrics on
     // it from another ecosystem sees a name rather than a blank. Best effort:

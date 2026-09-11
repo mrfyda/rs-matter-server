@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::model::{
@@ -56,6 +58,23 @@ struct ThreadEntry {
     dataset: String,
 }
 
+/// What this controller registered with one intermittently connected device.
+///
+/// The key is the shared secret sent to the device in `RegisterClient`: it is
+/// what a check-in from that device is encrypted with, so it is both the only
+/// way to read one and the only way to know which device sent it. It lives
+/// here, with the Wi-Fi passwords, because it is the same kind of thing.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct IcdEntry {
+    node_id: u64,
+    /// Base64, as the wire form of every other secret here.
+    key: String,
+    /// The highest check-in counter accepted from this device, if any. A
+    /// check-in that does not advance it is a replay.
+    #[serde(default)]
+    counter: Option<u32>,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ConfigData {
     #[serde(default = "default_fabric_label")]
@@ -72,6 +91,8 @@ struct ConfigData {
     additional_wifi: Vec<WifiEntry>,
     #[serde(default)]
     additional_thread: Vec<ThreadEntry>,
+    #[serde(default)]
+    icd_registrations: Vec<IcdEntry>,
 }
 
 fn default_fabric_label() -> String {
@@ -340,6 +361,62 @@ impl ConfigStore {
             all.insert(entry.id.clone(), entry.dataset.clone());
         }
         all
+    }
+
+    // -- ICD check-in registrations ----------------------------------------
+
+    /// Record the key a device will encrypt its check-ins with.
+    ///
+    /// Replaces any previous registration for that node: re-registering issues
+    /// a new key, and the old one stops being anything the device will use.
+    pub fn set_icd_registration(&self, node_id: u64, key: &[u8]) -> Result<()> {
+        let key = BASE64.encode(key);
+        self.mutate(|data| {
+            data.icd_registrations
+                .retain(|entry| entry.node_id != node_id);
+            data.icd_registrations.push(IcdEntry {
+                node_id,
+                key,
+                counter: None,
+            });
+        })
+    }
+
+    pub fn remove_icd_registration(&self, node_id: u64) -> Result<()> {
+        self.mutate(|data| {
+            data.icd_registrations
+                .retain(|entry| entry.node_id != node_id);
+        })
+    }
+
+    /// Every registration, as `(node id, key, last accepted counter)`.
+    ///
+    /// A check-in carries no readable sender, so this is what a receiver walks:
+    /// the key that decrypts it names the device that sent it.
+    pub fn icd_registrations(&self) -> Vec<(u64, Vec<u8>, Option<u32>)> {
+        self.data
+            .lock()
+            .unwrap()
+            .icd_registrations
+            .iter()
+            .filter_map(|entry| {
+                let key = BASE64.decode(&entry.key).ok()?;
+                Some((entry.node_id, key, entry.counter))
+            })
+            .collect()
+    }
+
+    /// Remember the counter a check-in carried, so a replay of it is refused.
+    pub fn note_icd_counter(&self, node_id: u64, counter: u32) -> Result<()> {
+        self.mutate(|data| {
+            if let Some(entry) = data
+                .icd_registrations
+                .iter_mut()
+                .find(|entry| entry.node_id == node_id)
+            {
+                entry.counter = Some(counter);
+            }
+        })
     }
 
     // -- summaries ---------------------------------------------------------

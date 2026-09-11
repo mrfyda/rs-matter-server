@@ -116,7 +116,7 @@ pub async fn write_attribute(args: &Args, context: CallContext<'_>) -> ApiResult
         .ok_or_else(|| ApiError::invalid_args("Missing value"))?;
     let timed_timeout_ms = timed_timeout(args)?;
 
-    let encoded = tlv_json::attribute_value_from_json(&value)?;
+    let encoded = tlv_json::attribute_value_from_json(cluster, attribute, &value)?;
     let status = context
         .server
         .matter
@@ -201,7 +201,7 @@ pub async fn device_command(args: &Args, context: CallContext<'_>) -> ApiResult 
                 })?;
             (
                 command_id,
-                tlv_json::from_json(&payload, clusters::FieldKind::Other)?,
+                tlv_json::from_json(&payload, &clusters::FieldKind::Other)?,
                 BTreeMap::new(),
             )
         }

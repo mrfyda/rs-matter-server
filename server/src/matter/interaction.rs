@@ -13,8 +13,8 @@ use serde_json::{Map, Value};
 
 use rs_matter::crypto::Crypto;
 use rs_matter::error::ErrorCode;
-use rs_matter::im::client::{ImClient, TxOutcome};
-use rs_matter::im::{AttrPath, AttrResp, CmdResp, IMStatusCode};
+use rs_matter::im::client::{ImClient, SubscribeOutcome, TxOutcome};
+use rs_matter::im::{AttrPath, AttrResp, CmdResp, EventPath, IMStatusCode, ReportDataResp};
 use rs_matter::tlv::TLVTag;
 use rs_matter::transport::exchange::Exchange;
 use rs_matter::Matter;
@@ -98,25 +98,7 @@ pub async fn read_attributes<C: Crypto>(
     let mut first_status = None;
     loop {
         let response = chunk.response().map_err(|e| im_error("read response", e))?;
-        if let Some(reports) = response.attr_reports.as_ref() {
-            for report in reports.iter() {
-                match report.map_err(|e| im_error("attribute report", e))? {
-                    AttrResp::Data(data) => {
-                        let path = format_path(
-                            data.path.endpoint.unwrap_or(0),
-                            data.path.cluster.unwrap_or(0),
-                            data.path.attr.unwrap_or(0),
-                        );
-                        let value = tlv_json::to_json(&data.data)
-                            .map_err(|e| im_error("attribute value", e))?;
-                        attributes.insert(path, value);
-                    }
-                    AttrResp::Status(status) => {
-                        first_status.get_or_insert(status.status.status);
-                    }
-                }
-            }
-        }
+        collect_attributes(&mut attributes, &response, &mut first_status)?;
         match chunk
             .complete()
             .await
@@ -133,6 +115,130 @@ pub async fn read_attributes<C: Crypto>(
         }
     }
     Ok(attributes)
+}
+
+/// What a device confirmed when it accepted a subscription, plus the snapshot
+/// it primed the subscription with.
+///
+/// The priming report is a full read of everything subscribed, so establishing
+/// a subscription doubles as an interview — the caller gets the node's current
+/// state without a second round-trip.
+#[derive(Debug)]
+pub struct Subscription {
+    pub subscription_id: u32,
+    /// The longest the device may stay silent before it owes a report. It
+    /// chooses this, within the ceiling the request asked for.
+    pub max_interval_secs: u16,
+    pub attributes: AttributesData,
+}
+
+/// Subscribe to every attribute on a node.
+///
+/// `keep_subscriptions` is deliberately *false*: this controller wants exactly
+/// one subscription per node, and a device that still holds one from a previous
+/// run of this server would otherwise keep pushing reports nothing here can
+/// match — while occupying one of the handful of subscription slots devices
+/// typically have. Asking the device to drop its others is how that is cleaned
+/// up, and it is safe because the slots being dropped are only those belonging
+/// to this controller on this fabric.
+pub async fn subscribe<C: Crypto>(
+    matter: &Matter<'_>,
+    crypto: C,
+    fabric_index: NonZeroU8,
+    node_id: u64,
+    min_interval_secs: u16,
+    max_interval_secs: u16,
+) -> Result<Subscription, ApiError> {
+    let paths = interview_paths();
+    let events = event_paths();
+    let exchange = open(matter, crypto, fabric_index, node_id).await?;
+    let mut sender = exchange
+        .subscribe_sender()
+        .await
+        .map_err(|e| im_error("subscribe exchange", e))?;
+
+    let mut chunk = loop {
+        match sender
+            .tx()
+            .await
+            .map_err(|e| im_error("subscribe request", e))?
+        {
+            TxOutcome::BuildRequest(builder) => {
+                sender = builder
+                    .keep_subs(false)
+                    .map_err(|e| im_error("subscribe keep", e))?
+                    .min_int_floor(min_interval_secs)
+                    .map_err(|e| im_error("subscribe min interval", e))?
+                    .max_int_ceil(max_interval_secs)
+                    .map_err(|e| im_error("subscribe max interval", e))?
+                    .attr_requests_from(&paths)
+                    .map_err(|e| im_error("subscribe path", e))?
+                    .event_requests_from(&events)
+                    .map_err(|e| im_error("subscribe event path", e))?
+                    .fabric_filtered(false)
+                    .map_err(|e| im_error("subscribe filter", e))?
+                    .end()
+                    .map_err(|e| im_error("subscribe build", e))?;
+            }
+            TxOutcome::GotResponse(chunk) => break chunk,
+        }
+    };
+
+    // The priming report arrives before the subscription is confirmed, in as
+    // many chunks as the node needs.
+    let mut attributes = AttributesData::new();
+    loop {
+        let response = chunk
+            .response()
+            .map_err(|e| im_error("subscribe report", e))?;
+        collect_attributes(&mut attributes, &response, &mut None)?;
+
+        match chunk
+            .complete()
+            .await
+            .map_err(|e| im_error("subscribe priming", e))?
+        {
+            SubscribeOutcome::NextChunk(next) => chunk = next,
+            SubscribeOutcome::Established(established) => {
+                return Ok(Subscription {
+                    subscription_id: established.subscription_id,
+                    max_interval_secs: established.max_int,
+                    attributes,
+                })
+            }
+        }
+    }
+}
+
+/// Fold one report's attribute entries into `attributes`.
+///
+/// Shared by the read path, the subscribe priming report, and the ongoing
+/// reports the responder receives, because all three carry the same shape and
+/// must decode it the same way — epoch conversion included.
+pub fn collect_attributes(
+    attributes: &mut AttributesData,
+    response: &ReportDataResp<'_>,
+    first_status: &mut Option<IMStatusCode>,
+) -> Result<(), ApiError> {
+    let Some(reports) = response.attr_reports.as_ref() else {
+        return Ok(());
+    };
+    for report in reports.iter() {
+        match report.map_err(|e| im_error("attribute report", e))? {
+            AttrResp::Data(data) => {
+                let cluster = data.path.cluster.unwrap_or(0);
+                let attribute = data.path.attr.unwrap_or(0);
+                let path = format_path(data.path.endpoint.unwrap_or(0), cluster, attribute);
+                let value = tlv_json::attribute_to_json(cluster, attribute, &data.data)
+                    .map_err(|e| im_error("attribute value", e))?;
+                attributes.insert(path, value);
+            }
+            AttrResp::Status(status) => {
+                first_status.get_or_insert(status.status.status);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Write one attribute, returning the Interaction Model status the node
@@ -167,6 +273,20 @@ pub async fn write_attribute<C: Crypto>(
         {
             TxOutcome::BuildRequest(builder) => {
                 sender = builder
+                    // Mandatory in `WriteRequestMessage`, and rs-matter's
+                    // builder does not insist: `write_requests()` may be
+                    // opened straight from the initial state, which silently
+                    // leaves the field off the wire. A device is entitled to
+                    // reject the whole action for it, and a real one does —
+                    // the Shelly plug answers `StatusResponse(0x80)`,
+                    // INVALID_ACTION, which rs-matter's client then reports
+                    // as the far less helpful `InvalidOpcode`.
+                    //
+                    // It must also agree with whether a `TimedRequest`
+                    // message preceded this one, or the device answers
+                    // TIMED_REQUEST_MISMATCH instead.
+                    .timed_request(timed_timeout_ms.is_some())
+                    .map_err(|e| im_error("write timed flag", e))?
                     .write_requests()
                     .map_err(|e| im_error("write requests", e))?
                     .push()
@@ -314,6 +434,18 @@ pub async fn ping<C: Crypto>(
 /// A single wildcard read (`*/*/*`) is what the reference does and what devices
 /// expect; it is also the only way to discover endpoints that were not present
 /// at commissioning time.
+/// Every event on every cluster of every endpoint.
+///
+/// A controller cannot know which events matter to a client, and the protocol
+/// forwards all of them as `node_event`, so the subscription asks for the lot.
+/// Unlike attributes there is no priming burst to pay for: events are only
+/// reported as they occur.
+pub fn event_paths() -> Vec<EventPath> {
+    vec![EventPath::from_gp(&rs_matter::im::GenericPath::new(
+        None, None, None,
+    ))]
+}
+
 pub fn interview_paths() -> Vec<AttrPath> {
     vec![AttrPath::from_gp(&rs_matter::im::GenericPath::new(
         None, None, None,
@@ -331,6 +463,52 @@ mod tests {
         assert!(paths[0].endpoint.is_none());
         assert!(paths[0].cluster.is_none());
         assert!(paths[0].attr.is_none());
+    }
+
+    /// A `WriteRequestMessage` must carry `TimedRequest` at context tag 1.
+    ///
+    /// The spec makes the field mandatory, but rs-matter's builder documents
+    /// it as optional and lets `write_requests()` be opened from the initial
+    /// state, which drops it silently. Nothing in this crate notices — the
+    /// message still encodes, and rs-matter's own server reads a missing
+    /// field as `false`. A real device does notice: the Shelly plug answers
+    /// `StatusResponse(0x80)`, INVALID_ACTION, and every write this server
+    /// can make — `write_attribute`, `set_acl_entry`, `set_node_binding` —
+    /// failed against hardware until the field was written.
+    ///
+    /// This mirrors the builder chain in `write_attribute` above. Keep the
+    /// two in step: the failure it guards against is invisible in-process.
+    #[test]
+    fn a_write_request_carries_the_mandatory_timed_request_field() {
+        use rs_matter::tlv::{TLVElement, TLVWrite};
+        use rs_matter::utils::storage::WriteBuf;
+
+        for timed in [false, true] {
+            let mut buf = [0u8; 256];
+            let mut writer = WriteBuf::new(&mut buf[..]);
+
+            // The same field order the builder emits, written directly so the
+            // assertion is about the bytes rather than about the builder.
+            writer.start_struct(&TLVTag::Anonymous).unwrap();
+            writer.bool(&TLVTag::Context(1), timed).unwrap();
+            writer.start_array(&TLVTag::Context(2)).unwrap();
+            writer.end_container().unwrap();
+            writer.u8(&TLVTag::Context(255), 13).unwrap();
+            writer.end_container().unwrap();
+
+            let len = writer.get_tail();
+            let element = TLVElement::new(&buf[..len]);
+            let found = element
+                .r#struct()
+                .unwrap()
+                .find_ctx(1)
+                .unwrap()
+                .non_empty()
+                .expect("TimedRequest must be present on the wire")
+                .bool()
+                .unwrap();
+            assert_eq!(found, timed);
+        }
     }
 
     #[test]

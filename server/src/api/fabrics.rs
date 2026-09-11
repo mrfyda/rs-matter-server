@@ -114,17 +114,31 @@ pub async fn remove_matter_fabric(args: &Args, context: CallContext<'_>) -> ApiR
     Ok(json!({}))
 }
 
+/// `NOCResponse.StatusCode`. The invoke below passes no response names, so the
+/// reply decodes tag-based and the status arrives under its numeric tag.
+const NOC_RESPONSE_STATUS_TAG: &str = "0";
+/// `NodeOperationalCertStatusEnum`, the two values that matter here.
+const NOC_STATUS_OK: u64 = 0;
+const NOC_STATUS_LABEL_CONFLICT: u64 = 10;
+
 /// Tell a node what to call this controller's fabric.
 ///
 /// The label is what other ecosystems show a user when they list the fabrics a
 /// device belongs to, so a device that was never told stays blank there. It is
 /// pushed after commissioning and whenever the configured label changes.
+///
+/// The device answers with an `NOCResponse`, and its status is the whole point
+/// of the call. Labels must be unique across the fabrics on one device, so a
+/// second controller that defaults to the same name as the first is refused
+/// with `LabelConflict` — which is not a rare case but the ordinary one, since
+/// every installation of this server defaults to the same label. Returning
+/// `Ok` on a refusal left the fabric nameless on the device and said nothing.
 pub async fn push_fabric_label(
     context: CallContext<'_>,
     node_id: u64,
     label: &str,
 ) -> Result<(), ApiError> {
-    context
+    let response = context
         .server
         .matter
         .invoke(
@@ -136,8 +150,33 @@ pub async fn push_fabric_label(
             None,
             BTreeMap::new(),
         )
-        .await
-        .map(|_| ())
+        .await?;
+
+    noc_response_result(&response, label)
+}
+
+/// Read the status out of an `NOCResponse` and say whether the device agreed.
+///
+/// Separate from the invoke so the decision can be tested: the invoke needs a
+/// device, and this is the part that was wrong.
+fn noc_response_result(response: &Value, label: &str) -> Result<(), ApiError> {
+    // A response with no status is not an error: a device that answers the
+    // invoke without the field has still accepted the command.
+    let status = response
+        .get(NOC_RESPONSE_STATUS_TAG)
+        .and_then(Value::as_u64)
+        .unwrap_or(NOC_STATUS_OK);
+
+    if status == NOC_STATUS_OK {
+        return Ok(());
+    }
+    Err(ApiError::sdk(match status {
+        NOC_STATUS_LABEL_CONFLICT => format!(
+            "the device already has a fabric labelled '{}'; labels must differ across the fabrics on one device",
+            label
+        ),
+        other => format!("the device refused the fabric label with status {}", other),
+    }))
 }
 
 /// Replace this fabric's ACL entries on a node.
@@ -316,6 +355,36 @@ fn binding_to_tlv(binding: &Value) -> Result<TlvNode, ApiError> {
 
 #[cfg(test)]
 mod tests {
+    /// Regression: two controllers on one device, both defaulting to the same
+    /// label. The device answers `LabelConflict` (10) and the label never
+    /// lands; returning `Ok` on that made a nameless fabric look like a
+    /// success. Found with a real plug commissioned onto two fabrics.
+    #[test]
+    fn a_refused_fabric_label_is_not_reported_as_success() {
+        // The tag-based shape `push_fabric_label` receives, since it invokes
+        // with no response names. This is the real plug's answer when a
+        // second controller asks for a label the first already has.
+        let refused = json!({ NOC_RESPONSE_STATUS_TAG: NOC_STATUS_LABEL_CONFLICT });
+        let error = noc_response_result(&refused, "Home").unwrap_err();
+        assert!(
+            error
+                .details
+                .contains("already has a fabric labelled 'Home'"),
+            "{}",
+            error.details
+        );
+
+        // An accepted label, and a device answering without the field at all,
+        // are both success.
+        let ok = json!({ NOC_RESPONSE_STATUS_TAG: NOC_STATUS_OK });
+        assert!(noc_response_result(&ok, "x").is_ok());
+        assert!(noc_response_result(&json!({}), "x").is_ok());
+
+        // Any other refusal is reported rather than swallowed.
+        let other = noc_response_result(&json!({ NOC_RESPONSE_STATUS_TAG: 11 }), "x").unwrap_err();
+        assert!(other.details.contains("status 11"), "{}", other.details);
+    }
+
     use super::*;
     use crate::api::tests_support::{call, test_context};
     use crate::protocol::model::MatterNodeData;

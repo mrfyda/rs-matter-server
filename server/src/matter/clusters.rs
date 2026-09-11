@@ -8,7 +8,7 @@
 //! `{"level": 128}` resolve to the same ids on both servers.
 
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use serde::Deserialize;
 
@@ -28,6 +28,13 @@ struct RawCluster {
     attributes: BTreeMap<String, u32>,
     #[serde(default)]
     events: BTreeMap<String, u32>,
+    /// Struct definitions the commands above refer to by name.
+    #[serde(default)]
+    structs: BTreeMap<String, RawStruct>,
+    /// Attribute id (as a string key) -> `us` or `s`, for the attributes the
+    /// Matter IDL types as an epoch.
+    #[serde(default)]
+    epoch: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,6 +49,14 @@ struct RawCommand {
     types: BTreeMap<String, String>,
 }
 
+/// A struct a payload field can hold, named by the cluster that defines it.
+#[derive(Debug, Deserialize)]
+struct RawStruct {
+    fields: BTreeMap<String, u32>,
+    #[serde(default)]
+    types: BTreeMap<String, String>,
+}
+
 #[derive(Debug)]
 pub struct ClusterMeta {
     pub id: u32,
@@ -49,35 +64,160 @@ pub struct ClusterMeta {
     commands: Vec<CommandMeta>,
     attributes: Vec<(String, u32)>,
     events: Vec<(String, u32)>,
+    epoch: BTreeMap<u32, EpochUnit>,
+}
+
+/// How an epoch-typed attribute counts.
+///
+/// Matter measures both from 2000-01-01T00:00:00 UTC; the reference reports
+/// them as Unix time, so the conversion happens at the codec boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpochUnit {
+    Seconds,
+    Micros,
+}
+
+impl EpochUnit {
+    /// How far the Matter epoch sits after the Unix one, in this unit.
+    pub const fn unix_offset(self) -> u64 {
+        const MATTER_EPOCH_UNIX_SECS: u64 = 946_684_800;
+        match self {
+            Self::Seconds => MATTER_EPOCH_UNIX_SECS,
+            Self::Micros => MATTER_EPOCH_UNIX_SECS * 1_000_000,
+        }
+    }
 }
 
 /// What a payload field holds. TLV is self-describing on read, so this is
 /// only consulted when encoding: it is what tells a JSON string destined for
-/// an octet-string field to be decoded from base64 rather than sent as text.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// an octet-string field to be decoded from base64 rather than sent as text,
+/// and a JSON object destined for a struct field which of its keys are names.
+#[derive(Clone, Debug, PartialEq)]
 pub enum FieldKind {
     Bytes,
     String,
     Int,
     Float,
     Bool,
-    List,
-    /// A struct, enum, bitmap, or nullable wrapper: encoded from the JSON
-    /// shape alone.
+    /// A list, carrying what its elements are.
+    List(Box<FieldKind>),
+    /// A struct whose fields have names of their own.
+    Struct(Arc<StructMeta>),
+    /// An enum, bitmap, or anything else that encodes from the JSON shape
+    /// alone.
     Other,
 }
 
 impl FieldKind {
-    fn parse(raw: &str) -> Self {
+    /// Resolve one generated kind string against the cluster's struct table.
+    ///
+    /// `structs` is being built as this runs, so a definition that is still
+    /// on the stack — only possible if rs-matter ever emits a cyclic struct —
+    /// resolves to `Other` rather than recursing forever.
+    fn parse(
+        raw: &str,
+        definitions: &BTreeMap<String, RawStruct>,
+        resolver: &mut Resolver,
+    ) -> Self {
+        if let Some(element) = raw.strip_prefix("list:") {
+            return Self::List(Box::new(Self::parse(element, definitions, resolver)));
+        }
+        if let Some(name) = raw.strip_prefix("struct:") {
+            return match resolver.resolve(name, definitions) {
+                Some(meta) => Self::Struct(meta),
+                None => Self::Other,
+            };
+        }
         match raw {
             "bytes" => Self::Bytes,
             "string" => Self::String,
             "int" => Self::Int,
             "float" => Self::Float,
             "bool" => Self::Bool,
-            "list" => Self::List,
             _ => Self::Other,
         }
+    }
+
+    /// What a list's elements hold. A field that is not a list has no
+    /// elements, so its own kind is the best answer for the values inside it.
+    pub fn element(&self) -> &FieldKind {
+        match self {
+            Self::List(element) => element,
+            other => other,
+        }
+    }
+}
+
+/// A struct nested inside a payload, with its own named fields.
+#[derive(Debug, PartialEq)]
+pub struct StructMeta {
+    /// Wire name, e.g. `credentialStruct`.
+    pub name: String,
+    /// Field wire name -> TLV context tag.
+    fields: Vec<(String, u32)>,
+    /// TLV context tag -> field kind.
+    kinds: BTreeMap<u32, FieldKind>,
+}
+
+impl StructMeta {
+    /// Look up the TLV tag for a field name, as [`CommandMeta::request_tag`]
+    /// does one level up.
+    pub fn tag(&self, field: &str) -> Option<u32> {
+        let wanted = normalize(field);
+        self.fields
+            .iter()
+            .find(|(name, _)| normalize(name) == wanted)
+            .map(|(_, tag)| *tag)
+    }
+
+    pub fn kind(&self, tag: u32) -> &FieldKind {
+        self.kinds.get(&tag).unwrap_or(&FieldKind::Other)
+    }
+}
+
+/// Turns the generated struct table into resolved [`StructMeta`] values,
+/// sharing one instance between every field that names it.
+#[derive(Default)]
+struct Resolver {
+    done: BTreeMap<String, Arc<StructMeta>>,
+    /// Definitions currently being resolved, so a cycle can be broken.
+    active: Vec<String>,
+}
+
+impl Resolver {
+    fn resolve(
+        &mut self,
+        name: &str,
+        definitions: &BTreeMap<String, RawStruct>,
+    ) -> Option<Arc<StructMeta>> {
+        if let Some(meta) = self.done.get(name) {
+            return Some(Arc::clone(meta));
+        }
+        if self.active.iter().any(|active| active == name) {
+            return None;
+        }
+        let definition = definitions.get(name)?;
+        self.active.push(name.to_string());
+        let kinds = definition
+            .types
+            .iter()
+            .filter_map(|(tag, kind)| {
+                Some((tag.parse().ok()?, FieldKind::parse(kind, definitions, self)))
+            })
+            .collect();
+        self.active.pop();
+
+        let meta = Arc::new(StructMeta {
+            name: wire_field_name(name),
+            fields: definition
+                .fields
+                .iter()
+                .map(|(field, tag)| (wire_field_name(field), *tag))
+                .collect(),
+            kinds,
+        });
+        self.done.insert(name.to_string(), Arc::clone(&meta));
+        Some(meta)
     }
 }
 
@@ -91,7 +231,7 @@ pub struct CommandMeta {
     /// TLV context tag -> response field wire name.
     pub response_fields: BTreeMap<u32, String>,
     /// TLV context tag -> payload field kind.
-    pub request_kinds: BTreeMap<u32, FieldKind>,
+    request_kinds: BTreeMap<u32, FieldKind>,
 }
 
 impl ClusterMeta {
@@ -126,6 +266,11 @@ impl ClusterMeta {
             .map(|(name, _)| name.as_str())
     }
 
+    /// The epoch unit an attribute is typed with, if any.
+    pub fn attribute_epoch(&self, id: u32) -> Option<EpochUnit> {
+        self.epoch.get(&id).copied()
+    }
+
     pub fn event_name(&self, id: u32) -> Option<&str> {
         self.events
             .iter()
@@ -148,11 +293,8 @@ impl CommandMeta {
         !self.response_fields.is_empty()
     }
 
-    pub fn request_kind(&self, tag: u32) -> FieldKind {
-        self.request_kinds
-            .get(&tag)
-            .copied()
-            .unwrap_or(FieldKind::Other)
+    pub fn request_kind(&self, tag: u32) -> &FieldKind {
+        self.request_kinds.get(&tag).unwrap_or(&FieldKind::Other)
     }
 }
 
@@ -172,6 +314,11 @@ fn registry() -> &'static BTreeMap<u32, ClusterMeta> {
         raw.into_iter()
             .filter_map(|(cluster_id, cluster)| {
                 let cluster_id = cluster_id.parse::<u32>().ok()?;
+                // One resolver per cluster: struct definitions are
+                // cluster-scoped, and every field naming the same struct
+                // should share the one instance.
+                let definitions = cluster.structs;
+                let mut resolver = Resolver::default();
                 let commands = cluster
                     .commands
                     .into_iter()
@@ -190,9 +337,12 @@ fn registry() -> &'static BTreeMap<u32, ClusterMeta> {
                             .collect(),
                         request_kinds: command
                             .types
-                            .into_iter()
+                            .iter()
                             .filter_map(|(tag, kind)| {
-                                Some((tag.parse().ok()?, FieldKind::parse(&kind)))
+                                Some((
+                                    tag.parse().ok()?,
+                                    FieldKind::parse(kind, &definitions, &mut resolver),
+                                ))
                             })
                             .collect(),
                     })
@@ -205,6 +355,18 @@ fn registry() -> &'static BTreeMap<u32, ClusterMeta> {
                         commands,
                         attributes: cluster.attributes.into_iter().collect(),
                         events: cluster.events.into_iter().collect(),
+                        epoch: cluster
+                            .epoch
+                            .into_iter()
+                            .filter_map(|(id, unit)| {
+                                let unit = match unit.as_str() {
+                                    "us" => EpochUnit::Micros,
+                                    "s" => EpochUnit::Seconds,
+                                    _ => return None,
+                                };
+                                Some((id.parse().ok()?, unit))
+                            })
+                            .collect(),
                     },
                 ))
             })
@@ -265,9 +427,56 @@ mod tests {
         let network = cluster(49).unwrap();
         let command = network.command("addOrUpdateThreadNetwork").unwrap();
         let dataset_tag = command.request_tag("operationalDataset").unwrap();
-        assert_eq!(command.request_kind(dataset_tag), FieldKind::Bytes);
+        assert_eq!(*command.request_kind(dataset_tag), FieldKind::Bytes);
         let breadcrumb_tag = command.request_tag("breadcrumb").unwrap();
-        assert_eq!(command.request_kind(breadcrumb_tag), FieldKind::Int);
+        assert_eq!(*command.request_kind(breadcrumb_tag), FieldKind::Int);
+    }
+
+    #[test]
+    fn a_struct_typed_field_carries_its_own_schema() {
+        let door_lock = cluster(257).unwrap();
+        let command = door_lock.command("setCredential").unwrap();
+        let tag = command.request_tag("credential").unwrap();
+        let FieldKind::Struct(credential) = command.request_kind(tag) else {
+            panic!(
+                "credential should be a struct, got {:?}",
+                command.request_kind(tag)
+            );
+        };
+        assert_eq!(credential.name, "credentialStruct");
+        assert_eq!(credential.tag("credentialType"), Some(0));
+        assert_eq!(credential.tag("credentialIndex"), Some(1));
+        assert_eq!(*credential.kind(1), FieldKind::Int);
+        assert_eq!(credential.tag("nonexistent"), None);
+    }
+
+    #[test]
+    fn a_list_field_carries_the_kind_of_its_elements() {
+        let content_control = cluster(1295).unwrap();
+        let command = content_control.command("addBlockApplications").unwrap();
+        let tag = command.request_tag("applications").unwrap();
+        let kind = command.request_kind(tag);
+        assert!(matches!(kind, FieldKind::List(_)), "got {:?}", kind);
+        let FieldKind::Struct(app) = kind.element() else {
+            panic!("elements should be structs, got {:?}", kind.element());
+        };
+        assert_eq!(app.tag("catalogVendorID"), Some(0));
+    }
+
+    /// The same struct reached from two commands is one instance, so the
+    /// table cannot grow a copy per reference.
+    #[test]
+    fn struct_definitions_are_shared_between_commands() {
+        let application_launcher = cluster(1292).unwrap();
+        let launch = application_launcher.command("launchApp").unwrap();
+        let stop = application_launcher.command("stopApp").unwrap();
+        let (FieldKind::Struct(from_launch), FieldKind::Struct(from_stop)) = (
+            launch.request_kind(launch.request_tag("application").unwrap()),
+            stop.request_kind(stop.request_tag("application").unwrap()),
+        ) else {
+            panic!("application should be a struct on both commands");
+        };
+        assert!(Arc::ptr_eq(from_launch, from_stop));
     }
 
     #[test]
@@ -278,6 +487,29 @@ mod tests {
         // Clients send this as PINCode or pinCode depending on their SDK.
         assert_eq!(lock.request_tag("PINCode"), lock.request_tag("pinCode"));
         assert!(lock.request_tag("PINCode").is_some());
+    }
+
+    #[test]
+    fn epoch_typed_attributes_are_labelled_with_their_unit() {
+        let time_sync = cluster(56).unwrap();
+        let utc_time = time_sync.attribute_id("UTCTime").unwrap();
+        assert_eq!(time_sync.attribute_epoch(utc_time), Some(EpochUnit::Micros));
+
+        let evse = cluster(153).unwrap();
+        let next_start = evse.attribute_id("NextChargeStartTime").unwrap();
+        assert_eq!(evse.attribute_epoch(next_start), Some(EpochUnit::Seconds));
+
+        // An ordinary integer attribute is not an epoch, and neither is an
+        // attribute id that belongs to a different cluster.
+        assert_eq!(cluster(6).unwrap().attribute_epoch(0), None);
+        assert_eq!(time_sync.attribute_epoch(1), None);
+    }
+
+    #[test]
+    fn the_matter_epoch_offset_is_the_2000_01_01_boundary() {
+        // 1970-01-01 to 2000-01-01 is 30 years with 7 leap days.
+        assert_eq!(EpochUnit::Seconds.unix_offset(), 946_684_800);
+        assert_eq!(EpochUnit::Micros.unix_offset(), 946_684_800_000_000);
     }
 
     #[test]

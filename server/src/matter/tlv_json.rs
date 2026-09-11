@@ -26,7 +26,7 @@ use rs_matter::tlv::{TLVElement, TLVTag, TLVValue, TLVWrite};
 
 use crate::protocol::error::ApiError;
 
-use super::clusters::{CommandMeta, FieldKind};
+use super::clusters::{self, CommandMeta, EpochUnit, FieldKind, StructMeta};
 
 // ---------------------------------------------------------------------------
 // Decoding: TLV -> JSON
@@ -36,6 +36,37 @@ use super::clusters::{CommandMeta, FieldKind};
 /// context tag.
 pub fn to_json(element: &TLVElement<'_>) -> Result<Value, Error> {
     decode(element, None)
+}
+
+/// Decode an attribute report, converting an epoch-typed value to Unix time.
+///
+/// Matter counts these from 2000-01-01 and the reference reports them as Unix
+/// time, so a client comparing one to its own clock needs the conversion done
+/// here rather than left to it.
+pub fn attribute_to_json(
+    cluster_id: u32,
+    attribute_id: u32,
+    element: &TLVElement<'_>,
+) -> Result<Value, Error> {
+    let value = decode(element, None)?;
+    Ok(match attribute_epoch(cluster_id, attribute_id) {
+        Some(unit) => to_unix_time(value, unit),
+        None => value,
+    })
+}
+
+fn attribute_epoch(cluster_id: u32, attribute_id: u32) -> Option<EpochUnit> {
+    clusters::cluster(cluster_id)?.attribute_epoch(attribute_id)
+}
+
+/// Matter epoch -> Unix. A null (the usual "not known yet" for these
+/// attributes) and anything that is not an unsigned count pass through
+/// unchanged.
+fn to_unix_time(value: Value, unit: EpochUnit) -> Value {
+    match value.as_u64() {
+        Some(matter) => Value::from(matter.saturating_add(unit.unix_offset())),
+        None => value,
+    }
 }
 
 /// Decode an invoke response: the top-level members are keyed by name, and
@@ -147,8 +178,12 @@ impl TlvNode {
     }
 }
 
-/// Resolve a tag-based JSON value (attribute writes, nested payload structs).
-pub fn from_json(value: &Value, kind: FieldKind) -> Result<TlvNode, ApiError> {
+/// Resolve a JSON value against the kind its field is declared to hold.
+///
+/// An object is resolved by name when the schema says the field is a struct,
+/// and by numeric TLV tag otherwise — which is how a client still reaches a
+/// cluster this build has no metadata for.
+pub fn from_json(value: &Value, kind: &FieldKind) -> Result<TlvNode, ApiError> {
     Ok(match value {
         Value::Null => TlvNode::Null,
         Value::Bool(value) => TlvNode::Bool(*value),
@@ -162,7 +197,7 @@ pub fn from_json(value: &Value, kind: FieldKind) -> Result<TlvNode, ApiError> {
             }
         }
         Value::String(text) => {
-            if kind == FieldKind::Bytes {
+            if *kind == FieldKind::Bytes {
                 TlvNode::Bytes(BASE64.decode(text).map_err(|_| {
                     ApiError::invalid_args(
                         "Expected a base64-encoded string for an octet-string field",
@@ -175,33 +210,55 @@ pub fn from_json(value: &Value, kind: FieldKind) -> Result<TlvNode, ApiError> {
         Value::Array(items) => TlvNode::Array(
             items
                 .iter()
-                .map(|item| from_json(item, element_kind(kind)))
+                .map(|item| from_json(item, kind.element()))
                 .collect::<Result<_, _>>()?,
         ),
-        Value::Object(members) => {
-            let mut resolved = Vec::with_capacity(members.len());
-            for (key, member) in members {
-                let tag = key.parse::<u8>().map_err(|_| {
-                    ApiError::invalid_args(format!(
-                        "Struct field '{}' must be addressed by its numeric TLV tag",
-                        key
-                    ))
-                })?;
-                resolved.push((tag, from_json(member, FieldKind::Other)?));
+        Value::Object(members) => match kind {
+            FieldKind::Struct(schema) => struct_from_json(schema, members)?,
+            _ => {
+                let mut resolved = Vec::with_capacity(members.len());
+                for (key, member) in members {
+                    let tag = key.parse::<u8>().map_err(|_| {
+                        ApiError::invalid_args(format!(
+                            "Struct field '{}' must be addressed by its numeric TLV tag",
+                            key
+                        ))
+                    })?;
+                    resolved.push((tag, from_json(member, &FieldKind::Other)?));
+                }
+                resolved.sort_by_key(|(tag, _)| *tag);
+                TlvNode::Struct(resolved)
             }
-            resolved.sort_by_key(|(tag, _)| *tag);
-            TlvNode::Struct(resolved)
-        }
+        },
     })
 }
 
-/// A list's declared kind describes its elements, so a list of octet strings
-/// keeps base64 decoding one level down.
-fn element_kind(kind: FieldKind) -> FieldKind {
-    match kind {
-        FieldKind::List => FieldKind::Other,
-        other => other,
+/// Resolve a nested struct whose fields the schema names.
+///
+/// A numeric key still works, so a payload written against an older build —
+/// or against a field this one has no name for — keeps encoding the same way.
+fn struct_from_json(
+    schema: &StructMeta,
+    members: &Map<String, Value>,
+) -> Result<TlvNode, ApiError> {
+    let mut resolved = Vec::with_capacity(members.len());
+    for (key, member) in members {
+        let tag = match schema.tag(key) {
+            Some(tag) => tag,
+            None => key.parse::<u32>().map_err(|_| {
+                ApiError::invalid_args(format!(
+                    "Unknown field '{}' for struct '{}'",
+                    key, schema.name
+                ))
+            })?,
+        };
+        let tag = u8::try_from(tag).map_err(|_| {
+            ApiError::invalid_args(format!("Field '{}' has an out-of-range TLV tag", key))
+        })?;
+        resolved.push((tag, from_json(member, schema.kind(tag as u32))?));
     }
+    resolved.sort_by_key(|(tag, _)| *tag);
+    Ok(TlvNode::Struct(resolved))
 }
 
 /// Resolve a `device_command` payload, whose top-level fields are named.
@@ -241,10 +298,20 @@ pub fn command_payload_from_json(
 }
 
 /// Encode an attribute value for a write. Attribute payloads are tag based, so
-/// no schema is consulted; a bytes-valued attribute must be sent as base64 and
-/// is detected by the caller supplying [`FieldKind::Bytes`].
-pub fn attribute_value_from_json(value: &Value) -> Result<TlvNode, ApiError> {
-    from_json(value, FieldKind::Other)
+/// no schema is consulted beyond the epoch types: a client sends Unix time for
+/// those, and the device expects Matter epoch.
+///
+/// A Unix time before 2000-01-01 has no Matter representation and encodes as
+/// the epoch itself, which is the closest instant the device can hold.
+pub fn attribute_value_from_json(
+    cluster_id: u32,
+    attribute_id: u32,
+    value: &Value,
+) -> Result<TlvNode, ApiError> {
+    if let (Some(unit), Some(unix)) = (attribute_epoch(cluster_id, attribute_id), value.as_u64()) {
+        return Ok(TlvNode::U64(unix.saturating_sub(unit.unix_offset())));
+    }
+    from_json(value, &FieldKind::Other)
 }
 
 /// Map a TLV write failure onto the protocol's SDK error.
@@ -350,6 +417,79 @@ mod tests {
     }
 
     #[test]
+    fn nested_payload_structs_resolve_their_field_names() {
+        let door_lock = crate::matter::clusters::cluster(257).unwrap();
+        let command = door_lock.command("setCredential").unwrap();
+        let payload = json!({
+            "operationType": 0,
+            "credential": { "credentialType": 1, "credentialIndex": 2 },
+            "credentialData": "3q2+7w==",
+        });
+        let node = command_payload_from_json(command, &payload).unwrap();
+        assert_eq!(
+            node,
+            TlvNode::Struct(vec![
+                (0, TlvNode::U64(0)),
+                (
+                    1,
+                    TlvNode::Struct(vec![(0, TlvNode::U64(1)), (1, TlvNode::U64(2))])
+                ),
+                (2, TlvNode::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF])),
+            ])
+        );
+    }
+
+    #[test]
+    fn nested_structs_still_accept_numeric_tags() {
+        let door_lock = crate::matter::clusters::cluster(257).unwrap();
+        let command = door_lock.command("setCredential").unwrap();
+        let named = json!({ "credential": { "credentialType": 1, "credentialIndex": 2 } });
+        let numeric = json!({ "1": { "0": 1, "1": 2 } });
+        assert_eq!(
+            command_payload_from_json(command, &named).unwrap(),
+            command_payload_from_json(command, &numeric).unwrap()
+        );
+    }
+
+    #[test]
+    fn an_unknown_nested_field_names_the_struct_it_was_meant_for() {
+        let door_lock = crate::matter::clusters::cluster(257).unwrap();
+        let command = door_lock.command("setCredential").unwrap();
+        let payload = json!({ "credential": { "kind": 1 } });
+        let error = command_payload_from_json(command, &payload).unwrap_err();
+        assert_eq!(error.code.as_i64(), 8);
+        assert!(
+            error.details.contains("Unknown field 'kind'")
+                && error.details.contains("credentialStruct"),
+            "{}",
+            error.details
+        );
+    }
+
+    #[test]
+    fn a_list_of_structs_resolves_every_element() {
+        let content_control = crate::matter::clusters::cluster(1295).unwrap();
+        let command = content_control.command("addBlockApplications").unwrap();
+        let payload = json!({
+            "applications": [
+                { "catalogVendorID": 1, "applicationID": "one" },
+                { "catalogVendorID": 2, "applicationID": "two" },
+            ]
+        });
+        let node = command_payload_from_json(command, &payload).unwrap();
+        assert_eq!(
+            node,
+            TlvNode::Struct(vec![(
+                0,
+                TlvNode::Array(vec![
+                    TlvNode::Struct(vec![(0, TlvNode::U64(1)), (1, TlvNode::Utf8("one".into()))]),
+                    TlvNode::Struct(vec![(0, TlvNode::U64(2)), (1, TlvNode::Utf8("two".into()))]),
+                ])
+            )])
+        );
+    }
+
+    #[test]
     fn octet_string_payload_fields_are_base64_decoded() {
         let network = crate::matter::clusters::cluster(49).unwrap();
         let command = network.command("addOrUpdateThreadNetwork").unwrap();
@@ -382,7 +522,8 @@ mod tests {
 
     #[test]
     fn attribute_writes_address_struct_fields_by_tag() {
-        let node = attribute_value_from_json(&json!({ "1": 5, "0": "text" })).unwrap();
+        // Basic Information's NodeLabel: an ordinary, non-epoch attribute.
+        let node = attribute_value_from_json(40, 5, &json!({ "1": 5, "0": "text" })).unwrap();
         assert_eq!(
             node,
             TlvNode::Struct(vec![
@@ -390,7 +531,71 @@ mod tests {
                 (1, TlvNode::U64(5))
             ])
         );
-        let error = attribute_value_from_json(&json!({ "label": 5 })).unwrap_err();
+        let error = attribute_value_from_json(40, 5, &json!({ "label": 5 })).unwrap_err();
         assert!(error.details.contains("numeric TLV tag"));
+    }
+
+    /// 2001-09-09T01:46:40Z, which is 1_000_000_000 in Unix seconds and
+    /// 53_315_200 in Matter seconds.
+    const UNIX_SECS: u64 = 1_000_000_000;
+    const MATTER_SECS: u64 = UNIX_SECS - 946_684_800;
+
+    #[test]
+    fn epoch_attributes_are_reported_as_unix_time() {
+        let mut buf = [0u8; 32];
+        let len = encode(&TlvNode::U64(MATTER_SECS), &mut buf);
+        let element = TLVElement::new(&buf[..len]);
+        // EnergyEvse::NextChargeStartTime, an epoch_s attribute.
+        assert_eq!(
+            attribute_to_json(153, 35, &element).unwrap(),
+            json!(UNIX_SECS)
+        );
+        // The same bytes on an attribute that is not an epoch stay as they are.
+        assert_eq!(
+            attribute_to_json(153, 0, &element).unwrap(),
+            json!(MATTER_SECS)
+        );
+    }
+
+    #[test]
+    fn an_unknown_epoch_value_is_left_alone() {
+        let mut buf = [0u8; 32];
+        let len = encode(&TlvNode::Null, &mut buf);
+        let element = TLVElement::new(&buf[..len]);
+        assert_eq!(attribute_to_json(153, 35, &element).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn epoch_attribute_writes_are_converted_back() {
+        assert_eq!(
+            attribute_value_from_json(153, 35, &json!(UNIX_SECS)).unwrap(),
+            TlvNode::U64(MATTER_SECS)
+        );
+        // TimeSynchronization::UTCTime counts microseconds.
+        assert_eq!(
+            attribute_value_from_json(56, 0, &json!(UNIX_SECS * 1_000_000)).unwrap(),
+            TlvNode::U64(MATTER_SECS * 1_000_000)
+        );
+    }
+
+    /// A client that sends a time before the Matter epoch gets the epoch
+    /// rather than a wrapped u64.
+    #[test]
+    fn a_pre_2000_write_saturates_at_the_matter_epoch() {
+        assert_eq!(
+            attribute_value_from_json(153, 35, &json!(0)).unwrap(),
+            TlvNode::U64(0)
+        );
+    }
+
+    #[test]
+    fn epoch_conversion_round_trips() {
+        let node = attribute_value_from_json(56, 0, &json!(UNIX_SECS * 1_000_000)).unwrap();
+        let mut buf = [0u8; 32];
+        let len = encode(&node, &mut buf);
+        assert_eq!(
+            attribute_to_json(56, 0, &TLVElement::new(&buf[..len])).unwrap(),
+            json!(UNIX_SECS * 1_000_000)
+        );
     }
 }
