@@ -169,23 +169,19 @@ announces itself.
 image sets `DBUS_SYSTEM_BUS_ADDRESS` because zbus otherwise falls back to the
 spec's `/var/run/dbus/system_bus_socket`, and the distroless runtime has no
 `/var/run` — it ships `run` and `var` but not Debian's symlink between them.
-And under Docker-in-Docker, the bind source is resolved by the inner daemon
-inside the DinD container rather than on the machine, so the real host's
-`/run/dbus` is out of reach; Docker then creates an empty root-owned directory
-at the destination, and connecting to *that* fails with `EACCES` rather than
-`ENOENT`, because the kernel checks write permission before it checks the
-target is a socket. Nothing in this project's compose fixes that — the bus has
-to be passed into the DinD container itself, which on umbrelOS means editing
-the Portainer app's own compose and redoing it after every update. On a host
-where the bus cannot be reached there is no fallback: `server_info` carries a
-`ble_proxy_enabled` field because the reference's model has one, and this
-server always reports it `false`. Nothing here proxies a radio elsewhere. A
-Wi-Fi or Ethernet device is still commissionable over mDNS; a Thread device
-that has never joined a network is not reachable at all.
+And under Docker-in-Docker the bind source is resolved by the inner daemon, so
+the host's `/run/dbus` is out of reach; Docker creates an empty root-owned
+directory at the destination and connecting to *that* fails with `EACCES`
+rather than `ENOENT`, because the kernel checks write permission before it
+checks the target is a socket. Only passing the bus into the DinD container
+fixes it. Where the bus cannot be reached there is no fallback — the
+`ble_proxy_enabled` field exists because the reference's model has it, and is
+always `false`. Wi-Fi and Ethernet devices are unaffected; they commission
+over mDNS.
 
-**What is not proven.** All of it compiles and none of it has commissioned a
-real device. Testing needs a factory-reset device — which means removing one
-from the fabric — and a host whose D-Bus policy lets the server's uid drive the
-adapter, not merely read it. The container mounts the host's system bus and
-runs as uid 65532, which is normally enough to see an adapter and not enough to
-start discovery.
+**Where it stops.** It has run against a factory-reset device on a Linux host
+with a real adapter, and no connection is ever issued: the scan matches and
+the handshake is composed, but the adapter only ever scans, restarting
+discovery every ten seconds. PARITY.md's gap 3 has the HCI capture. The D-Bus
+permission gate feared here turned out not to be the obstacle — an ordinary
+user drove the adapter with no `bluetooth` group.

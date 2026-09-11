@@ -118,122 +118,85 @@ only real proof.
 What closing each one takes, and what it takes to prove closed, is in
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
-1. **Subscriptions have run against a device; node events have not.** Every
-   node is subscribed to — a wildcard subscription over attributes *and*
-   events, established by `crate::monitor`, its reports consumed by
-   `matter::reports` and published as `attribute_updated`, `node_updated` and
-   `node_event`. The attribute half is now proven on hardware: the Shelly plug
-   accepts the wildcard subscription, and a change made *at the device* — its
-   physical button — arrives as `attribute_updated` on an exchange the device
-   itself opens, with no poll involved (the monitor skips a node with a live
-   subscription entirely).
+1. **Subscriptions run; node events do not.** Every node is subscribed to — a
+   wildcard subscription over attributes *and* events, established by
+   `crate::monitor`, its reports consumed by `matter::reports`. The attribute
+   half is proven on hardware: the plug accepts the subscription and a change
+   made at the device arrives as `attribute_updated` with no poll involved.
 
    The event half is not. The plug raises no `Switch` cluster events, so
-   nothing has ever exercised `node_event` against a device, and the
-   delta-encoded timestamp path in particular is still asserted only by unit
-   tests.
+   nothing has exercised `node_event` against a device, and the delta-encoded
+   timestamp path in particular is asserted only by unit tests.
 
-   Polling remains, for the two cases where it is still the answer: a node that
-   will not subscribe (no slots left, or a refused wildcard) keeps being
-   polled, and a subscription that goes silent for twice its `max_interval` is
-   dropped and re-established. `--poll-interval-secs` still sets that cadence.
+   Polling remains for the two cases where it is the answer: a node that will
+   not subscribe, and a subscription silent for twice its `max_interval`.
+   Changes this controller *caused* are read back from the target endpoint as
+   soon as the command returns, which beats waiting for the device's report.
 
-   Changes this controller *caused* are still read back from the target
-   endpoint as soon as the command returns (about 110 ms), which is quicker
-   than waiting for the device's own report.
+   What the first hardware run cost, recorded because it is the argument for
+   doing this sooner: a report carries only what changed and was being applied
+   as though it were a poll's wildcard read. One button press reduced the node
+   from 179 attributes to the 2 in the report and announced endpoint 0 as
+   removed. The priming report *is* a full read, which is why establishing a
+   subscription always looked right and 324 tests missed it. Absent paths now
+   mean different things depending on where the values came from; see
+   `storage::nodes::Coverage`.
 
-   What that first hardware run cost, recorded because it is the argument for
-   doing this sooner: a device's report carries only what changed, and it was
-   being applied as though it were a poll's wildcard read. One button press
-   reduced the node from 179 attributes to the 2 in the report and announced
-   endpoint 0 as removed. The priming report *is* a full read — which is why
-   establishing a subscription always looked right, and why 324 tests missed
-   it. Absent paths now mean different things depending on where the values
-   came from; see `storage::nodes::Coverage`.
-2. **A device that reboots is unreachable until this server restarts.**
-   Found on hardware: power-cycling the Shelly plug left it unreachable for
-   the ten minutes it was tried, and only restarting the server fixed it.
+2. **A device that reboots is unreachable until this server restarts.** A
+   rebooted device forgets its CASE session; rs-matter keeps its side and
+   never removes it. MRP giving up (`Too many retransmissions`) clears only
+   that exchange's retransmission and ACK state, and `Exchange::initiate`
+   reuses an existing session, establishing fresh CASE only when there is
+   none. So every later operation goes out on a session the device will not
+   answer. Sessions leave the table on explicit close, fabric removal, an
+   expired flag, or LRU eviction when the table is *full* — none of which
+   arrives for one dead session on a small fabric. A restart empties the table
+   in memory, which is the whole of why a restart fixes it.
 
-   The cause is a CASE session that outlives the peer that forgot it. A
-   rebooted device has no memory of the session; rs-matter keeps its side in
-   the session table, and nothing takes it out. MRP noticing the silence —
-   `Too many retransmissions. Giving up` — clears only that exchange's
-   retransmission and ACK state (`transport/mrp.rs`), leaving the session
-   itself untouched. `Exchange::initiate` reuses an existing session whenever
-   there is one and establishes a fresh CASE only when there is not, so every
-   later operation is sent on a session the device will not answer. Sessions
-   are removed on explicit close, on fabric removal, when marked expired, or
-   as the LRU victim when the table is *full* — none of which happens to one
-   dead session on a small fabric. A restart empties the table in memory,
-   which is why it recovers.
+   Measured: the device rebooted at 22:24:08 by its own uptime attribute and
+   pinged in 5 ms throughout; every read failed with a 45 s timeout for the
+   ten minutes it was tried; a restart established fresh CASE in 3 s.
 
-   Nothing in this repository can fix it. rs-matter exposes no per-peer
-   session eviction, `Matter::transport` is a private field, and
-   `TransportMgr::reset` clears only the RX and TX buffers. It belongs
-   upstream: a session whose MRP has given up should be marked expired, or
-   eviction should be reachable.
+   Not fixable here — no per-peer eviction in rs-matter's public API,
+   `Matter::transport` is private, `TransportMgr::reset` touches only the RX
+   and TX buffers. Upstream should mark a session expired once its MRP has
+   given up.
 
-   **The monitor is not at fault**, though an earlier version of this entry
-   said it was. It notices the silent subscription and retries on schedule —
-   subscribe, then poll, each ending in `RxTimeout`, then a 300 s backoff once
-   the node is marked unavailable. The retries cannot succeed because they
-   reuse the same dead session. What made it look wedged is that every one of
-   those failure paths logs at `debug`, so at the default level a node in this
-   state produces silence.
+   The monitor is *not* at fault: it marks the node unavailable, retries the
+   subscribe, retries the poll, and backs off. All of that logs at `debug`,
+   so at the default level a node in this state produces silence.
 
-   Two smaller findings from the same run, both fixable here. `ping_node`
-   answered `true` in 3.2 ms throughout, and availability followed it, because
-   `ping` opens an exchange through `open()` and gets the cached session back
-   without a round trip: the probe proves a session object exists, not that
-   the device answers, which is exactly backwards in the case it exists to
-   catch. And `maintain_node` calls `subscriptions.forget()` before awaiting
-   `subscribe()`, so the entry is gone before `forget_silent` could name it
-   and `stopped reporting` can never be logged.
+   Two things beside it are ours. `ping_node` answers `true` for a dead node,
+   because `ping` is handed the cached session with no round trip — it proves
+   a session object exists, not that the device answers, and availability
+   follows it. And `maintain_node` calls `subscriptions.forget()` before
+   awaiting `subscribe()`, so the entry is gone before `forget_silent` could
+   name it and `stopped reporting` can never be logged.
 
-3. **Bluetooth commissioning has run on hardware, and fails before it
-   reaches the device.** `commission_with_code` scans over Bluetooth when
-   mDNS finds nothing. The device is meant to be reached over BTP, handed its
-   Wi-Fi or Thread credentials over the PASE session between AddNOC and CASE,
-   and then resolved over mDNS once it has joined its network.
+3. **Bluetooth commissioning connects to nothing.** Everything up to the radio
+   works, proven against a factory-reset plug on a Linux host with a real
+   adapter: mDNS finds nothing and the fallback fires, the scan matches on the
+   short discriminator derived from the pairing code and reads the right
+   vendor, product and discriminator off the advertisement, a BTP session and
+   exchange are created, and the handshake is composed and sent.
 
-   Everything up to the radio works, and was proven against a factory-reset
-   Shelly plug on a Linux host with a real adapter. mDNS finds nothing and the
-   fallback fires; the scan matches the device on the short discriminator
-   derived from the pairing code, reading `AdvData { vid: 5264, pid: 1,
-   discriminator: 1612 }` off its advertisement; an unsecured BTP session and
-   exchange are created; and the BTP handshake request is composed and sent.
+   The device never sees it. An HCI capture over a 194-second attempt holds
+   **no connection attempt and no ACL data at all** — zero `LE Create
+   Connection`, zero ATT packets. The adapter spends the attempt scanning: 37
+   `Start Service Discovery` commands, one every ~10.5 s. That scanning is
+   ours; it stops when the process does, and runs while the server is idle.
 
-   None of it reaches the device. An HCI capture over a 194-second attempt
-   contains **no connection attempt and no ACL data at all** — zero `LE Create
-   Connection`, zero ATT packets. What the adapter does instead is scan: 37
-   `Start Service Discovery` commands, one every ~10.5 s, for the whole
-   attempt. The scanning is this server's own — it stops when the process
-   stops, and it runs while the server is merely idle, not only while
-   commissioning.
+   The log claims otherwise, which is what made it hard to see. `Discovered
+   Matter GATT characteristics C1/C2, ATT MTU: Some(247)` is BlueZ answering
+   from its *cached* GATT database, and the handshake is then written into a
+   connection that does not exist.
 
-   The log says otherwise, which is what made this hard to see. `Discovered
-   Matter GATT characteristics C1/C2, ATT MTU: Some(247)` is printed ten
-   seconds after `Connecting to commissionable device`, and that is BlueZ's
-   *cached* GATT database answering — populated by an earlier manual
-   `bluetoothctl connect`, not by a live link. The handshake is then written
-   into a connection that does not exist and the commissioner waits out its
-   180 s timeout.
-
-   So the device is not at fault and never saw a byte. The fault is in the
-   BlueZ backend or in how this server drives it: a connect is never issued
-   while its own discovery is being restarted every ten seconds. That is
-   upstream of this repository, in `rs_matter::transport::network::btp::gatt::bluez`.
-
-   Two things the same run settled, both previously listed as unknowns:
-
-   - **The permission gate is not the problem.** Debian 13's D-Bus policy let
-     an ordinary user in `sudo`/`users` start discovery without the
-     `bluetooth` group. `bluetooth_enabled` reported `true` and was accurate
-     about everything it claims.
-   - **Linux only, still.** rs-matter's BTP Central backends are `target_os =
-     "linux"`. macOS would need a CoreBluetooth backend that does not exist,
-     and a plain CLI binary could not use one without an app bundle and
-     entitlements.
+   Upstream, in `rs_matter::transport::network::btp::gatt::bluez`. Two
+   unknowns closed on the way: the D-Bus permission gate the compose file
+   warns about was not the problem (Debian 13 let an ordinary user start
+   discovery with no `bluetooth` group, and `bluetooth_enabled` was accurate),
+   and macOS remains out of reach because the BTP Central backends are
+   `target_os = "linux"`.
 
 4. **mDNS queries go out over IPv4 only.** The one-shot browser binds an IPv4
    socket and asks the IPv4 group, so every discovery this server does —
@@ -301,64 +264,42 @@ What closing each one takes, and what it takes to prove closed, is in
 
 ## Hardware validation
 
-The procedure for extending this table — the rig each claim needs, the
-commands, and what counts as a pass — is
+What a device has actually shown, against a Shelly Plug S Gen3 (vendor 5264,
+product 1) on a live network, plus a second controller on a Raspberry Pi 5.
+Entries marked **fixed** failed on first contact; the gap they exposed is
+above. What is still unproven, and how to prove it, is in
 [docs/HARDWARE-TESTING.md](docs/HARDWARE-TESTING.md).
 
-Run against a Shelly Plug S Gen3 (vendor 5264, product 1) on a live network:
-
-| Step | Result |
+| Claim | What the device did |
 |---|---|
-| `commission_with_code` with an 11-digit manual code | PASE → AddNOC → CASE → CommissioningComplete → interview in **5.4 s** |
-| First interview | 179 attributes across endpoints 0 and 1; `matter_version` 1.3.0 derived from DataModelRevision |
-| Attribute decoding | Tag-based structs as the reference emits them, e.g. `"0/29/0": [{"0": 22, "1": 1}]` |
-| `read_attribute` single and wildcard | `1/6/0` and `1/6/*` both correct |
-| `device_command` `toggle` / `on` / `off` | Plug switched; `attribute_updated` fired as `[1, "1/6/0", true]`, **110-119 ms** after the command across six consecutive runs |
-| Restart recovery | Node, attributes and addresses restored; CASE re-established from the persisted fabric; commands still work |
-| `ping_node` | `{"fe80::<device>": true}`, keyed by the address the node answered on |
-| `open_commissioning_window` | The locally computed SPAKE2+ verifier was **accepted by the device**; manual and QR codes returned |
-| `get_matter_fabrics` | Fabric descriptor decoded, vendor name resolved |
-| Two contending clients | Home Assistant claimed the fabric label first; the second connection was correctly ignored, exactly as the reference specifies |
+| `commission_with_code` | PASE → CASE → CommissioningComplete → subscribe → interview. 5.4 s release, 6.9 s debug. Also against an *enhanced* window opened by another controller |
+| `discover` | Full TXT record, `long_discriminator` 1612 matching the pairing code's own encoding, vendor, product, port, `commissioning_mode`. IPv4 address only — gap 4 in practice |
+| A device accepts a wildcard subscription | Accepted, keepalive 300 s |
+| A change made *at the device* | Button press → `attribute_updated`, on an exchange the device opened. The monitor skips subscribed nodes, so no poll was involved. This is also the proof a device can open a session *to* this node |
+| The store survives a report | **fixed** — a report carries only what changed, and was applied as a full snapshot |
+| `write_attribute` | **fixed** — every write omitted the mandatory `TimedRequest` field. Now `Status: 0`, value read back off the device, timed form too |
+| The fabric label across two fabrics | **fixed** — labels must be unique per device, both controllers defaulted to the same one, and the `LabelConflict` status was discarded |
+| `set_acl_entry` / `set_node_binding` | `status: 0` writing the admin entry back; `195` (`UNSUPPORTED_CLUSTER`) for a binding on an endpoint without the cluster — a per-path status in a real `WriteResponse` |
+| `open_commissioning_window` | Locally computed SPAKE2+ verifier accepted, 102 ms. `discover` then showed `commissioning_mode: 2` under a *fresh* discriminator, and a timed `RevokeCommissioning` put both back |
+| Multi-admin | Commissioned onto a second fabric from a different host; both controllers read the same two-fabric list and both drive the device |
+| The fabric label reaches the device | Read back off the device's own `OperationalCredentials.Fabrics` |
+| `device_command` | 110-144 ms including the read-back, and exactly one `attribute_updated` — the device's own report of the same change is correctly seen as no change |
+| `ping_node` | 3.4 ms reachable against a 5.0 s timeout unreachable. Note it trusts a cached session: see gap 2 |
+| `remove_node` | 1.2 s on a reachable device; on an unreachable one, removed locally after 10.0 s and logged |
+| `interview_node`, already interviewed | 265 ms and 3 events, not 179: only what changed is republished |
+| `read_attribute` | Single path, path lists, and wildcards, including live values such as RSSI |
+| `check_node_update` | `null` in 178 ms cold, 3 ms cached — and correct: the ledger publishes exactly one version for this vid/pid, the one the device runs |
+| `get_network_topology` | Real graph: Wi-Fi station at RSSI −47 edged to a synthetic AP whose BSSID is the router's LAN MAC plus one |
+| `get_icd_state`, no cluster | `supported: false`, everything else null |
+| Restart recovery | Node, attributes and addresses restored; CASE re-established from the persisted fabric |
+| Two contending clients | Home Assistant claimed the fabric label first; the second connection was correctly ignored |
+| Credentials are write-only | `get_all_credentials` returns the SSID and no password |
 
-A second run on 2026-09-10, against the current build after a factory reset,
-covering what the first could not:
-
-| Step | Result |
-|---|---|
-| `discover` against a factory-reset plug | Full TXT record: `long_discriminator` 1612 — matching the manual pairing code's own encoding — vendor 5264, product 1, port 5540, `commissioning_mode` 1. Only the IPv4 address is reported, which is the IPv4-only browser (gap 4) visible in practice |
-| `commission_with_code`, current build | PASE → CASE → CommissioningComplete → **subscribe** → interview in **6.93 s**, on a debug build |
-| A device accepts a wildcard subscription | Accepted, keepalive 300 s. Never previously proven |
-| A change made *at the device* | Physical button press → `attribute_updated [2, "1/6/0", true]`, delivered on an exchange the device opened. The monitor skips subscribed nodes, so no poll was involved |
-| The store survives a report | **Failed first**, then fixed: see gap 1. After the fix, one press produces exactly `attribute_updated` and `node_updated`, no `endpoint_removed`, and the node still holds all 179 attributes across both endpoints |
-| `ping_node` on an unreachable node | `{"fe80::4af6:eeff:feb6:8e4c": false}`, keyed by the known address, after a 5.0 s CASE timeout |
-| `remove_node` on an unreachable node | Removed locally after 10.0 s of trying, logged as `could not be decommissioned cleanly (...); removing it locally anyway`, and `node_removed` published with the bare node id |
-| `device_command` `on` / `off` | 129 ms and 144 ms; exactly one `attribute_updated` each. The read-back updates the store first, so the device's own report of the same change is correctly recognised as no change rather than published twice |
-| `write_attribute` | **Failed first**, then fixed: every write this server makes omitted the mandatory `TimedRequest` field and the plug rejected the action. After the fix, `Status: 0`, the value read back off the device, and the timed form works too |
-| `get_node_ip_addresses` | `["192.168.1.228"]` — resolved over mDNS in 1.5 s, but **IPv4 only**. The documented "link-local IPv6 first" ordering cannot happen while the browser is IPv4-only (gap 4) |
-| `get_matter_fabrics` | One fabric decoded off the device: index 1, label `Home`, vendor 65521 resolved to `[Test vendor #1]` |
-| `get_icd_state` on a device without the cluster | `supported: false`, everything else null, as specified |
-| `check_node_update` against the real CSA ledger | `null` in 178 ms cold, 3 ms cached. Independently confirmed correct: the ledger publishes exactly one software version for vid 5264 / pid 1, `16908353`, which is what the device runs |
-| `get_network_topology` | Real graph: node 2 as a Wi-Fi station at RSSI −47, edged to a synthetic AP whose BSSID `C4:9A:31:01:51:F1` is the router's LAN MAC plus one |
-| `set_acl_entry` | `status: 0` writing the fabric's own admin entry back unchanged, in the snake_case shape — the asymmetry with `write_attribute`'s capitalised one is real. The ACL read back identical afterwards, and access was retained |
-| `set_node_binding` on an endpoint with no Binding cluster | `status: 195` (`UNSUPPORTED_CLUSTER`) — a per-path status in a real `WriteResponse`, which is the device answering rather than refusing the action |
-| `open_commissioning_window` | The locally computed SPAKE2+ verifier was accepted, in 102 ms. `discover` then showed the node at `commissioning_mode: 2` with a *fresh* discriminator 1696, distinct from the factory 1612 |
-| `device_command` with a timed invoke | `RevokeCommissioning` (cluster 60) closed that window in 279 ms; `discover` returned to `commissioning_mode: 0` and discriminator 1612 |
-| The fabric label reaches the device | `set_default_fabric_label` to `RigLabel` in 106 ms, then read back off the device's own `OperationalCredentials.Fabrics`. Restored to `Home` afterwards |
-| `ping_node` on a reachable node | `{"192.168.1.228": true}` in 3.4 ms, against 5.0 s for the unreachable case above |
-| `interview_node` on an already-interviewed node | 265 ms and **3** events, not 179: only the attributes that actually changed are republished |
-| `read_attribute` shapes | Single path, a list of three paths, and the `1/6/*` wildcard all correct, including live values such as RSSI |
-| Multi-admin: a second controller on one device | The plug commissioned onto a second fabric from a different host, using the enhanced window the first opened — 6.94 s, 185 events. Both controllers then read the same two-fabric list off the device and both drive it |
-| The fabric label across two fabrics | **Failed first**, then fixed. Labels must be unique across a device's fabrics, and every installation of this server defaults to the same one, so the second controller's `UpdateFabricLabel` came back `LabelConflict` (10) — and the status was discarded, leaving that fabric nameless with nothing logged. A distinct label lands immediately; a conflicting one is now reported |
-
-One measurement from that run belongs with the gaps rather than the passes.
-Commissioning published **184 events** — 179 `attribute_updated`, 2
-`endpoint_added`, 2 `node_updated`, 1 `node_added` — into the 256-slot event
-channel, on a connection that was also listening, which is what Home Assistant
-does. That is 72% of the buffer for a two-endpoint plug, so the interview
-overflow described in the roadmap is not a bridge-only concern.
-
-Home Assistant drives the same plug — entity discovery and control — against
-the published container image.
+One measurement belongs with the gaps rather than the passes. Commissioning
+published **184 events** into the 256-slot event channel, on a connection that
+was also listening — which is what Home Assistant does. That is 72% of the
+buffer for a *two-endpoint plug*, so the interview overflow is not a
+bridge-only concern.
 
 `matter_version` comes from `BasicInformation::SpecificationVersion`, which
 only devices from 1.3 onwards report. Older ones fall back to
