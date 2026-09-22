@@ -20,13 +20,20 @@ which expose no REST API. The reference reaches those over **MeshCoP** — CoAP
 over DTLS, authenticated with the `pskc` and `networkKey` of a Thread dataset
 `set_thread_dataset` already stores — and prefers it even where REST exists,
 because the border router's task API queries the mesh one node at a time.
-Nothing in this dependency tree speaks CoAP or DTLS. Rust has no small
-pure-Rust DTLS crate: the choices are a binding to OpenSSL or mbedTLS, which
-complicates the arm64 cross-build, or `webrtc-dtls`, which is pure Rust but
-large and built for a different use. Choosing is the work; the collection
-state in `api::thread_diagnostics` already takes any source that hands over
-nodes one at a time, and the reference's `@matter/thread-br-client` is a
-complete worked example of the protocol.
+Nothing in this dependency tree speaks CoAP or DTLS, and the DTLS is not the
+ordinary kind: MeshCoP authenticates with `TLS_ECJPAKE_WITH_AES_128_CCM_8`,
+a password-authenticated key exchange over the PSKc. No general-purpose DTLS
+crate offers that cipher suite — `webrtc-dtls` does not, and neither does
+OpenSSL; mbedTLS does, behind a C binding that complicates the arm64
+cross-build. The reference took the other route and wrote its own: in
+`@matter/thread-br-client`, about 3,000 lines of TypeScript for the DTLS
+handshake, EC-JPAKE, the record layer and CoAP, on top of P-256, AES-CCM and
+SHA-256 primitives this tree already has through rs-matter's crypto. Porting
+that is the realistic path, and it is pure code; the collection state in
+`api::thread_diagnostics` already takes any source that hands over nodes one
+at a time. What it cannot be is verified without a border router — though
+for MeshCoP any border router will do, Apple's and Google's included, since
+the credentials come from the dataset rather than from the router.
 
 Verifying REST against a real border router is in docs/HARDWARE-TESTING.md.
 
