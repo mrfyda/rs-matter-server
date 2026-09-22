@@ -53,23 +53,6 @@ whatever the device does with its own signature check; and memory, because
 images run to megabytes and the store holds them in RAM for the life of the
 process.
 
-### A dual-stack mDNS browser
-
-The one-shot browser asks over IPv4 only, so everything it finds depends on an
-IPv4 answer. On an IPv6-only network nothing is found at all. It also makes one
-documented behaviour unreachable: `get_node_ip_addresses` promises the node's
-addresses "ordered as Matter dials them, link-local IPv6 first", and against a
-real device it returns the IPv4 address alone.
-
-Send the same query from an IPv6 socket to `ff02::fb` and merge the answers.
-Additive by construction — the IPv4 query keeps working if the IPv6 one cannot
-be sent — but not as small as it sounds: sending to a link-local multicast
-group needs an outgoing interface, so it means enumerating interfaces and
-sending per interface, and the merged answers need de-duplicating where both
-transports carry the same instance.
-
-Note the responder is already dual-stack; this is the browser alone.
-
 ## Deferred
 
 **Recovering a node whose device rebooted.** A device that reboots forgets its

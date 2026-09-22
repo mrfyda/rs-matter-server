@@ -12,15 +12,24 @@
 //! port, so responders answer by unicast and no multicast group has to be
 //! joined — which matters because the Matter responder may already own port
 //! 5353.
+//!
+//! The query goes out over both IP families. Matter is IPv6-first — a Thread
+//! device has no IPv4 address at all, and is only ever found through its
+//! border router's IPv6 advertisement — so a browser that asked over IPv4
+//! alone found nothing on an IPv6-only network and, against a device that
+//! answers on both, reported the IPv4 address alone. Answers from both
+//! transports are folded into one map, keyed by instance name, so a device
+//! that answers on both comes out as one instance with all its addresses.
 
 use std::collections::BTreeMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
 use std::time::Duration;
 
 use async_io::Async;
 
-/// The IPv4 mDNS group and port.
+/// The mDNS groups and port.
 const MDNS_GROUP_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
+const MDNS_GROUP_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
 const MDNS_PORT: u16 = 5353;
 
 /// Record types this browser understands.
@@ -81,30 +90,95 @@ impl ServiceInstance {
 ///
 /// Answers are aggregated across every response received in the window, since
 /// a responder may split the PTR, SRV, TXT and address records across packets.
+///
+/// One query goes out over IPv4 and one over IPv6 on every interface that has
+/// an IPv6 address. Each send is best effort — a network with only one family
+/// refuses the other's send, and that is not a failure of the browse — and
+/// only a query that could go out on neither is an error.
 pub async fn browse(service: &str, timeout: Duration) -> std::io::Result<Vec<ServiceInstance>> {
-    let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))?;
-    socket.set_nonblocking(true)?;
-    // Keep the query on the local link, as mDNS requires.
-    socket.set_multicast_ttl_v4(255)?;
-    let socket = Async::new(socket)?;
-
     let query = build_query(service);
-    socket
-        .send_to(&query, SocketAddr::from((MDNS_GROUP_V4, MDNS_PORT)))
-        .await?;
+    let mut sent = 0usize;
+    let mut last_error: Option<std::io::Error> = None;
+
+    let socket_v4 = match bind_v4() {
+        Ok(socket) => Some(socket),
+        Err(error) => {
+            log::debug!("No IPv4 socket for the mDNS query: {}", error);
+            last_error = Some(error);
+            None
+        }
+    };
+    if let Some(socket) = &socket_v4 {
+        match socket
+            .send_to(&query, SocketAddr::from((MDNS_GROUP_V4, MDNS_PORT)))
+            .await
+        {
+            Ok(_) => sent += 1,
+            Err(error) => {
+                log::debug!("The IPv4 mDNS query could not be sent: {}", error);
+                last_error = Some(error);
+            }
+        }
+    }
+
+    let socket_v6 = match bind_v6() {
+        Ok(socket) => Some(socket),
+        Err(error) => {
+            log::debug!("No IPv6 socket for the mDNS query: {}", error);
+            last_error = Some(error);
+            None
+        }
+    };
+    if let Some(socket) = &socket_v6 {
+        for target in ipv6_targets(ipv6_interfaces()) {
+            match socket.send_to(&query, SocketAddr::V6(target)).await {
+                Ok(_) => sent += 1,
+                Err(error) => {
+                    log::debug!(
+                        "The IPv6 mDNS query could not be sent on interface {}: {}",
+                        target.scope_id(),
+                        error
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+    }
+
+    if sent == 0 {
+        return Err(last_error.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no interface to send an mDNS query on",
+            )
+        }));
+    }
 
     let mut instances: BTreeMap<String, ServiceInstance> = BTreeMap::new();
-    let mut buffer = vec![0u8; 4096];
+    let mut buffer_v4 = vec![0u8; 4096];
+    let mut buffer_v6 = vec![0u8; 4096];
 
     let deadline = async {
         async_io::Timer::after(timeout).await;
     };
     let collect = async {
         loop {
-            let Ok((len, _from)) = socket.recv_from(&mut buffer).await else {
-                continue;
-            };
-            collect_answers(&buffer[..len], service, &mut instances);
+            // Whichever socket has a packet first; a socket that was not bound
+            // never does.
+            let received = futures_lite::future::or(
+                receive(socket_v4.as_ref(), &mut buffer_v4, Received::V4),
+                receive(socket_v6.as_ref(), &mut buffer_v6, Received::V6),
+            )
+            .await;
+            match received {
+                Ok(Received::V4(len)) => {
+                    collect_answers(&buffer_v4[..len], service, &mut instances)
+                }
+                Ok(Received::V6(len)) => {
+                    collect_answers(&buffer_v6[..len], service, &mut instances)
+                }
+                Err(_) => continue,
+            }
         }
     };
     futures_lite::future::or(deadline, collect).await;
@@ -115,6 +189,100 @@ pub async fn browse(service: &str, timeout: Duration) -> std::io::Result<Vec<Ser
         .into_values()
         .filter(|instance| instance.port.is_some() || !instance.addresses.is_empty())
         .collect())
+}
+
+/// Which transport a packet arrived on, and how long it was.
+enum Received {
+    V4(usize),
+    V6(usize),
+}
+
+/// Wait for one packet on a socket, or forever on a socket that was not bound.
+async fn receive(
+    socket: Option<&Async<UdpSocket>>,
+    buffer: &mut [u8],
+    tag: fn(usize) -> Received,
+) -> std::io::Result<Received> {
+    match socket {
+        Some(socket) => socket.recv_from(buffer).await.map(|(len, _from)| tag(len)),
+        None => futures_lite::future::pending().await,
+    }
+}
+
+fn bind_v4() -> std::io::Result<Async<UdpSocket>> {
+    let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))?;
+    socket.set_nonblocking(true)?;
+    // Keep the query on the local link, as mDNS requires.
+    socket.set_multicast_ttl_v4(255)?;
+    Async::new(socket)
+}
+
+fn bind_v6() -> std::io::Result<Async<UdpSocket>> {
+    let socket = UdpSocket::bind(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0))?;
+    socket.set_nonblocking(true)?;
+    {
+        let socket = socket2::SockRef::from(&socket);
+        // IPv4 has its own socket; this one is not also a mapped-IPv4 one.
+        socket.set_only_v6(true)?;
+        socket.set_multicast_hops_v6(255)?;
+    }
+    Async::new(socket)
+}
+
+/// The interfaces an IPv6 query goes out on: up, multicast-capable, neither
+/// loopback nor point-to-point, and holding an IPv6 address.
+///
+/// `ff02::fb` is link-local, so the kernel cannot route a packet to it
+/// without being told which link — hence one send per interface, and hence
+/// the indices rather than the addresses. `getifaddrs` lists one entry per
+/// address, so an interface with several appears once here.
+fn ipv6_interfaces() -> Vec<u32> {
+    use nix::net::if_::{if_nametoindex, InterfaceFlags};
+
+    let entries = match nix::ifaddrs::getifaddrs() {
+        Ok(entries) => entries,
+        Err(error) => {
+            log::debug!(
+                "Could not list interfaces for the IPv6 mDNS query: {}",
+                error
+            );
+            return Vec::new();
+        }
+    };
+    let mut indices = Vec::new();
+    for entry in entries {
+        if !entry
+            .flags
+            .contains(InterfaceFlags::IFF_UP | InterfaceFlags::IFF_MULTICAST)
+            || entry
+                .flags
+                .intersects(InterfaceFlags::IFF_LOOPBACK | InterfaceFlags::IFF_POINTOPOINT)
+        {
+            continue;
+        }
+        let has_ipv6 = entry
+            .address
+            .as_ref()
+            .and_then(|address| address.as_sockaddr_in6())
+            .is_some();
+        if !has_ipv6 {
+            continue;
+        }
+        if let Ok(index) = if_nametoindex(entry.interface_name.as_str()) {
+            if !indices.contains(&index) {
+                indices.push(index);
+            }
+        }
+    }
+    indices
+}
+
+/// The IPv6 group, once per interface, with the interface as the scope id —
+/// which is how a link-local destination names its link.
+fn ipv6_targets(interfaces: impl IntoIterator<Item = u32>) -> impl Iterator<Item = SocketAddrV6> {
+    interfaces
+        .into_iter()
+        .map(|index| SocketAddrV6::new(MDNS_GROUP_V6, MDNS_PORT, 0, index))
 }
 
 /// The service a commissioned node announces itself on.
@@ -511,6 +679,17 @@ mod tests {
 
     /// Build a response carrying PTR, SRV, TXT and A records for one instance.
     fn sample_response(service: &str, instance: &str, txt: &[(&str, &[u8])]) -> Vec<u8> {
+        response_with_address(service, instance, txt, IpAddr::from([192, 168, 1, 50]))
+    }
+
+    /// The same response, with the host's address record chosen by the
+    /// caller: an A record for an IPv4 address, an AAAA record for an IPv6 one.
+    fn response_with_address(
+        service: &str,
+        instance: &str,
+        txt: &[(&str, &[u8])],
+        address: IpAddr,
+    ) -> Vec<u8> {
         let mut message = Vec::new();
         message.extend_from_slice(&0u16.to_be_bytes()); // id
         message.extend_from_slice(&0x8400u16.to_be_bytes()); // authoritative response
@@ -552,8 +731,52 @@ mod tests {
         }
         record(&full, TYPE_TXT, &txt_data);
 
-        record(host, TYPE_A, &[192, 168, 1, 50]);
+        match address {
+            IpAddr::V4(address) => record(host, TYPE_A, &address.octets()),
+            IpAddr::V6(address) => record(host, TYPE_AAAA, &address.octets()),
+        }
         message
+    }
+
+    /// A device that answers on both transports is one instance, with the
+    /// address each transport carried — and the same address seen on both
+    /// is recorded once.
+    #[test]
+    fn answers_from_both_transports_merge_into_one_instance() {
+        let service = "_matter._tcp.local";
+        let instance = "123456789ABCDEF0-0000000000000001";
+        let over_v4 =
+            response_with_address(service, instance, &[], "192.168.1.50".parse().unwrap());
+        let over_v6 = response_with_address(service, instance, &[], "fe80::1".parse().unwrap());
+
+        let mut instances = BTreeMap::new();
+        collect_answers(&over_v4, service, &mut instances);
+        collect_answers(&over_v6, service, &mut instances);
+        collect_answers(&over_v6, service, &mut instances);
+
+        assert_eq!(instances.len(), 1);
+        let found = instances.values().next().unwrap();
+        assert_eq!(found.instance_name, instance);
+        assert_eq!(found.port, Some(49191));
+        assert_eq!(
+            found.addresses,
+            vec![
+                "192.168.1.50".parse::<IpAddr>().unwrap(),
+                "fe80::1".parse::<IpAddr>().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn the_ipv6_query_is_scoped_to_each_interface() {
+        let targets: Vec<SocketAddrV6> = ipv6_targets([2, 5]).collect();
+        assert_eq!(targets.len(), 2);
+        for (target, index) in targets.iter().zip([2u32, 5]) {
+            assert_eq!(*target.ip(), "ff02::fb".parse::<Ipv6Addr>().unwrap());
+            assert_eq!(target.port(), MDNS_PORT);
+            assert_eq!(target.scope_id(), index);
+        }
+        assert_eq!(ipv6_targets([]).count(), 0);
     }
 
     #[test]

@@ -194,16 +194,17 @@ What closing each one takes, and what it takes to prove closed, is in
    and macOS remains out of reach because the BTP Central backends are
    `target_os = "linux"`.
 
-4. **mDNS queries go out over IPv4 only.** The one-shot browser binds an IPv4
-   socket and asks the IPv4 group, so every discovery this server does —
-   `discover`, `get_thread_border_routers`, and the operational resolve behind
-   `get_node_ip_addresses` — depends on something answering over IPv4. A
-   Wi-Fi or Ethernet device does. A Thread device has no IPv4 address at all
-   and is found only because its border router advertises it on the
-   infrastructure link; on an IPv6-only network nothing would be found.
-   Closing this means sending the same query from an IPv6 socket to `ff02::fb`
-   and collecting both, which is additive — the IPv4 query is unaffected by an
-   IPv6 one failing to send.
+4. **The IPv6 leg of the mDNS browser is unverified.** The one-shot browser
+   now asks over both families — the IPv4 group, and `ff02::fb` once per
+   interface that holds an IPv6 address, with the interface as the scope id —
+   and folds both sets of answers into one instance map. Each send is best
+   effort, so a network with one family only loses nothing. But every
+   hardware run so far predates it: `discover` and `get_node_ip_addresses`
+   have only ever been seen returning the IPv4 address, and whether a real
+   device's AAAA answer now arrives, and arrives first, is what the next rig
+   has to show. A Thread device has no IPv4 address at all and is only found
+   through its border router's advertisement, so this is also the first
+   chance of finding one on an IPv6-only network.
 5. **Nothing collects Thread diagnostics yet.** The shape, the cache and the
    answers are implemented — a network is named, its batch is cached for an
    hour once complete, `force` bypasses that, and each batch is announced as
@@ -269,7 +270,7 @@ above. What is still unproven, and how to prove it, is in
 | Claim | What the device did |
 |---|---|
 | `commission_with_code` | PASE → CASE → CommissioningComplete → subscribe → interview. 5.4 s release, 6.9 s debug. Also against an *enhanced* window opened by another controller |
-| `discover` | Full TXT record, `long_discriminator` 1612 matching the pairing code's own encoding, vendor, product, port, `commissioning_mode`. IPv4 address only — gap 4 in practice |
+| `discover` | Full TXT record, `long_discriminator` 1612 matching the pairing code's own encoding, vendor, product, port, `commissioning_mode`. IPv4 address only, measured before the browser asked over IPv6 — gap 4 |
 | A device accepts a wildcard subscription | Accepted, keepalive 300 s |
 | A change made *at the device* | Button press → `attribute_updated`, on an exchange the device opened. The monitor skips subscribed nodes, so no poll was involved. This is also the proof a device can open a session *to* this node |
 | The store survives a report | **fixed** — a report carries only what changed, and was applied as a full snapshot |
