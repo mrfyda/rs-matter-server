@@ -78,6 +78,15 @@ pub async fn run(context: Arc<ServerContext>, config: MonitorConfig) {
     let mut last_polled: BTreeMap<u64, Instant> = BTreeMap::new();
 
     loop {
+        // A subscription that stopped reporting is dropped at the start of the
+        // pass, so this pass treats the node as unsubscribed and starts again.
+        // It has to happen before the node is visited: `maintain_node` replaces
+        // whatever is recorded, and a silent entry it has already replaced can
+        // no longer be named here.
+        for node_id in context.subscriptions.forget_silent() {
+            log::info!("Node {} stopped reporting; will re-subscribe", node_id);
+        }
+
         for node in context.nodes.all() {
             // Imported test nodes have no device behind them.
             if node.is_test_node() {
@@ -112,12 +121,6 @@ pub async fn run(context: Arc<ServerContext>, config: MonitorConfig) {
         // Forget nodes that have been removed, so the map cannot grow without
         // bound over a long run.
         last_polled.retain(|node_id, _| context.nodes.contains(*node_id));
-        // A subscription that stopped reporting is dropped here rather than
-        // where it is noticed, so the next pass treats the node as unsubscribed
-        // and starts again.
-        for node_id in context.subscriptions.forget_silent() {
-            log::info!("Node {} stopped reporting; will re-subscribe", node_id);
-        }
         async_io::Timer::after(config.stagger.max(Duration::from_secs(1))).await;
     }
 }
@@ -127,10 +130,12 @@ pub async fn run(context: Arc<ServerContext>, config: MonitorConfig) {
 /// A failure to *reach* the node is not followed by a read: opening the CASE
 /// session is the expensive part and it has just failed, and retrying it costs
 /// the whole retransmit budget again on an actor that serves one op at a time.
+///
+/// Whatever subscription is recorded for the node is not working, or this
+/// would not be running. It is not forgotten here: a new one replaces it on
+/// success, and on failure it stays until the pass that finds it silent, which
+/// is the pass that logs it.
 pub async fn maintain_node(context: &Arc<ServerContext>, node_id: u64) {
-    // Whatever was recorded is not working, or this would not be running.
-    context.subscriptions.forget(node_id);
-
     let first_read = context.nodes.awaiting_first_interview(node_id);
     match context
         .matter

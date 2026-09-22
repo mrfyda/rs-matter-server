@@ -70,21 +70,6 @@ transports carry the same instance.
 
 Note the responder is already dual-stack; this is the browser alone.
 
-### Cross-cluster structs in the payload registry
-
-`tools/build_registry.py` resolves a payload field's struct by looking for its
-tag enum in the same generated file. Four are defined in the shared `globals`
-module instead — `ICECandidateStruct`, `ICEServerStruct`, `ViewportStruct` and
-`TestGlobalStruct` — so the seven request fields that use them fall back to
-`other`, and their fields have to be addressed by numeric TLV tag rather than
-by name.
-
-The fix is to index tag enums across the whole generated tree rather than per
-file. Small, no hardware, no dependency decision — and it blocks the camera
-work: `IceServers` on `ProvideOffer` and `SolicitOffer`, and `IceCandidates`
-on `ProvideICECandidates`, are exactly these types. Worth doing before anyone
-tries a real WebRTC session.
-
 ## Deferred
 
 **Recovering a node whose device rebooted.** A device that reboots forgets its
@@ -94,14 +79,6 @@ on a session the device will not answer. The node stays unreachable until this
 server restarts. No per-peer eviction exists in rs-matter's public API, so the
 fix belongs upstream: mark a session expired once its MRP has given up.
 PARITY.md's gap 2 carries the trace.
-
-Two smaller things beside it *are* ours, worth doing whenever that gap is next
-opened. `ping_node` reports a dead node as reachable, because `ping` is handed
-the cached session with no round trip — it proves a session object exists, not
-that the device answers, and availability follows it. And `maintain_node`
-calls `subscriptions.forget()` before awaiting `subscribe()`, so the entry is
-gone before `forget_silent` could name it and `stopped reporting` can never be
-logged.
 
 **Bluetooth commissioning connects to nothing.** The scan matches the device
 and the handshake is composed, but no connection is ever issued at the HCI

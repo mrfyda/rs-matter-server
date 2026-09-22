@@ -39,15 +39,23 @@ async fn open<'a, C: Crypto>(
 ) -> Result<Exchange<'a>, ApiError> {
     Exchange::initiate(matter, crypto, fabric_index, node_id)
         .await
-        .map_err(|error| match error.code() {
-            ErrorCode::NoNetworkInterface | ErrorCode::NotFound | ErrorCode::RxTimeout => {
-                ApiError::node_not_resolving(node_id)
-            }
-            _ => ApiError::new(
-                ProtocolError::NodeNotReady,
-                format!("Node {} is not ready: {:?}", node_id, error.code()),
-            ),
-        })
+        .map_err(|error| reach_error(node_id, error))
+}
+
+/// Map a failure to get *anything* out of a node onto the protocol's two
+/// reachability errors. Used where no answer has arrived yet — opening the
+/// session, and waiting for the first response on it — because that is the
+/// point at which a timeout means the device, not the request, is the problem.
+fn reach_error(node_id: u64, error: rs_matter::error::Error) -> ApiError {
+    match error.code() {
+        ErrorCode::NoNetworkInterface | ErrorCode::NotFound | ErrorCode::RxTimeout => {
+            ApiError::node_not_resolving(node_id)
+        }
+        _ => ApiError::new(
+            ProtocolError::NodeNotReady,
+            format!("Node {} is not ready: {:?}", node_id, error.code()),
+        ),
+    }
 }
 
 fn im_error(context: &str, error: rs_matter::error::Error) -> ApiError {
@@ -416,16 +424,61 @@ pub async fn invoke<C: Crypto>(
     Ok(result)
 }
 
-/// Establish a CASE session as a reachability probe.
+/// Basic Information lives on the root endpoint of every node, and
+/// `ClusterRevision` is a global attribute every cluster carries: the one path
+/// a controller can read from any device without knowing anything about it.
+const BASIC_INFORMATION_CLUSTER: u32 = 40;
+const CLUSTER_REVISION_ATTRIBUTE: u32 = 0xFFFD;
+
+/// Prove the node answers.
+///
+/// Opening the exchange is not proof: `Exchange::initiate` reuses a session it
+/// already holds, and it holds one for a device that has since rebooted and
+/// forgotten it (see PARITY.md's gap 2), so a cached session says only that
+/// the node answered *once*. The read that follows has to cross the network,
+/// and MRP giving up on it is what surfaces as `RxTimeout`. Any answer counts,
+/// including a status saying the attribute could not be read: a device that
+/// declines is a device that is there.
 pub async fn ping<C: Crypto>(
     matter: &Matter<'_>,
     crypto: C,
     fabric_index: NonZeroU8,
     node_id: u64,
 ) -> Result<(), ApiError> {
-    open(matter, crypto, fabric_index, node_id)
+    let exchange = open(matter, crypto, fabric_index, node_id).await?;
+    let mut sender = exchange
+        .read_sender()
         .await
-        .map(|_| ())
+        .map_err(|e| im_error("ping exchange", e))?;
+    let paths = [AttrPath::from_gp(&rs_matter::im::GenericPath::new(
+        Some(0),
+        Some(BASIC_INFORMATION_CLUSTER),
+        Some(CLUSTER_REVISION_ATTRIBUTE),
+    ))];
+    let mut chunk = loop {
+        match sender.tx().await.map_err(|e| reach_error(node_id, e))? {
+            TxOutcome::BuildRequest(builder) => {
+                sender = builder
+                    .attr_requests_from(&paths)
+                    .map_err(|e| im_error("ping path", e))?
+                    .fabric_filtered(false)
+                    .map_err(|e| im_error("ping filter", e))?
+                    .end()
+                    .map_err(|e| im_error("ping build", e))?;
+            }
+            TxOutcome::GotResponse(chunk) => break chunk,
+        }
+    };
+    // The answer is the proof; its content is not read. The exchange is still
+    // run to completion so the device sees it closed rather than abandoned.
+    while let Some(next) = chunk
+        .complete()
+        .await
+        .map_err(|e| im_error("ping completion", e))?
+    {
+        chunk = next;
+    }
+    Ok(())
 }
 
 /// Read the paths a first interview needs: the whole of every endpoint the node

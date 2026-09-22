@@ -31,7 +31,7 @@ The `every_advertised_command_is_routed` contract test enforces that against
 | `get_node_ip_addresses` | ✅ | `prefer_cache` answers from the record; without it the node's operational instance (`<compressed-fabric-id>-<node-id>._matter._tcp`) is resolved over mDNS, ordered as Matter dials them — link-local IPv6 first — and stored. A resolve nothing answers falls back to the record and a reachability check, so a node answering CASE is not reported as address-less. |
 | `remove_node` | ✅ | Sends `RemoveFabric` to the device, then forgets it locally. A node that cannot be reached is still removed locally (and logged), so an unplugged device is not undeletable. |
 | `interview_node` | ✅ | Wildcard read of every endpoint; publishes the attribute, endpoint and node events it produced. |
-| `ping_node` | ✅ | CASE probe with `attempts`; keyed by the node's known addresses. Updates availability. |
+| `ping_node` | ✅ | Reads one attribute over CASE, with `attempts`; keyed by the node's known addresses. Updates availability. A cached session alone is not taken as proof: see gap 2. |
 | `import_test_node` | ✅ | All three Home Assistant dump shapes; ids allocated from `0xFFFF_FFFE_0000_0000`. |
 | `get_vendor_names` | ✅ | Serves the reference's static vendor table (1245 entries, decimal-keyed). A `filter_vendors` id the table does not cover is looked up in the ledger, which is where vendor ids are assigned — 161 assigned ids are missing from that table. Cached for an hour, negative answers included; an unreachable ledger drops that one id rather than failing the call. An unfiltered request answers from the table alone, as the reference does. |
 | `set_wifi_credentials` | ✅ | Named lists, write-only secrets, and the "omit the password only for an unchanged SSID" rule. |
@@ -164,14 +164,10 @@ What closing each one takes, and what it takes to prove closed, is in
 
    The monitor is *not* at fault: it marks the node unavailable, retries the
    subscribe, retries the poll, and backs off. All of that logs at `debug`,
-   so at the default level a node in this state produces silence.
-
-   Two things beside it are ours. `ping_node` answers `true` for a dead node,
-   because `ping` is handed the cached session with no round trip — it proves
-   a session object exists, not that the device answers, and availability
-   follows it. And `maintain_node` calls `subscriptions.forget()` before
-   awaiting `subscribe()`, so the entry is gone before `forget_silent` could
-   name it and `stopped reporting` can never be logged.
+   so at the default level a node in this state produces silence. `ping_node`
+   does report it: a ping reads one attribute over the session rather than
+   trusting that the session exists, so a dead node answers `false` and is
+   marked unavailable.
 
 3. **Bluetooth commissioning connects to nothing.** Everything up to the radio
    works, proven against a factory-reset plug on a Linux host with a real
@@ -284,7 +280,7 @@ above. What is still unproven, and how to prove it, is in
 | Multi-admin | Commissioned onto a second fabric from a different host; both controllers read the same two-fabric list and both drive the device |
 | The fabric label reaches the device | Read back off the device's own `OperationalCredentials.Fabrics` |
 | `device_command` | 110-144 ms including the read-back, and exactly one `attribute_updated` — the device's own report of the same change is correctly seen as no change |
-| `ping_node` | 3.4 ms reachable against a 5.0 s timeout unreachable. Note it trusts a cached session: see gap 2 |
+| `ping_node` | 3.4 ms reachable against a 5.0 s timeout unreachable. Measured before the ping read an attribute over the session; a reachable ping now costs one read round trip more |
 | `remove_node` | 1.2 s on a reachable device; on an unreachable one, removed locally after 10.0 s and logged |
 | `interview_node`, already interviewed | 265 ms and 3 events, not 179: only what changed is republished |
 | `read_attribute` | Single path, path lists, and wildcards, including live values such as RSSI |
