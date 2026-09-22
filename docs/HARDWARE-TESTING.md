@@ -227,16 +227,30 @@ by matching the accessor, so a camera not in the store reports `null` there.
 
 ### Thread diagnostics collect
 
-Hardware: an **open** border router.
-
-Nothing collects yet, so this run is reconnaissance for building the
-collector: point the border router's REST API at yourself and see what it
-actually serves.
+Hardware: an **open** border router — a Pi with an nRF52840 dongle running
+`ot-br-posix` with its REST server on, or Home Assistant's OTBR add-on —
+with a few Thread devices joined to it. Apple and Google border routers
+serve no REST API; a mesh behind one answers `no_credentials` here, which is
+correct and not what this proves.
 
 ```bash
-curl -s http://<border-router>:8081/api/diagnostics | head
 tools/ws.py get_thread_border_routers
+tools/ws.py --listen --for 60 get_thread_diagnostics ext_pan_id=<extendedPanIdHex>
 ```
+
+A pass is the first answer within about five seconds — `in_progress` with
+the nodes collected so far, or complete already on a small mesh — followed
+by `thread_diagnostics_updated` events and a final batch with no
+`partialReason` and one node per device, each with `extMacAddress`,
+`rloc16` and whatever else the device answered. Everything here was built
+against ot-br-posix's OpenAPI file and REST sources and a scripted stand-in,
+so what this run adds is the real border router: how long a task takes to
+settle, which devices' tasks end `stopped` and whether the retry catches
+them, and whether an older build is detected as the one-shot `GET
+/diagnostics` API. `Thread network <xp> has a REST border router at ...`
+in the log says which API was detected; a mesh where every task fails
+logs `none answered a diagnostic query`. The second ask within the hour must
+come back from the cache; `force=true` must probe and collect again.
 
 ### The migration is real
 

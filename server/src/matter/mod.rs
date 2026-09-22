@@ -12,6 +12,7 @@ pub mod interaction;
 pub mod mdns_browser;
 pub mod nodes;
 pub mod ota_provider;
+pub mod otbr_rest;
 pub mod reports;
 pub mod responder;
 pub mod spake2p_verifier;

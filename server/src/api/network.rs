@@ -21,11 +21,11 @@ use crate::protocol::events::Event;
 use crate::protocol::message::Args;
 use crate::protocol::model::{
     MatterNodeData, NetworkTopology, NetworkTopologyConnection, NetworkTopologyNode,
-    ThreadDiagnosticsBatch, ThreadDiagnosticsPartial, ThreadDiagnosticsSource,
     TopologyDirectionInfo,
 };
 use crate::protocol::paths::parse_path;
 
+use super::thread_diagnostics::{ThreadNetwork, FIRST_BATCH_WAIT};
 use super::{CallContext, ServerContext};
 
 const THREAD_DIAGNOSTICS_CLUSTER: u32 = 53;
@@ -147,17 +147,19 @@ fn border_router(instance: &ServiceInstance, now: i64) -> BorderRouterEntry {
 
 /// Per-network Thread diagnostics.
 ///
-/// Two forms, as the reference defines them. With an `ext_pan_id` this waits
-/// for a collection and answers with that network's batch, or `null` when
-/// there is no such network to collect from. Without one it answers with the
-/// current cache for every known network — immediately, even when that is
-/// empty — and refreshes in the background, so the fresh batches arrive as
-/// `thread_diagnostics_updated` events.
+/// Two forms, as the reference defines them. With an `ext_pan_id` this starts
+/// (or joins) that network's collection, waits a few seconds for it, and
+/// answers with the batch as it stands — complete if the mesh answered in
+/// time, `in_progress` otherwise, with the rest arriving as
+/// `thread_diagnostics_updated` events — or `null` when there is no such
+/// network to collect from. Without one it answers with the current cache for
+/// every known network — immediately, even when that is empty — and refreshes
+/// them in the background, so the fresh batches arrive as events.
 ///
 /// `force` bypasses the cache. So does an incomplete batch: a partial result
 /// records why it is partial, and a reason like "no credentials" stops being
-/// true the moment a dataset is stored, so it must not stick for the hour a
-/// complete batch would.
+/// true the moment a border router appears, so it must not stick for the hour
+/// a complete batch would.
 pub async fn get_thread_diagnostics(args: &Args, context: CallContext<'_>) -> ApiResult {
     let ext_pan_id = args.str("ext_pan_id")?.map(str::to_string);
     if let Some(ext_pan_id) = ext_pan_id.as_deref() {
@@ -193,22 +195,28 @@ pub async fn get_thread_diagnostics(args: &Args, context: CallContext<'_>) -> Ap
         }
     }
 
-    let networks = thread_networks(context.server).await;
-    let Some(network) = networks.into_iter().find(|network| network.0 == ext_pan_id) else {
+    let networks = thread_networks().await;
+    let Some(network) = networks
+        .into_iter()
+        .find(|network| network.ext_pan_id_hex == ext_pan_id)
+    else {
         // Nothing discovered claims this network, so there is nothing to
         // collect from and nothing to cache.
         return Ok(Value::Null);
     };
 
-    let batch = collect(context.server, &network);
+    let collection = context.server.thread_diagnostics.collection(
+        &network,
+        context.server.events.clone(),
+        force,
+    );
+    let batch = collection.first_batch(FIRST_BATCH_WAIT).await;
     Ok(serde_json::to_value(batch).unwrap_or(Value::Null))
 }
 
-/// A Thread network this server knows of: its extended PAN id and name.
-type ThreadNetwork = (String, String);
-
-/// Every Thread network a discovered Border Router claims to be on.
-async fn thread_networks(context: &ServerContext) -> Vec<ThreadNetwork> {
+/// Every Thread network a discovered Border Router claims to be on, with the
+/// Border Routers claiming it.
+async fn thread_networks() -> Vec<ThreadNetwork> {
     let instances = match mdns_browser::browse(MESHCOP_SERVICE, BROWSE_TIMEOUT).await {
         Ok(instances) => instances,
         Err(error) => {
@@ -216,53 +224,49 @@ async fn thread_networks(context: &ServerContext) -> Vec<ThreadNetwork> {
             return Vec::new();
         }
     };
-    let _ = context;
 
-    let mut networks: Vec<ThreadNetwork> = instances
-        .iter()
-        .filter_map(|instance| {
-            let ext_pan_id = instance.txt_hex("xp")?;
-            let name = instance.txt_str("nn").unwrap_or_default();
-            Some((ext_pan_id.to_uppercase(), name))
-        })
-        .collect();
     // One network usually has several border routers.
-    networks.sort();
-    networks.dedup_by(|a, b| a.0 == b.0);
+    let mut networks: Vec<ThreadNetwork> = Vec::new();
+    for instance in instances {
+        let Some(ext_pan_id_hex) = instance.txt_hex("xp").map(|hex| hex.to_uppercase()) else {
+            continue;
+        };
+        match networks
+            .iter_mut()
+            .find(|network| network.ext_pan_id_hex == ext_pan_id_hex)
+        {
+            Some(network) => {
+                if network.name.is_empty() {
+                    network.name = instance.txt_str("nn").unwrap_or_default();
+                }
+                network.border_routers.push(instance);
+            }
+            None => networks.push(ThreadNetwork {
+                ext_pan_id_hex,
+                name: instance.txt_str("nn").unwrap_or_default(),
+                border_routers: vec![instance],
+            }),
+        }
+    }
+    networks.sort_by(|a, b| a.ext_pan_id_hex.cmp(&b.ext_pan_id_hex));
     networks
 }
 
-/// Collect one network's diagnostics, cache the result and announce it.
-///
-/// There is no collector yet: reaching a node's diagnostics needs MeshCoP over
-/// CoAP/DTLS, authenticated with the `pskc` and `networkKey` of a stored Thread
-/// dataset, or a Border Router offering the OpenThread REST API. Until one
-/// exists every network answers the same way the reference does when it has
-/// neither — a batch naming the network, carrying no nodes, and saying why.
-fn collect(context: &ServerContext, network: &ThreadNetwork) -> ThreadDiagnosticsBatch {
-    let batch = ThreadDiagnosticsBatch {
-        ext_pan_id_hex: network.0.clone(),
-        network_name: network.1.clone(),
-        collected_at: chrono::Utc::now().timestamp_millis(),
-        source: ThreadDiagnosticsSource::None,
-        nodes: Vec::new(),
-        partial_reason: Some(ThreadDiagnosticsPartial::NoCredentials),
-    };
-
-    context.thread_diagnostics.store(batch.clone());
-    context.events.publish(Event::thread_diagnostics_updated(
-        serde_json::to_value(&batch).unwrap_or(Value::Null),
-    ));
-    batch
-}
-
-/// Refresh every known network, announcing each batch as it is produced.
+/// Start a collection for every known network that needs one. Nothing is
+/// awaited: each announces its batches as it produces them.
 async fn collect_all(context: &ServerContext, force: bool) {
-    for network in thread_networks(context).await {
-        if !force && context.thread_diagnostics.fresh(&network.0).is_some() {
+    for network in thread_networks().await {
+        if !force
+            && context
+                .thread_diagnostics
+                .fresh(&network.ext_pan_id_hex)
+                .is_some()
+        {
             continue;
         }
-        collect(context, &network);
+        let _ = context
+            .thread_diagnostics
+            .collection(&network, context.events.clone(), force);
     }
 }
 
@@ -989,6 +993,10 @@ mod tests {
         );
     }
 
+    use crate::protocol::model::{
+        ThreadDiagnosticsBatch, ThreadDiagnosticsPartial, ThreadDiagnosticsSource,
+    };
+
     fn batch(
         ext_pan_id: &str,
         partial: Option<ThreadDiagnosticsPartial>,
@@ -1038,10 +1046,18 @@ mod tests {
     #[test]
     fn a_network_with_no_credentials_reports_that() {
         let context = test_context();
-        let network = ("1122334455667788".to_string(), "MyThreadNet".to_string());
+        let network = ThreadNetwork {
+            ext_pan_id_hex: "1122334455667788".to_string(),
+            name: "MyThreadNet".to_string(),
+            border_routers: Vec::new(),
+        };
         let events = context.events.subscribe();
 
-        let batch = collect(&context, &network);
+        let collection =
+            context
+                .thread_diagnostics
+                .collection(&network, context.events.clone(), false);
+        let batch = block_on(collection.first_batch(FIRST_BATCH_WAIT));
         assert_eq!(batch.ext_pan_id_hex, "1122334455667788");
         assert_eq!(batch.network_name, "MyThreadNet");
         assert_eq!(batch.source, ThreadDiagnosticsSource::None);

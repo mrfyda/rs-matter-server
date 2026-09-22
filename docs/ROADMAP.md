@@ -6,37 +6,29 @@ shown, see [PARITY.md](../PARITY.md); for how it is put together,
 
 ## Left to build
 
-### A source for Thread diagnostics
+### MeshCoP as a second source for Thread diagnostics
 
-The contract is implemented — the batch model, the per-network cache and its
-hour of validity, `force`, both forms of `get_thread_diagnostics`, and the
-`thread_diagnostics_updated` event. Every network answers with an empty batch
-and `no_credentials`, which is what the reference answers for a network it has
-no way into. What is missing is a way in.
+Diagnostics are collected over a border router's OpenThread REST API: a
+network's border routers are probed on port 8081, the mesh is queried one
+node at a time through the task API (or in one read from an older build), and
+the batch streams — `in_progress` as nodes arrive, then complete. That covers
+an open border router: a Pi running `ot-br-posix`, or Home Assistant's OTBR
+add-on.
 
-Two exist, and the reference prefers the first:
+It does not cover a mesh whose only border routers are Apple's or Google's,
+which expose no REST API. The reference reaches those over **MeshCoP** — CoAP
+over DTLS, authenticated with the `pskc` and `networkKey` of a Thread dataset
+`set_thread_dataset` already stores — and prefers it even where REST exists,
+because the border router's task API queries the mesh one node at a time.
+Nothing in this dependency tree speaks CoAP or DTLS. Rust has no small
+pure-Rust DTLS crate: the choices are a binding to OpenSSL or mbedTLS, which
+complicates the arm64 cross-build, or `webrtc-dtls`, which is pure Rust but
+large and built for a different use. Choosing is the work; the collection
+state in `api::thread_diagnostics` already takes any source that hands over
+nodes one at a time, and the reference's `@matter/thread-br-client` is a
+complete worked example of the protocol.
 
-- **MeshCoP**, over CoAP and DTLS, authenticated with the `pskc` and
-  `networkKey` of a Thread dataset `set_thread_dataset` already stores. Nothing
-  in this dependency tree speaks either protocol, so this starts with choosing
-  what should — the largest single decision left on this list.
-- **OpenThread REST**, where a discovered border router exposes it on port
-  8081. No new dependency: `ureq` is already here. But the current API is a
-  JSON:API task collection — post a `getNetworkDiagnosticTask`, poll it, read
-  the diagnostics item it references — not the single `GET /diagnostics` older
-  documentation describes, so check what the border router in front of you
-  actually serves before writing against either.
-
-Either way, one behaviour is not built and matters as much as the source:
-collection **streams**. The reference gathers over about 20 seconds and
-publishes partial batches as nodes answer, refining `partialReason` until the
-window closes. The event and the reason it carries are in place; nothing yet
-fills them in over time.
-
-Verifying needs an **open** border router — a Pi with an nRF52840 dongle
-running `ot-br-posix`, or Home Assistant's OTBR add-on. Apple and Google
-border routers expose no REST API and hand out no credentials, so a mesh
-behind one cannot be collected from at all.
+Verifying REST against a real border router is in docs/HARDWARE-TESTING.md.
 
 ## Deferred
 

@@ -59,7 +59,7 @@ The `every_advertised_command_is_routed` contract test enforces that against
 | `update_node` | ⚠️ | Grants the node access to this server's OTA Provider cluster and invokes `AnnounceOTAProvider` on it; the device then queries, downloads over BDX, and applies on its own schedule — visible as `attribute_updated` on the requestor's `UpdateState`. An image uploaded here is served as is. One only the ledger knows about is fetched from the vendor URL the ledger publishes, checked against the ledger's SHA-256 digest and its own OTA header, and stored before the device is told — so the call takes as long as that download. A mismatch on either check is refused with error 11 and a reason. |
 | `initiate_ota_upload` | ✅ | Single-use, client-bound, expiring ticket; the HTTP endpoint parses the OTA header and stores the image. |
 | `get_thread_border_routers` | ✅ | Passive `_meshcop._udp` browse reporting extended address, extended PAN id, network name, host name, addresses and vendor/model. |
-| `get_thread_diagnostics` | ⚠️ | Both forms answer in the reference's shape: `ext_pan_id` returns that network's `ThreadDiagnosticsBatch` (or `null` when no discovered Border Router claims it), and the bare form returns the cache for every known network at once and refreshes behind it. `force` bypasses the cache, and only a *complete* batch is ever a cache hit. Nothing collects yet, so every batch is `source: "none"` with `partialReason: "no_credentials"` — see the gaps below. |
+| `get_thread_diagnostics` | ⚠️ | Both forms answer in the reference's shape: `ext_pan_id` starts or joins that network's collection, waits up to 5 s, and returns the batch as it stands (or `null` when no discovered Border Router claims the network); the bare form returns the cache for every known network at once and refreshes behind it. Collection is over a Border Router's OpenThread REST API on port 8081, task by task, streaming `in_progress` batches as `thread_diagnostics_updated` and a complete one at the end; both the task API and the older one-shot `GET /diagnostics` are spoken. `force` bypasses the cache and re-probes, and only a *complete* batch is ever a cache hit. A network with no REST Border Router answers `source: "none"`, `partialReason: "no_credentials"`, as the reference does with neither source — MeshCoP is not spoken here. Unverified against a real Border Router: see the gaps below. |
 | `get_network_topology` | ✅ | Real graph derived from the nodes' Thread and Wi-Fi diagnostics: roles, neighbour links with per-direction LQI/RSSI, route-table fallback edges, unknown Thread neighbours, and synthetic Wi-Fi access points. `refresh` re-reads the diagnostics clusters. |
 | `send_webrtc_provider_command` | ⚠️ | `ProvideOffer` and `SolicitOffer` are invoked on the camera's provider cluster, with payload fields resolved by name through the same metadata `device_command` uses. The camera's reply arrives on the `WebRTCTransportRequestor` cluster this node hosts and reaches the client as `webrtc_callback`. No camera has ever been on the other end of it. |
 | `subscribe_attribute` | ❌ | Error 9, matching the reference implementation (its docs call it a stub, but its dispatcher rejects it). |
@@ -205,24 +205,25 @@ What closing each one takes, and what it takes to prove closed, is in
    has to show. A Thread device has no IPv4 address at all and is only found
    through its border router's advertisement, so this is also the first
    chance of finding one on an IPv6-only network.
-5. **Nothing collects Thread diagnostics yet.** The shape, the cache and the
-   answers are implemented — a network is named, its batch is cached for an
-   hour once complete, `force` bypasses that, and each batch is announced as
-   an event. What is missing is a source, so every batch says `no_credentials`
-   and carries no nodes.
+5. **Thread diagnostics have not met a Border Router.** Collection over the
+   OpenThread REST API is built — probe `/node` on each Border Router's
+   routable addresses, refresh the device directory, one
+   `getNetworkDiagnosticTask` per device with the type names ot-br-posix's
+   own source accepts, read each result item as it completes, and fall back
+   to the older `GET /diagnostics` on a build that predates the task API —
+   and it streams, publishing `in_progress` batches as nodes arrive and a
+   complete one when the sweep ends. All of it is exercised against a
+   scripted stand-in for the Border Router, built from ot-br-posix's OpenAPI
+   file and REST sources; none of it against the real thing, whose
+   timings, task failures and per-build quirks are what the stand-in
+   cannot know. See docs/HARDWARE-TESTING.md.
 
-   Two sources exist, and the reference prefers the first. **MeshCoP** over
-   CoAP/DTLS, authenticated with the `pskc` and `networkKey` of a stored Thread
-   dataset: no CoAP or DTLS client is in this dependency tree, so this is a
-   dependency decision as much as a coding one. **OpenThread REST**, where a
-   Border Router exposes it on port 8081: ordinary HTTP against a client this
-   server already has, but the current API is a JSON:API task collection —
-   post an action, poll it, read the result — rather than the single GET older
-   documentation describes.
-
-   The reference also collects over a ~20 second streaming window, publishing
-   partial batches as nodes answer. The event and the `partialReason` that
-   carries are in place; nothing yet streams into them.
+   **MeshCoP is not spoken.** The reference prefers it and it is the only way
+   into a mesh behind an Apple or Google Border Router, which expose no REST
+   API. Such a network answers `no_credentials` here, exactly as the
+   reference does when it has neither source. Adding MeshCoP is a
+   dependency decision — CoAP over DTLS — before it is a coding one; the
+   roadmap has the options.
 6. **No update has run against a device.** The whole provider side is built —
    `matter::responder` hosts the OTA Software Update Provider cluster,
    `update_node` grants the device access and announces this server to it,
