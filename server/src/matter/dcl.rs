@@ -9,11 +9,19 @@
 //!
 //! It is also the registry a vendor id is assigned in, so it can name a vendor
 //! that shipped after the reference's static table was last cut.
+//!
+//! The ledger publishes where an image is and what its digest is, not the
+//! image: serving one means fetching it from the vendor's CDN and checking it
+//! against that digest. `download_image` does exactly that, and refuses to
+//! hand back bytes that do not match — whatever a device would make of them.
 
+use std::io::Read;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use base64::Engine;
+use serde::{Deserialize, Deserializer};
+use sha2::{Digest, Sha256};
 
 use crate::protocol::error::ApiError;
 use crate::protocol::model::{MatterSoftwareVersion, UpdateSource};
@@ -24,6 +32,15 @@ pub const MAIN_NET_URL: &str = "https://on.dcl.csa-iot.org";
 pub const TEST_NET_URL: &str = "https://on.test-net.dcl.csa-iot.org";
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long fetching an image may take end to end. Images run to megabytes
+/// and vendor CDNs are of very different speeds, so this is generous; it is a
+/// bound on a stalled transfer, not a budget.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+/// `otaChecksumType` 1: SHA-256 over the whole file. The other values the
+/// specification allows are truncated SHA-256 and SHA-3 variants, which nothing
+/// in the ledger uses; an image published with one is refused rather than
+/// served unchecked.
+const CHECKSUM_SHA256: u32 = 1;
 /// How long a lookup is reused. Clients poll for updates on a timer, and the
 /// ledger changes at the pace of firmware releases, so this keeps a
 /// once-a-minute client from becoming once-a-minute traffic to the CSA.
@@ -67,6 +84,58 @@ struct ModelVersion {
     max_applicable_software_version: u64,
     #[serde(rename = "releaseNotesUrl", default)]
     release_notes_url: String,
+    /// The ledger sends this as a decimal string; zero means unpublished.
+    #[serde(rename = "otaFileSize", default, deserialize_with = "lenient_u64")]
+    ota_file_size: Option<u64>,
+    /// Base64 of the digest, as the ledger stores it.
+    #[serde(rename = "otaChecksum", default)]
+    ota_checksum: String,
+    #[serde(rename = "otaChecksumType", default)]
+    ota_checksum_type: u32,
+}
+
+/// A number the ledger may send as a JSON number or as a decimal string, and
+/// where zero means "not given".
+fn lenient_u64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::Number(number)) => number.as_u64(),
+        Some(serde_json::Value::String(text)) => text.trim().parse().ok(),
+        _ => None,
+    }
+    .filter(|size| *size > 0))
+}
+
+/// Where a published image is, and how to know the bytes that arrive are it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublishedImage {
+    pub version: MatterSoftwareVersion,
+    pub url: String,
+    /// The size the ledger publishes, when it publishes one.
+    pub size: Option<u64>,
+    pub sha256: [u8; 32],
+}
+
+/// The digest as the ledger encodes it — base64, per the schema — or as the
+/// 64 hex characters a hand-entered record sometimes carries instead.
+fn decode_digest(text: &str) -> Option<[u8; 32]> {
+    let text = text.trim();
+    // Base64 first, but only a 32-byte result counts: 64 hex characters are
+    // also well-formed base64, of the wrong length.
+    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(text) {
+        if let Ok(digest) = <[u8; 32]>::try_from(bytes) {
+            return Some(digest);
+        }
+    }
+    if text.len() != 64 || !text.is_ascii() {
+        return None;
+    }
+    (0..64)
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok())
+        .collect::<Option<Vec<u8>>>()?
+        .try_into()
+        .ok()
 }
 
 impl ModelVersion {
@@ -80,6 +149,36 @@ impl ModelVersion {
             // A version with no image published cannot be delivered to
             // anything, so it is not an available update.
             && !self.ota_url.is_empty()
+    }
+
+    /// The image this version publishes, or `None` when it publishes none.
+    ///
+    /// An image whose digest cannot be checked here is an error rather than
+    /// `None`: it exists, and the caller should say why it will not be served.
+    fn published_image(self, source: UpdateSource) -> Result<Option<PublishedImage>, ApiError> {
+        if self.ota_url.is_empty() {
+            return Ok(None);
+        }
+        if self.ota_checksum_type != CHECKSUM_SHA256 {
+            return Err(ApiError::update(format!(
+                "The ledger publishes version {} with checksum type {}, and only SHA-256 \
+                 (type 1) can be verified here; refusing to serve an unverified image",
+                self.software_version, self.ota_checksum_type
+            )));
+        }
+        let sha256 = decode_digest(&self.ota_checksum).ok_or_else(|| {
+            ApiError::update(format!(
+                "The ledger's checksum for version {} is not a SHA-256 digest; refusing to \
+                 serve an unverified image",
+                self.software_version
+            ))
+        })?;
+        Ok(Some(PublishedImage {
+            url: self.ota_url.clone(),
+            size: self.ota_file_size,
+            sha256,
+            version: self.into_wire(source),
+        }))
     }
 
     fn into_wire(self, source: UpdateSource) -> MatterSoftwareVersion {
@@ -286,12 +385,38 @@ impl DclClient {
         candidates.sort_unstable_by(|a, b| b.cmp(a));
 
         for candidate in candidates {
-            let model = self.model_version(vid, pid, candidate)?;
+            let Some(model) = self.model_version(vid, pid, candidate)? else {
+                continue;
+            };
             if model.applies_to(current_version) {
                 return Ok(Some(model.into_wire(self.source)));
             }
         }
         Ok(None)
+    }
+
+    /// The image the ledger publishes for one specific version, if that version
+    /// applies to a device running `current_version` and comes with an image.
+    ///
+    /// Not cached: this is asked once, when an update is actually being
+    /// applied, and it precedes a download that dwarfs it.
+    ///
+    /// This performs blocking HTTP, so it must be called from a connection
+    /// thread and never from the Matter executor.
+    pub fn published_image(
+        &self,
+        vid: u16,
+        pid: u16,
+        software_version: u64,
+        current_version: u64,
+    ) -> Result<Option<PublishedImage>, ApiError> {
+        let Some(model) = self.model_version(vid, pid, software_version)? else {
+            return Ok(None);
+        };
+        if !model.applies_to(current_version) {
+            return Ok(None);
+        }
+        model.published_image(self.source)
     }
 
     fn software_versions(&self, vid: u16, pid: u16) -> Result<Vec<u64>, ApiError> {
@@ -316,27 +441,103 @@ impl DclClient {
         }
     }
 
+    /// One published version; `None` when the ledger has no such entry.
     fn model_version(
         &self,
         vid: u16,
         pid: u16,
         software_version: u64,
-    ) -> Result<ModelVersion, ApiError> {
+    ) -> Result<Option<ModelVersion>, ApiError> {
         let url = format!(
             "{}/dcl/model/versions/{}/{}/{}",
             self.base_url, vid, pid, software_version
         );
-        let response = ureq::get(&url)
-            .timeout(REQUEST_TIMEOUT)
-            .call()
-            .map_err(|error| {
-                ApiError::update_check(format!("Could not reach the update registry: {}", error))
-            })?;
+        let response = match ureq::get(&url).timeout(REQUEST_TIMEOUT).call() {
+            Ok(response) => response,
+            Err(ureq::Error::Status(404, _)) => return Ok(None),
+            Err(error) => {
+                return Err(ApiError::update_check(format!(
+                    "Could not reach the update registry: {}",
+                    error
+                )))
+            }
+        };
         let parsed: ModelVersionResponse = response.into_json().map_err(|error| {
             ApiError::update_check(format!("The update registry replied unreadably: {}", error))
         })?;
-        Ok(parsed.model_version)
+        Ok(Some(parsed.model_version))
     }
+}
+
+/// Fetch a published image and prove it is the one the ledger describes.
+///
+/// The bytes come back only if they hash to the ledger's digest; a mismatch,
+/// a truncated transfer, or a body longer than `max_size` is an error, and
+/// nothing is kept. `max_size` bounds memory, because the caller holds the
+/// image whole for the life of the process — a mismatch there is refused
+/// before a byte is read when the ledger publishes the size, and as soon as the
+/// limit is crossed when it does not.
+///
+/// This performs blocking HTTP, so it must be called from a connection thread
+/// and never from the Matter executor.
+pub fn download_image(image: &PublishedImage, max_size: u64) -> Result<Vec<u8>, ApiError> {
+    if let Some(size) = image.size {
+        if size > max_size {
+            return Err(ApiError::update(format!(
+                "The ledger says the image is {} bytes, above this server's {} byte limit",
+                size, max_size
+            )));
+        }
+    }
+
+    let response = ureq::get(&image.url)
+        .timeout(DOWNLOAD_TIMEOUT)
+        .call()
+        .map_err(|error| {
+            ApiError::update(format!(
+                "Could not fetch the image from {}: {}",
+                image.url, error
+            ))
+        })?;
+
+    let mut bytes = Vec::new();
+    // One byte past the limit is enough to know the limit was crossed.
+    response
+        .into_reader()
+        .take(max_size.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            ApiError::update(format!(
+                "The image could not be read from {}: {}",
+                image.url, error
+            ))
+        })?;
+    if bytes.len() as u64 > max_size {
+        return Err(ApiError::update(format!(
+            "The image from {} is larger than this server's {} byte limit",
+            image.url, max_size
+        )));
+    }
+    if let Some(size) = image.size {
+        if bytes.len() as u64 != size {
+            return Err(ApiError::update(format!(
+                "The image from {} is {} bytes, but the ledger says {}",
+                image.url,
+                bytes.len(),
+                size
+            )));
+        }
+    }
+
+    let digest = Sha256::digest(&bytes);
+    if digest[..] != image.sha256[..] {
+        return Err(ApiError::update(format!(
+            "The image from {} does not match the digest the ledger publishes; refusing to \
+             serve it",
+            image.url
+        )));
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -355,7 +556,169 @@ mod tests {
             min_applicable_software_version: min,
             max_applicable_software_version: max,
             release_notes_url: String::new(),
+            ota_file_size: None,
+            ota_checksum: String::new(),
+            ota_checksum_type: 0,
         }
+    }
+
+    /// A captured `/dcl/model/versions/<vid>/<pid>/<version>` answer for a
+    /// product that publishes an image: what the fields look like on the wire,
+    /// the size as a string included.
+    const PUBLISHED: &str = r#"{"modelVersion":{"vid":4447,"pid":8194,"softwareVersion":1020,
+        "softwareVersionString":"1.0.2.0","cdVersionNumber":1,"firmwareInformation":"",
+        "softwareVersionValid":true,
+        "otaUrl":"https://cdn.example.test/aqara.matter.4447_8194_1.0.2.0.ota",
+        "otaFileSize":"615200","otaChecksum":"udgppdjbZz7SaWPUoFp9us9Isl/AsThTZrSzbRUTXQo=",
+        "otaChecksumType":1,"minApplicableSoftwareVersion":1011,
+        "maxApplicableSoftwareVersion":1020,"releaseNotesUrl":"","creator":"cosmos1q",
+        "schemaVersion":0,"specificationVersion":0}}"#;
+
+    /// Serve one HTTP response on a local port and hand back its URL.
+    fn serve_once(status: &str, body: Vec<u8>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/image.ota", listener.local_addr().unwrap());
+        let status = status.to_string();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            let head = format!(
+                "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                status,
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&body);
+        });
+        url
+    }
+
+    fn published(url: &str, size: Option<u64>, bytes: &[u8]) -> PublishedImage {
+        PublishedImage {
+            version: model(20, url, 1, 100).into_wire(UpdateSource::MainNetDcl),
+            url: url.to_string(),
+            size,
+            sha256: Sha256::digest(bytes).into(),
+        }
+    }
+
+    #[test]
+    fn a_ledger_entry_with_an_image_yields_its_url_size_and_digest() {
+        let parsed: ModelVersionResponse = serde_json::from_str(PUBLISHED).unwrap();
+        let image = parsed
+            .model_version
+            .published_image(UpdateSource::MainNetDcl)
+            .unwrap()
+            .expect("an image is published");
+        assert_eq!(
+            image.url,
+            "https://cdn.example.test/aqara.matter.4447_8194_1.0.2.0.ota"
+        );
+        assert_eq!(image.size, Some(615200));
+        assert_eq!(image.sha256[..4], [0xb9, 0xd8, 0x29, 0xa5]);
+        assert_eq!(image.version.software_version, 1020);
+        assert_eq!(image.version.update_source, UpdateSource::MainNetDcl);
+    }
+
+    #[test]
+    fn a_version_without_an_image_publishes_none() {
+        let none = model(20, "", 1, 100)
+            .published_image(UpdateSource::MainNetDcl)
+            .unwrap();
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn an_unverifiable_checksum_is_refused_rather_than_ignored() {
+        let mut other_type = model(20, "https://example.test/image.ota", 1, 100);
+        other_type.ota_checksum = "udgppdjbZz7SaWPUoFp9us9Isl/AsThTZrSzbRUTXQo=".into();
+        other_type.ota_checksum_type = 7;
+        let error = other_type
+            .published_image(UpdateSource::MainNetDcl)
+            .unwrap_err();
+        assert_eq!(error.code.as_i64(), 11);
+        assert!(error.details.contains("checksum type 7"));
+
+        let mut garbage = model(20, "https://example.test/image.ota", 1, 100);
+        garbage.ota_checksum = "not a digest".into();
+        garbage.ota_checksum_type = 1;
+        assert!(garbage.published_image(UpdateSource::MainNetDcl).is_err());
+    }
+
+    #[test]
+    fn a_hex_digest_is_accepted_beside_the_base64_one() {
+        let hex =
+            "b9d829a5d8db673ed26963d4a05a7dbacf48b25fc0b138536 6b4b36d15135d0a".replace(' ', "");
+        let mut version = model(20, "https://example.test/image.ota", 1, 100);
+        version.ota_checksum = hex;
+        version.ota_checksum_type = 1;
+        let image = version
+            .published_image(UpdateSource::MainNetDcl)
+            .unwrap()
+            .unwrap();
+        assert_eq!(image.sha256[..4], [0xb9, 0xd8, 0x29, 0xa5]);
+        assert_eq!(image.sha256[31], 0x0a);
+    }
+
+    #[test]
+    fn a_download_that_matches_the_digest_is_returned_whole() {
+        let bytes: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+        let url = serve_once("200 OK", bytes.clone());
+        let image = published(&url, Some(bytes.len() as u64), &bytes);
+        assert_eq!(download_image(&image, 1 << 20).unwrap(), bytes);
+    }
+
+    #[test]
+    fn a_download_that_does_not_match_the_digest_is_refused() {
+        let bytes = b"firmware that was tampered with".to_vec();
+        let url = serve_once("200 OK", bytes.clone());
+        let mut image = published(&url, None, &bytes);
+        image.sha256[0] ^= 0xff;
+        let error = download_image(&image, 1 << 20).unwrap_err();
+        assert_eq!(error.code.as_i64(), 11);
+        assert!(error.details.contains("digest"), "{}", error.details);
+    }
+
+    #[test]
+    fn a_download_of_the_wrong_size_is_refused_before_it_is_hashed() {
+        let bytes = b"short".to_vec();
+        let url = serve_once("200 OK", bytes.clone());
+        let image = published(&url, Some(999), &bytes);
+        let error = download_image(&image, 1 << 20).unwrap_err();
+        assert!(
+            error.details.contains("the ledger says 999"),
+            "{}",
+            error.details
+        );
+    }
+
+    #[test]
+    fn a_download_past_the_size_limit_is_refused() {
+        let bytes = vec![7u8; 100];
+        // Published as larger than the limit: refused without a request.
+        let image = published("http://127.0.0.1:9/never", Some(200), &bytes);
+        assert!(download_image(&image, 150)
+            .unwrap_err()
+            .details
+            .contains("limit"));
+        // Not published: refused once the limit is crossed.
+        let url = serve_once("200 OK", bytes.clone());
+        let image = published(&url, None, &bytes);
+        assert!(download_image(&image, 50)
+            .unwrap_err()
+            .details
+            .contains("limit"));
+    }
+
+    #[test]
+    fn an_unreachable_image_names_its_url() {
+        let url = serve_once("404 Not Found", b"gone".to_vec());
+        let image = published(&url, None, b"whatever");
+        let error = download_image(&image, 1 << 20).unwrap_err();
+        assert_eq!(error.code.as_i64(), 11);
+        assert!(error.details.contains(&url), "{}", error.details);
     }
 
     #[test]

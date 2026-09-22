@@ -38,21 +38,6 @@ running `ot-br-posix`, or Home Assistant's OTBR add-on. Apple and Google
 border routers expose no REST API and hand out no credentials, so a mesh
 behind one cannot be collected from at all.
 
-### Serving an update the ledger knows about
-
-`update_node` serves images uploaded through `POST /ota-upload/<id>`, and
-refuses a version only the CSA ledger knows about. The ledger publishes a URL
-and a digest, not the image, so serving one means fetching it from the vendor's
-CDN, checking it against that digest, and storing it as though it had been
-uploaded — at which point everything already built takes over.
-
-rs-matter's `ota_prov::dcl` module is a worked example of exactly this, behind
-its `ota-dcl` feature, over a pluggable HTTPS client. Two things deserve care:
-the digest check, because an unverified image must never reach a device
-whatever the device does with its own signature check; and memory, because
-images run to megabytes and the store holds them in RAM for the life of the
-process.
-
 ## Deferred
 
 **Recovering a node whose device rebooted.** A device that reboots forgets its

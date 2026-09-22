@@ -3,17 +3,20 @@
 //! Update *discovery* works against two sources: the local image store, where
 //! an image uploaded through `POST /ota-upload/<id>` is matched to a node by
 //! the vendor id, product id and software version parsed from its header, and
-//! the CSA ledger, which names versions it does not hold. Distribution follows
-//! only for the first: `update_node` grants the node access to the OTA
+//! the CSA ledger, which names versions it does not hold. Distribution is
+//! always from the store: `update_node` grants the node access to the OTA
 //! Provider cluster `matter::responder` hosts and announces this server to it,
 //! and the device fetches the image over BDX on its own schedule. A version
-//! only the ledger knows about is refused with the documented update error
-//! rather than announcing a provider with nothing to send.
+//! only the ledger knows about is fetched first — from the vendor's URL the
+//! ledger publishes, checked against the digest it publishes beside it, and
+//! stored as though it had been uploaded — so a provider is never announced
+//! with nothing to send, and never sends bytes the ledger did not vouch for.
 //!
 //! The store is in memory. Images are held for the life of the process, are
 //! not written to the storage directory, and are not evicted once a device has
 //! taken one — so a restart between the upload and the update means uploading
-//! again, and a long-running server holds every image it was ever given.
+//! (or fetching) again, and a long-running server holds every image it was
+//! ever given.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -21,12 +24,13 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::matter::dcl;
 use crate::matter::tlv_json::TlvNode;
 use crate::protocol::error::{ApiError, ApiResult};
 use crate::protocol::message::Args;
 use crate::protocol::model::{MatterSoftwareVersion, OtaUploadTicket, UpdateSource};
 
-use super::{require_node, CallContext};
+use super::{require_node, CallContext, ServerContext};
 
 /// How long a reserved upload id stays valid.
 const UPLOAD_TTL: Duration = Duration::from_secs(60);
@@ -298,6 +302,11 @@ pub async fn check_node_update(args: &Args, context: CallContext<'_>) -> ApiResu
 /// device's own schedule, and are visible as they happen: the OTA Requestor
 /// cluster's `UpdateState` and `UpdateStateProgress` attributes are part of
 /// the node's subscription, so they arrive as `attribute_updated` events.
+///
+/// An image uploaded here is preferred, as the reference prefers it. Failing
+/// that, one the ledger publishes is fetched and verified before the device is
+/// told anything, which makes this call as slow as that download when it
+/// happens: the alternative is a provider announced with nothing to send.
 pub async fn update_node(args: &Args, context: CallContext<'_>) -> ApiResult {
     let node_id = require_node(args, context)?;
     if !context.server.runtime.ota_enabled {
@@ -323,25 +332,25 @@ pub async fn update_node(args: &Args, context: CallContext<'_>) -> ApiResult {
     };
 
     // Only an image this server holds can be served: the ledger says an update
-    // exists, not what is in it, and a provider with nothing to send would
-    // leave the device retrying against a promise.
-    let offered = context
+    // exists and where, not what is in it, and a provider with nothing to send
+    // would leave the device retrying against a promise. So an image the store
+    // lacks is fetched into it first, or the call fails here.
+    let local = context
         .server
         .ota
         .best_match(vendor_id as u16, product_id as u16, current_version)
-        .filter(|image| requested.is_none_or(|version| image.software_version == version))
-        .ok_or_else(|| {
-            ApiError::update(match requested {
-                Some(version) => format!(
-                    "No image for version {} of node {} has been uploaded to this server",
-                    version, node_id
-                ),
-                None => format!(
-                    "No image newer than {} has been uploaded for node {}",
-                    current_version, node_id
-                ),
-            })
-        })?;
+        .filter(|image| requested.is_none_or(|version| image.software_version == version));
+    let offered = match local {
+        Some(image) => image,
+        None => fetch_from_ledger(
+            context.server,
+            node_id,
+            vendor_id as u16,
+            product_id as u16,
+            current_version,
+            requested,
+        )?,
+    };
 
     // The device is about to invoke on this node, and an incoming invoke is
     // access-controlled: without this it would be refused by its own
@@ -377,6 +386,87 @@ pub async fn update_node(args: &Args, context: CallContext<'_>) -> ApiResult {
         offered.software_version
     );
     Ok(serde_json::to_value(offered).unwrap_or(Value::Null))
+}
+
+/// Bring an image the ledger publishes into the store, verified.
+///
+/// The version is the one asked for, or else the newest the ledger considers
+/// applicable to what the device runs. The bytes are checked twice before they
+/// are kept: against the ledger's digest, so a CDN cannot substitute them, and
+/// against their own OTA header, so a ledger entry pointing at the wrong file
+/// is caught before a device is offered it. Every failure is the documented
+/// update error, and says which step refused.
+fn fetch_from_ledger(
+    server: &ServerContext,
+    node_id: u64,
+    vendor_id: u16,
+    product_id: u16,
+    current_version: u64,
+    requested: Option<u64>,
+) -> Result<MatterSoftwareVersion, ApiError> {
+    let as_update_error = |error: ApiError| ApiError::update(error.details);
+
+    let version = match requested {
+        Some(version) => version,
+        None => server
+            .check_dcl(vendor_id, product_id, current_version)
+            .map_err(as_update_error)?
+            .map(|update| update.software_version)
+            .ok_or_else(|| {
+                ApiError::update(format!(
+                    "No image newer than {} has been uploaded for node {}, and the ledger \
+                     publishes none that applies",
+                    current_version, node_id
+                ))
+            })?,
+    };
+
+    let published = server
+        .published_image(vendor_id, product_id, version, current_version)
+        .map_err(as_update_error)?
+        .ok_or_else(|| {
+            ApiError::update(format!(
+                "No image for version {} of node {} has been uploaded to this server, and the \
+                 ledger publishes none that applies to what it runs",
+                version, node_id
+            ))
+        })?;
+
+    log::info!(
+        "Fetching version {} for node {} from {}",
+        version,
+        node_id,
+        published.url
+    );
+    let bytes = dcl::download_image(&published, MAX_UPLOAD_SIZE)?;
+
+    let header = parse_ota_header(&bytes).map_err(|error| {
+        ApiError::update(format!(
+            "The image the ledger publishes for version {} is not a Matter OTA file: {}",
+            version, error.details
+        ))
+    })?;
+    if header.vid != vendor_id || header.pid != product_id || header.software_version != version {
+        return Err(ApiError::update(format!(
+            "The image the ledger publishes for version {} is for vendor 0x{:04x} product \
+             0x{:04x} version {}, not this node's product",
+            version, header.vid, header.pid, header.software_version
+        )));
+    }
+
+    log::info!(
+        "Stored OTA image for vendor 0x{:04x} product 0x{:04x} version {} ({} bytes) from the \
+         ledger",
+        vendor_id,
+        product_id,
+        version,
+        bytes.len()
+    );
+    server.ota.store(StoredImage {
+        version: published.version.clone(),
+        bytes,
+    });
+    Ok(published.version)
 }
 
 /// Reserve an id for an image upload over HTTP.
@@ -662,9 +752,9 @@ mod tests {
         assert!(error.details.contains("has not been interviewed"));
     }
 
-    /// The ledger knowing about an update is not the same as this server
-    /// having the image: a device pointed at a provider with nothing to send
-    /// would retry against a promise.
+    /// Nothing uploaded, and nothing in a ledger to fetch: a test vendor with
+    /// the test ledger off has no ledger at all, so this resolves without
+    /// touching the network, and the refusal says both halves.
     #[test]
     fn updating_to_a_version_no_image_was_uploaded_for_is_refused() {
         let context = test_context();
@@ -682,6 +772,11 @@ mod tests {
         assert_eq!(error.code.as_i64(), 11);
         assert!(
             error.details.contains("has been uploaded"),
+            "{}",
+            error.details
+        );
+        assert!(
+            error.details.contains("ledger publishes none"),
             "{}",
             error.details
         );

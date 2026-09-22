@@ -44,6 +44,9 @@ ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 
 # Utilities
 base64 = "0.22"
+# SHA-256, to check a firmware image fetched from a vendor's CDN against the
+# digest the CSA ledger publishes for it before it is ever served to a device.
+sha2 = "0.10"
 # Gzip, for reading matterjs-server's compressed storage snapshots during an
 # import. `rust_backend` keeps this pure Rust — no zlib to cross-compile.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

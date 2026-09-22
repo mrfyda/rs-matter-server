@@ -87,6 +87,17 @@ image large enough for the BDX transfer to span many blocks, and the restart
 case — the image store is in memory, so a server restarted between the upload
 and the update has nothing to serve.
 
+Then the same without the upload, against a product whose vendor publishes
+an image in the ledger: `check_node_update` must report it with
+`update_source: "main-net-dcl"`, and `update_node` must fetch it before
+answering, which is visible as the call taking as long as the download and
+as a `Stored OTA image ... from the ledger` line in the log. A pass is the
+same `UpdateState` walk afterwards. The fetch is verified against a local
+server only; a real CDN that redirects, throttles, or serves a file whose
+header disagrees with the ledger is what this run adds. Aqara's
+`4447/8194` is one product with a published image, though its entry is
+marked invalid and so is not offered.
+
 ### Nested payload fields resolve by name
 
 Rig: `lock-app` or `thermostat-app`.

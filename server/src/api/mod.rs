@@ -278,16 +278,42 @@ impl ServerContext {
         product_id: u16,
         current_version: u64,
     ) -> Result<Option<crate::protocol::model::MatterSoftwareVersion>, ApiError> {
-        if is_test_vendor(vendor_id) {
-            return match &self.test_dcl {
-                Some(client) => client.check_update(vendor_id, product_id, current_version),
-                // A test device is not in the production ledger, so querying
-                // it would only produce a misleading "up to date".
-                None => Ok(None),
-            };
+        match self.ledger_for(vendor_id) {
+            Some(client) => client.check_update(vendor_id, product_id, current_version),
+            None => Ok(None),
         }
-        self.dcl
-            .check_update(vendor_id, product_id, current_version)
+    }
+
+    /// The image a ledger publishes for one version of a product, if that
+    /// version applies to a device on `current_version`. `None` for a test
+    /// vendor with the test ledger off, as with `check_dcl`.
+    ///
+    /// This performs blocking HTTP and must be called from a connection
+    /// thread, never from the Matter executor.
+    pub fn published_image(
+        &self,
+        vendor_id: u16,
+        product_id: u16,
+        software_version: u64,
+        current_version: u64,
+    ) -> Result<Option<crate::matter::dcl::PublishedImage>, ApiError> {
+        match self.ledger_for(vendor_id) {
+            Some(client) => {
+                client.published_image(vendor_id, product_id, software_version, current_version)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Which ledger speaks for a vendor: the test ledger for a test vendor id,
+    /// when it is enabled, and the production one otherwise. A test device is
+    /// not in the production ledger, so querying it would only produce a
+    /// misleading "up to date".
+    fn ledger_for(&self, vendor_id: u16) -> Option<&DclClient> {
+        if is_test_vendor(vendor_id) {
+            return self.test_dcl.as_ref();
+        }
+        Some(&self.dcl)
     }
 
     /// The name a ledger has for a vendor id, for the ids the reference's

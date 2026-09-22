@@ -56,7 +56,7 @@ The `every_advertised_command_is_routed` contract test enforces that against
 | `unregister_icd` | ✅ | `force` skips the peer round-trip. The stored check-in key is dropped either way. |
 | `resync_icd` | ✅ | Unregisters and reconnects; answers `null`. |
 | `check_node_update` | ✅ | Locally uploaded images first, then the CSA Distributed Compliance Ledger (cached for an hour). Test vendor ids use the test ledger only with `--enable-test-net-dcl`. A version with no published image is not reported as an update. |
-| `update_node` | ⚠️ | Grants the node access to this server's OTA Provider cluster and invokes `AnnounceOTAProvider` on it; the device then queries, downloads over BDX, and applies on its own schedule — visible as `attribute_updated` on the requestor's `UpdateState`. Only an image uploaded here can be served: an update the ledger merely knows about is refused with error 11 and a reason. |
+| `update_node` | ⚠️ | Grants the node access to this server's OTA Provider cluster and invokes `AnnounceOTAProvider` on it; the device then queries, downloads over BDX, and applies on its own schedule — visible as `attribute_updated` on the requestor's `UpdateState`. An image uploaded here is served as is. One only the ledger knows about is fetched from the vendor URL the ledger publishes, checked against the ledger's SHA-256 digest and its own OTA header, and stored before the device is told — so the call takes as long as that download. A mismatch on either check is refused with error 11 and a reason. |
 | `initiate_ota_upload` | ✅ | Single-use, client-bound, expiring ticket; the HTTP endpoint parses the OTA header and stores the image. |
 | `get_thread_border_routers` | ✅ | Passive `_meshcop._udp` browse reporting extended address, extended PAN id, network name, host name, addresses and vendor/model. |
 | `get_thread_diagnostics` | ⚠️ | Both forms answer in the reference's shape: `ext_pan_id` returns that network's `ThreadDiagnosticsBatch` (or `null` when no discovered Border Router claims it), and the bare form returns the cache for every known network at once and refreshes behind it. `force` bypasses the cache, and only a *complete* batch is ever a cache hit. Nothing collects yet, so every batch is `source: "none"` with `partialReason: "no_credentials"` — see the gaps below. |
@@ -223,20 +223,21 @@ What closing each one takes, and what it takes to prove closed, is in
    The reference also collects over a ~20 second streaming window, publishing
    partial batches as nodes answer. The event and the `partialReason` that
    carries are in place; nothing yet streams into them.
-6. **An update the ledger knows about cannot be installed.** The whole
-   provider side works — `matter::responder` hosts the OTA Software Update
-   Provider cluster, `update_node` grants the device access and announces this
-   server to it, and the image goes out over BDX — but only for an image that
-   was uploaded here through `POST /ota-upload/<id>`. `check_node_update` also
-   reports updates found in the CSA ledger, and those cannot be served: the
-   ledger says an image exists and where, not what is in it, so serving one
-   means fetching it from the vendor's CDN first and checking it against the
-   digest the ledger publishes. Until that exists, `update_node` refuses a
-   ledger-only version rather than announcing a provider with nothing to send.
+6. **No update has run against a device.** The whole provider side is built —
+   `matter::responder` hosts the OTA Software Update Provider cluster,
+   `update_node` grants the device access and announces this server to it,
+   and the image goes out over BDX — for an image uploaded here through
+   `POST /ota-upload/<id>` and, now, for one the CSA ledger publishes: it is
+   fetched from the vendor's URL, checked against the ledger's SHA-256 digest
+   and its own OTA header, and stored as though it had been uploaded. Only
+   SHA-256 (`otaChecksumType` 1) is verified; a version published with any
+   other type is refused rather than served unchecked.
 
-   None of this has run against a device. The image store, the designator
-   parsing and the access grant are unit-tested; the flow through a real
-   requestor is not.
+   The image store, the digest check, the fetch and the access grant are
+   unit-tested, the fetch against a local server standing in for a CDN. The
+   flow through a real requestor is not, and neither is a real vendor's CDN —
+   which may redirect, throttle, or serve something whose header disagrees
+   with the ledger. See docs/HARDWARE-TESTING.md.
 
    Note that a Matter update is not the same thing as a vendor update: a device
    can be current in the ledger while the vendor's own app offers newer
