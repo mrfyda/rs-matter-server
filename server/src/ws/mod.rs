@@ -164,6 +164,10 @@ pub async fn run(
     // sees this reconnects instead of waiting for a timeout.
     context.events.publish(Event::server_shutdown());
     shutdown.store(true, Ordering::SeqCst);
+    // Whatever the last reports changed and the writer has not yet written.
+    if let Err(error) = context.nodes.flush() {
+        log::warn!("Could not persist node state at shutdown: {}", error);
+    }
     Ok(())
 }
 

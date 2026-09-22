@@ -4,9 +4,23 @@
 //! of controller-only data (last known addresses) that must never leak into a
 //! `MatterNodeData` response. Keeping the split explicit is what stops the
 //! internal fields from drifting onto the protocol.
+//!
+//! Two ways to persist. `save` writes now, for the changes that are rare and
+//! must not be lost — a node commissioned or removed, an import. `save_soon`
+//! coalesces, for the changes that arrive in bursts: every subscription report
+//! that moves an attribute used to serialise and fsync the whole store, some
+//! 4 ms per report on a Pi's SD card and growing with node count, and a busy
+//! fabric reports far more often than that is worth. A writer thread folds
+//! everything that changed within a couple of seconds into one write, and
+//! the store is flushed on the way out so nothing pending is lost to a clean
+//! shutdown.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -45,11 +59,33 @@ struct Snapshot {
     nodes: Vec<StoredNode>,
 }
 
+/// How often coalesced writes go to disk at most. Long enough to fold a
+/// burst of reports into one write, short enough that a crash loses little.
+const WRITE_INTERVAL: Duration = Duration::from_secs(2);
+/// How long the writer thread waits for more work before it stands down; a
+/// quiet fabric should not keep a thread for nothing.
+const WRITER_IDLE: Duration = Duration::from_secs(60);
+
+/// What the writer thread and `save_soon` agree about.
+#[derive(Default)]
+struct WriterState {
+    /// Changes not yet on disk.
+    dirty: bool,
+    /// Whether a writer thread is alive to take them.
+    running: bool,
+    /// When the store was last written, by anyone.
+    last_write: Option<Instant>,
+}
+
 /// Thread-safe, optionally file-backed node store.
 #[derive(Default)]
 pub struct NodeStore {
-    nodes: std::sync::Mutex<BTreeMap<u64, StoredNode>>,
+    nodes: Mutex<BTreeMap<u64, StoredNode>>,
     path: Option<PathBuf>,
+    writer: Mutex<WriterState>,
+    wake: Condvar,
+    /// How many times the file has been written, for tests and diagnostics.
+    writes: AtomicUsize,
 }
 
 impl NodeStore {
@@ -76,23 +112,83 @@ impl NodeStore {
             BTreeMap::new()
         };
         Ok(Self {
-            nodes: std::sync::Mutex::new(nodes),
+            nodes: Mutex::new(nodes),
             path: Some(path),
+            // Loading counts as a write, so the first burst after startup is
+            // folded like any other rather than written the moment it starts.
+            writer: Mutex::new(WriterState {
+                last_write: Some(Instant::now()),
+                ..WriterState::default()
+            }),
+            wake: Condvar::new(),
+            writes: AtomicUsize::new(0),
         })
     }
 
-    /// Write the snapshot through a temporary file so an interrupted write
-    /// cannot truncate the existing state.
+    /// Write the snapshot now, through a temporary file so an interrupted
+    /// write cannot truncate the existing state.
+    ///
+    /// For changes that are rare and must not be lost. A change that arrives
+    /// in bursts goes through `save_soon` instead.
     pub fn save(&self) -> Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
         };
+        // Taken before the snapshot: a change made while the file is being
+        // written stays dirty and is written next time.
+        {
+            let mut writer = self.writer.lock().unwrap();
+            writer.dirty = false;
+            writer.last_write = Some(Instant::now());
+        }
         let snapshot = Snapshot {
             nodes: self.nodes.lock().unwrap().values().cloned().collect(),
         };
         super::private::write_private(path, &serde_json::to_vec_pretty(&snapshot)?)
             .with_context(|| format!("writing node state {}", path.display()))?;
+        self.writes.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Write the snapshot soon: within `WRITE_INTERVAL` of the last write,
+    /// folded together with everything else that changes before then.
+    ///
+    /// Returns at once. A failure to write is logged by the writer thread,
+    /// which is the only place it can be noticed; the caller has nothing to
+    /// do about it either way.
+    pub fn save_soon(self: &Arc<Self>) {
+        if self.path.is_none() {
+            return;
+        }
+        let mut writer = self.writer.lock().unwrap();
+        writer.dirty = true;
+        if !writer.running {
+            writer.running = true;
+            let store = Arc::downgrade(self);
+            thread::Builder::new()
+                .name("node-store-writer".into())
+                .spawn(move || writer_loop(store))
+                .expect("spawning the node store writer");
+        }
+        self.wake.notify_one();
+    }
+
+    /// Write anything `save_soon` has not written yet. For shutdown.
+    pub fn flush(&self) -> Result<()> {
+        if self.writer.lock().unwrap().dirty {
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    /// Whether `save_soon` has changes it has not written yet.
+    pub fn is_dirty(&self) -> bool {
+        self.writer.lock().unwrap().dirty
+    }
+
+    /// How many times the file has been written.
+    pub fn write_count(&self) -> usize {
+        self.writes.load(Ordering::Relaxed)
     }
 
     pub fn len(&self) -> usize {
@@ -368,6 +464,53 @@ pub struct InterviewDiff {
 
 /// A bridge exposes the Aggregator device type (0x000E) in some endpoint's
 /// Descriptor DeviceTypeList (cluster 29, attribute 0).
+/// The writer thread: write when dirty, no more often than `WRITE_INTERVAL`,
+/// and stand down after `WRITER_IDLE` with nothing to do.
+///
+/// Holds the store weakly, so it never keeps one alive; a store dropped with
+/// changes pending writes them itself, in `Drop`.
+fn writer_loop(store: Weak<NodeStore>) {
+    loop {
+        let Some(store) = store.upgrade() else {
+            return;
+        };
+        let mut writer = store.writer.lock().unwrap();
+        while !writer.dirty {
+            let (guard, waited) = store.wake.wait_timeout(writer, WRITER_IDLE).unwrap();
+            writer = guard;
+            if waited.timed_out() && !writer.dirty {
+                writer.running = false;
+                return;
+            }
+        }
+        // Not sooner than the interval after the last write, whoever wrote.
+        let due = writer
+            .last_write
+            .map(|last| last + WRITE_INTERVAL)
+            .unwrap_or_else(Instant::now);
+        drop(writer);
+        let now = Instant::now();
+        if due > now {
+            thread::sleep(due - now);
+        }
+        if let Err(error) = store.save() {
+            log::warn!("Could not persist node state: {}", error);
+        }
+    }
+}
+
+impl Drop for NodeStore {
+    /// Nothing pending survives the store going away except by being written
+    /// here; the writer thread only ever borrows it.
+    fn drop(&mut self) {
+        if self.writer.lock().unwrap().dirty {
+            if let Err(error) = self.save() {
+                log::warn!("Could not persist node state on the way out: {}", error);
+            }
+        }
+    }
+}
+
 fn detect_bridge(attributes: &AttributesData) -> bool {
     const AGGREGATOR_DEVICE_TYPE: u64 = 0x000E;
     attributes.iter().any(|(path, value)| {
@@ -599,6 +742,95 @@ mod tests {
         assert_eq!(reloaded.len(), 1);
         assert_eq!(reloaded.ip_addresses(5), vec!["fd00::5".to_string()]);
         assert_eq!(reloaded.highest_node_id(), Some(5));
+    }
+
+    /// A burst of changes is one write, not one per change — and the write
+    /// happens, without anyone asking for it again.
+    #[test]
+    fn a_burst_of_soon_saves_is_one_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nodes.json");
+        let store = Arc::new(NodeStore::load(&path).unwrap());
+        store.upsert(StoredNode::new(MatterNodeData::new(1, "t".into())));
+
+        for i in 0..50 {
+            store.set_attribute(1, "1/6/0", json!(i % 2 == 0));
+            store.save_soon();
+        }
+        assert!(store.is_dirty());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while store.is_dirty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!store.is_dirty(), "the writer never wrote");
+        assert_eq!(store.write_count(), 1);
+
+        let reloaded = NodeStore::load(&path).unwrap();
+        // The last value of the burst is what landed.
+        assert_eq!(reloaded.get(1).unwrap().attributes["1/6/0"], json!(false));
+    }
+
+    /// Two bursts separated by more than the interval are two writes; two
+    /// within it are still one.
+    #[test]
+    fn soon_saves_are_paced_by_the_last_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(NodeStore::load(dir.path().join("nodes.json")).unwrap());
+        store.upsert(StoredNode::new(MatterNodeData::new(1, "t".into())));
+
+        // An immediate save counts as the last write, so the soon-save that
+        // follows waits out the interval rather than writing at once.
+        store.save().unwrap();
+        store.save_soon();
+        thread::sleep(Duration::from_millis(300));
+        assert!(store.is_dirty());
+        assert_eq!(store.write_count(), 1);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while store.is_dirty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(store.write_count(), 2);
+    }
+
+    #[test]
+    fn flushing_writes_what_is_pending_and_only_that() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nodes.json");
+        let store = Arc::new(NodeStore::load(&path).unwrap());
+        // Nothing pending: nothing written.
+        store.flush().unwrap();
+        assert_eq!(store.write_count(), 0);
+
+        store.upsert(StoredNode::new(MatterNodeData::new(7, "t".into())));
+        store.save_soon();
+        store.flush().unwrap();
+        assert!(!store.is_dirty());
+        assert_eq!(store.write_count(), 1);
+        assert_eq!(NodeStore::load(&path).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_store_dropped_with_changes_pending_writes_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nodes.json");
+        {
+            let store = Arc::new(NodeStore::load(&path).unwrap());
+            store.upsert(StoredNode::new(MatterNodeData::new(9, "t".into())));
+            store.save_soon();
+            assert!(store.is_dirty());
+        }
+        assert_eq!(NodeStore::load(&path).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_store_without_a_file_has_nothing_to_write() {
+        let store = Arc::new(NodeStore::new());
+        store.save_soon();
+        assert!(!store.is_dirty());
+        store.flush().unwrap();
+        assert_eq!(store.write_count(), 0);
     }
 
     #[test]

@@ -97,7 +97,7 @@ not:
 | the CA's root key, or its intermediate key and certificate | `controller-icac-key.bin` | ✅ Both PKI shapes work: rs-matter signs device NOCs with the root directly when there is no ICAC. |
 | `nodes/commissionedNodes` and the per-node commissioning state | `nodes.json` | ✅ Node ids, commissioning dates, last known addresses, and the fabric index the device assigned this controller. |
 | the `config` namespace | `config.json` | ✅ Fabric label, node-id counter, and the Wi-Fi and Thread credential lists. |
-| the cached attribute values | — | ⚠️ Not copied. matter.js stores them decoded into its own object model; each node is re-read instead, on its first poll after startup, and reports unavailable with no attributes until then. |
+| the cached attribute values | — | ⚠️ Not copied, by decision. matter.js stores them decoded into its own object model; each node is re-read instead, on its first poll after startup, and reports unavailable with no attributes until then — a window of one poll interval on the first boot after the import, and nothing after. Not worth teaching this importer matter.js's object model. |
 | sessions and CASE resumption records | — | ❌ Dropped; a fresh CASE handshake replaces them. |
 | subscription state | — | ❌ Dropped; this server polls (gap 1 below). |
 

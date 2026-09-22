@@ -58,19 +58,7 @@ the HCI capture.
 even with one, a plain CLI binary could not use it without an app bundle and
 entitlements.
 
-**The migration's uncopied attribute cache.** A node adopted from
-matterjs-server reports unavailable with no attributes until its first
-subscription or poll fills it in. Copying matter.js's decoded cache would
-shorten that window on first boot and nothing else.
-
 **matter.js's `sqlite` storage driver.** `--import-matterjs` reads the `wal`,
 `file` and `json` drivers. A source written by `sqlite` is detected and
 reported with the matter.js command that converts it to one of those, which
 is a shorter path than teaching this reader SQL for a one-time import.
-
-**The node store is rewritten per report.** Every subscription report that
-changes an attribute serializes all of `nodes.json` and fsyncs it — measured
-at 4 ms for a 13 KB store on a Pi 5's SD card, and it grows with node count.
-Polling bounded this to once per node per 30 s; subscriptions do not. Whether
-it needs fixing depends on a fabric chatty enough to show it, which no rig
-here has yet.

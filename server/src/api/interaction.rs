@@ -41,9 +41,7 @@ pub fn publish_attribute_changes(
         }
     }
     if changed {
-        if let Err(error) = context.server.nodes.save() {
-            log::warn!("Could not persist observed attributes: {}", error);
-        }
+        context.server.nodes.save_soon();
     }
     changed
 }

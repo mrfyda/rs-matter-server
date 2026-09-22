@@ -295,9 +295,8 @@ pub fn publish_changes(
             .publish(Event::attribute_updated(node_id, path, value.clone()));
     }
     context.events.publish(Event::node_updated(&diff.node));
-    if let Err(error) = context.nodes.save() {
-        log::warn!("Could not persist polled attributes: {}", error);
-    }
+    // Reports arrive in bursts, and one write covers a burst.
+    context.nodes.save_soon();
 }
 
 /// Record reachability, announcing only a real transition.
@@ -317,7 +316,7 @@ fn mark_available(context: &Arc<ServerContext>, node_id: u64, available: bool) {
             "unavailable"
         }
     );
-    let _ = context.nodes.save();
+    context.nodes.save_soon();
     context.events.publish(Event::node_updated(&node));
 }
 

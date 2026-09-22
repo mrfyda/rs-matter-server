@@ -367,7 +367,7 @@ async fn refresh_diagnostics(context: CallContext<'_>) {
             ),
         }
     }
-    let _ = context.server.nodes.save();
+    context.server.nodes.save_soon();
 }
 
 /// Derive the graph from cached attributes.

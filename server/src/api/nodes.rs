@@ -113,9 +113,7 @@ pub async fn resolve_addresses(context: &ServerContext, node_id: u64) -> Option<
         .collect();
     if context.nodes.ip_addresses(node_id) != addresses {
         context.nodes.set_ip_addresses(node_id, addresses.clone());
-        if let Err(error) = context.nodes.save() {
-            log::warn!("Could not persist node {}'s addresses: {}", node_id, error);
-        }
+        context.nodes.save_soon();
     }
     Some(addresses)
 }
@@ -135,7 +133,7 @@ pub async fn ping_node(args: &Args, context: CallContext<'_>) -> ApiResult {
     // Availability follows a ping: it is the most direct evidence there is.
     if let Some((node, changed)) = context.server.nodes.set_available(node_id, reachable) {
         if changed {
-            let _ = context.server.nodes.save();
+            context.server.nodes.save_soon();
             context.server.events.publish(Event::node_updated(&node));
         }
     }
