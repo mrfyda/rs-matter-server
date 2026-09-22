@@ -37,13 +37,23 @@ array, or `struct:<Name>` naming an entry in the same cluster's `structs`
 table. Structs are emitted by reference rather than inlined: the same struct is
 often reachable from several commands, and a reference cannot recurse forever
 if a definition ever becomes cyclic.
+
+Most structs are defined in the cluster file that uses them. A few — the
+WebRTC ICE types among them — are shared across clusters and generated once
+into the root module, `clusters_generated.rs`, which sits beside the
+`clusters_generated/` directory. That file is read as a second scope: a struct
+the cluster's own file does not define is looked up there, and is still
+emitted into the cluster's `structs` table, so the JSON needs no notion of a
+shared scope.
 """
 import json
 import re
 import sys
 from pathlib import Path
 
-ENUM_RE = re.compile(r"pub enum (\w+) \{(.*?)\n\}", re.S)
+# The closing brace is matched at any indentation: a cluster file's enums sit
+# at column zero, the globals module's one level in.
+ENUM_RE = re.compile(r"pub enum (\w+) \{(.*?)\n[ \t]*\}", re.S)
 VARIANT_RE = re.compile(r"^\s*(\w+) = (\d+),", re.M)
 CLUSTER_ID_RE = re.compile(
     r"pub const FULL_CLUSTER: crate::dm::Cluster<'static> = crate::dm::Cluster::new\(\s*(\d+),\s*(\d+),",
@@ -202,7 +212,13 @@ def parse_field_types(source: str, type_name: str, structs: set[str]) -> dict[st
     start = source.find(marker)
     if start < 0:
         return {}
-    end = source.find("\n}", start)
+    # The block ends at the brace that closes it: the first one at the impl's
+    # own indentation, which is column zero in a cluster file and one level in
+    # for the globals module. Any shallower search would run into the next
+    # struct's accessors and pair their types with this struct's tags.
+    line_start = source.rfind("\n", 0, start) + 1
+    indent = source[line_start:start]
+    end = source.find(f"\n{indent}}}", start)
     block = source[start : end if end > 0 else len(source)]
     return {
         tag: classify_type(rust_type, structs)
@@ -217,10 +233,18 @@ def struct_reference(kind: str) -> str | None:
     return kind[len("struct:") :] if kind.startswith("struct:") else None
 
 
+# One generated source and the enums parsed out of it.
+Scope = tuple[str, dict[str, dict[str, int]]]
+
+
 def collect_structs(
-    source: str, kinds: dict[str, str], enums: dict[str, dict[str, int]], structs: set[str]
+    scopes: list[Scope], kinds: dict[str, str], structs: set[str]
 ) -> dict[str, dict]:
     """Every struct definition reachable from the given field kinds.
+
+    `scopes` are searched in order — the cluster's own file first, then the
+    shared globals — and the first that defines the struct's tag enum is the
+    one its accessors are read from.
 
     Walks references breadth-first so a struct nested inside a struct is
     emitted too, and keeps a seen set so a cyclic definition would terminate.
@@ -231,12 +255,13 @@ def collect_structs(
         name = pending.pop()
         if name in out:
             continue
-        fields = enums.get(f"{name}Tag")
-        if not fields:
-            continue
-        types = parse_field_types(source, name, structs)
-        out[name] = {"fields": fields, "types": types}
-        pending.extend(ref for ref in map(struct_reference, types.values()) if ref)
+        for source, enums in scopes:
+            fields = enums.get(f"{name}Tag")
+            if fields:
+                types = parse_field_types(source, name, structs)
+                out[name] = {"fields": fields, "types": types}
+                pending.extend(ref for ref in map(struct_reference, types.values()) if ref)
+                break
     return out
 
 
@@ -253,9 +278,32 @@ def parse_enums(source: str) -> dict[str, dict[str, int]]:
     return out
 
 
+def tag_structs(enums: dict[str, dict[str, int]]) -> set[str]:
+    """The structs a set of enums defines.
+
+    A struct is anything with a tag enum; the suffix alone is not a reliable
+    test, since request and response structs carry one too.
+    """
+    return {name[: -len("Tag")] for name in enums if name.endswith("Tag")}
+
+
+def read_globals(directory: Path) -> Scope:
+    """The shared types codegen writes into the root module beside the
+    cluster directory. Its absence means the layout changed, which is worth a
+    loud failure: silently falling back would emit every shared struct as
+    `other` again."""
+    path = directory.parent / "clusters_generated.rs"
+    if not path.is_file():
+        sys.exit(f"{path} not found: expected codegen's root module beside {directory}")
+    source = path.read_text()
+    return source, parse_enums(source)
+
+
 def main(generated_dir: str, out_path: str, codegen_dir: str) -> None:
     directory = Path(generated_dir)
     epoch_attributes = parse_epoch_attributes(read_idl(Path(codegen_dir)))
+    globals_scope = read_globals(directory)
+    global_structs = tag_structs(globals_scope[1])
     registry = {}
 
     for path in sorted(directory.glob("*.rs")):
@@ -266,9 +314,8 @@ def main(generated_dir: str, out_path: str, codegen_dir: str) -> None:
         cluster_id = int(cluster_match.group(1))
         revision = int(cluster_match.group(2))
         enums = parse_enums(source)
-        # A struct is anything with a tag enum; the suffix alone is not a
-        # reliable test, since request and response structs carry one too.
-        structs = {name[: -len("Tag")] for name in enums if name.endswith("Tag")}
+        structs = tag_structs(enums) | global_structs
+        scopes = [(source, enums), globals_scope]
 
         command_responses = parse_command_responses(source)
         commands = {}
@@ -289,7 +336,7 @@ def main(generated_dir: str, out_path: str, codegen_dir: str) -> None:
             types = parse_field_types(source, f"{command_name}Request", structs)
             if types:
                 entry["types"] = types
-                definitions.update(collect_structs(source, types, enums, structs))
+                definitions.update(collect_structs(scopes, types, structs))
             commands[command_name] = entry
 
         cluster = {

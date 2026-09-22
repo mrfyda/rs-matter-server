@@ -136,10 +136,6 @@ tracking the device's real idle and active windows.
 
 Rig: `camera-app`. Matter cameras barely exist.
 
-**Do the registry fix first** — see the roadmap. `IceServers` and
-`IceCandidates` are typed `list:other`, so anything carrying real ICE servers
-has to be addressed by numeric TLV tag until that lands.
-
 ```bash
 tools/ws.py --listen --for 120 send_webrtc_provider_command node_id=1 \
     endpoint_id=1 command_name=SolicitOffer payload='{"streamUsage":1}'
