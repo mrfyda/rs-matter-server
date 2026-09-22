@@ -104,6 +104,61 @@ tools/ws.py device_command node_id=1 endpoint_id=1 cluster_id=257 \
 members addressed by name rather than numeric TLV tag. Name matching ignores
 case and separators, so `credentialType` resolves too.
 
+### Discovery answers over IPv6
+
+Rig: any device; `all-clusters-app` on the same host is enough. Every
+hardware run so far predates the browser asking over IPv6, so every address
+it has ever reported was an IPv4 one.
+
+```bash
+tools/ws.py discover
+tools/ws.py get_node_ip_addresses node_id=1
+```
+
+A pass is IPv6 addresses in both answers, and `get_node_ip_addresses` leading
+with the link-local one, as it promises. The stronger test is an IPv6-only
+network, or a Thread device behind a border router: neither has an IPv4
+address to answer with, so anything found there was found over IPv6. The
+query goes out once per interface that holds an IPv6 address; a host with
+several is the case worth trying, since a wrong interface produces silence,
+not an error.
+
+### A rebooted device pings as unreachable
+
+Rig: `all-clusters-app`, killed and restarted with the same KVS so it keeps
+the fabric — which is what a real device does when it loses power.
+
+```bash
+tools/ws.py ping_node node_id=1                 # true, while it runs
+# restart the app, then, without restarting this server:
+tools/ws.py --listen ping_node node_id=1
+```
+
+A pass is `false` for every address, and a `node_updated` with
+`available: false`. The ping reads one attribute over the session rather than
+trusting that a session exists, so the rebooted device — which has forgotten
+the session this server still holds — no longer pings as reachable. The node
+itself stays unreachable until this server restarts; that is PARITY.md's gap
+2, upstream, and not what this proves.
+
+### A quiet subscription is logged and re-established
+
+Rig: `all-clusters-app`, stopped for longer than twice the subscription's
+keepalive — the server asks for five minutes, so stop it for eleven.
+
+At the default log level, a pass is one line:
+
+```
+Node 1 stopped reporting; will re-subscribe
+```
+
+followed by a re-subscribe attempt on the next pass. Before this, the entry
+was forgotten just ahead of the sweep that would have named it, so the line
+could never be logged and a subscription dying silently left no trace at
+`info`. Restarting the app before the eleven minutes are up is the second
+half: the priming report of the new subscription should arrive and the node
+should return to `available: true`.
+
 ### The interview does not overflow its own client
 
 A first interview publishes one event per attribute into a 256-slot channel,
@@ -142,7 +197,19 @@ tools/ws.py --listen --for 120 send_webrtc_provider_command node_id=1 \
 ```
 
 A pass is `webrtc_callback` carrying the session id and the `data` object for
-its type. Two things are untested rather than unverified: an SDP is kilobytes
+its type. Then the same command with ICE servers in it:
+
+```bash
+tools/ws.py send_webrtc_provider_command node_id=1 endpoint_id=1 \
+    command_name=SolicitOffer \
+    payload='{"streamUsage":1,"IceServers":[{"UrLs":["stun:stun.example:3478"]}]}'
+```
+
+`IceServers` and `IceCandidates` are structs shared across clusters that the
+registry only recently learned to resolve; a pass is the device accepting the
+list with its members addressed by name, as the nested-payload test above
+proves for a struct the cluster defines itself. Two things are untested rather
+than unverified: an SDP is kilobytes
 and only reaches the device over the TCP transport, which so far only a
 synthetic handshake has exercised; and the node id on a callback is recovered
 by matching the accessor, so a camera not in the store reports `null` there.
