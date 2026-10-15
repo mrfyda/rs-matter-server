@@ -42,7 +42,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rand_core::OsRng;
+use rand_core_10::{OsRng, UnwrapErr};
 use rs_matter::bdx::{Bdx, BdxBuffer, PROTO_ID_BDX};
 use rs_matter::crypto::Crypto;
 use rs_matter::dm::clusters::app::webrtc_req;
@@ -52,7 +52,7 @@ use rs_matter::dm::clusters::ota_prov::{self, OtaBdxHandler, OtaProviderHandler}
 use rs_matter::dm::devices::DEV_TYPE_OTA_PROVIDER;
 use rs_matter::dm::networks::eth::EthNetwork;
 use rs_matter::dm::networks::wireless::NoopWirelessNetCtl;
-use rs_matter::dm::{Async, Dataver, EmptyHandler, Endpoint, EpClMatcher, Node};
+use rs_matter::dm::{Async, Dataver, EmptyHandler, Endpoint, Node};
 use rs_matter::im::{InteractionModel, InteractionModelState, PROTO_ID_INTERACTION_MODEL};
 use rs_matter::persist::DirKvBlobStore;
 use rs_matter::respond::{ChainedExchangeHandler, Responder};
@@ -141,25 +141,16 @@ pub async fn run<'a, C: Crypto + Clone>(
     // device invokes `QueryImage` on.
     let handlers = EmptyHandler
         .chain(
-            EpClMatcher::new(
-                Some(ota_provider::OTA_PROVIDER_ENDPOINT),
-                Some(DescHandler::CLUSTER.id),
-            ),
-            Async(DescHandler::new(Dataver::new_rand(&mut OsRng)).adapt()),
+            |endpoint, cluster| endpoint == ota_provider::OTA_PROVIDER_ENDPOINT && cluster == DescHandler::CLUSTER.id,
+            Async(DescHandler::new(Dataver::new_rand(&mut UnwrapErr(OsRng))).adapt()),
         )
         .chain(
-            EpClMatcher::new(
-                Some(ota_provider::OTA_PROVIDER_ENDPOINT),
-                Some(ota_prov::FULL_CLUSTER.id),
-            ),
-            OtaProviderHandler::new(Dataver::new_rand(&mut OsRng), &images).adapt(),
+            |endpoint, cluster| endpoint == ota_provider::OTA_PROVIDER_ENDPOINT && cluster == ota_prov::FULL_CLUSTER.id,
+            OtaProviderHandler::new(Dataver::new_rand(&mut UnwrapErr(OsRng)), &images).adapt(),
         )
         .chain(
-            EpClMatcher::new(
-                Some(webrtc::WEBRTC_REQUESTOR_ENDPOINT),
-                Some(webrtc_req::FULL_CLUSTER.id),
-            ),
-            WebRtcRequestor::new(webrtc_context, Dataver::new_rand(&mut OsRng)).adapt(),
+            |endpoint, cluster| endpoint == webrtc::WEBRTC_REQUESTOR_ENDPOINT && cluster == webrtc_req::FULL_CLUSTER.id,
+            WebRtcRequestor::new(webrtc_context, Dataver::new_rand(&mut UnwrapErr(OsRng))).adapt(),
         );
 
     let data_model = InteractionModel::new_with_reports(

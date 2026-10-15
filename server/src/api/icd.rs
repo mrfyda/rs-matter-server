@@ -298,8 +298,8 @@ async fn other_vendor_admins(
 
 /// Fill a buffer with random bytes for the check-in key.
 fn getrandom_key(key: &mut [u8]) {
-    use rand_core::RngCore;
-    rand_core::OsRng.fill_bytes(key);
+    use rand_core_10::{Rng, UnwrapErr};
+    UnwrapErr(rand_core_10::OsRng).fill_bytes(key);
 }
 
 #[cfg(test)]

@@ -509,10 +509,10 @@ const FORBIDDEN_PASSCODES: &[u32] = &[
 ];
 
 fn random_passcode() -> u32 {
-    use rand_core::RngCore;
+    use rand_core_10::{Rng, UnwrapErr};
     loop {
         // The valid range is 1..=99_999_998, minus the forbidden values.
-        let candidate = rand_core::OsRng.next_u32() % 99_999_999;
+        let candidate = UnwrapErr(rand_core_10::OsRng).next_u32() % 99_999_999;
         if candidate != 0 && !FORBIDDEN_PASSCODES.contains(&candidate) {
             return candidate;
         }
@@ -520,14 +520,14 @@ fn random_passcode() -> u32 {
 }
 
 fn random_discriminator() -> u16 {
-    use rand_core::RngCore;
-    (rand_core::OsRng.next_u32() & 0xFFF) as u16
+    use rand_core_10::{Rng, UnwrapErr};
+    (UnwrapErr(rand_core_10::OsRng).next_u32() & 0xFFF) as u16
 }
 
 fn random_salt() -> Vec<u8> {
-    use rand_core::RngCore;
+    use rand_core_10::{Rng, UnwrapErr};
     let mut salt = vec![0u8; MAX_SALT_LEN];
-    rand_core::OsRng.fill_bytes(&mut salt);
+    UnwrapErr(rand_core_10::OsRng).fill_bytes(&mut salt);
     salt
 }
 

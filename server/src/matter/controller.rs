@@ -6,11 +6,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use rand_core::{OsRng, RngCore};
+use rand_core_10::{OsRng, UnwrapErr};
 use rs_matter::cert::gen::VALID_FOREVER;
 use rs_matter::cert::MAX_CERT_TLV_AND_ASN1_LEN;
 use rs_matter::crypto::{
-    default_crypto, CanonAeadKey, CanonPkcSecretKey, Crypto, SecretKey, SigningSecretKey,
+    default_crypto, CanonAeadKey, CanonPkcSecretKey, Crypto, Rng, SecretKey, SigningSecretKey,
 };
 use rs_matter::dm::clusters::basic_info::BasicInfoConfig;
 use rs_matter::dm::devices::test::{TEST_DEV_ATT, TEST_DEV_COMM, TEST_DEV_DET};
@@ -201,7 +201,7 @@ pub fn init_matter(storage_path: &str, config: &FabricConfig) -> Result<Matter<'
 /// operational IPK from the epoch key, so nothing that can be computed is
 /// carried over and trusted.
 fn install_fabric(matter: &Matter<'_>, imported: &ImportedFabric) -> Result<CanonPkcSecretKey> {
-    let crypto = default_crypto(OsRng, rs_matter::dm::devices::test::DAC_PRIVKEY);
+    let crypto = default_crypto(UnwrapErr(OsRng), rs_matter::dm::devices::test::DAC_PRIVKEY);
 
     let operational_key = CanonPkcSecretKey::try_from(imported.operational_key.as_slice())
         .map_err(|e| anyhow::anyhow!("the imported operational key is unusable: {:?}", e))?;
@@ -375,7 +375,7 @@ fn create_fabric(matter: &Matter<'_>, config: &FabricConfig) -> Result<CanonPkcS
 fn create_fabric_once(matter: &Matter<'_>, config: &FabricConfig) -> Result<CanonPkcSecretKey> {
     // Use the test DAC (Device Attestation Certificate) for development.
     // In production, this should be a vendor-specific DAC.
-    let crypto = default_crypto(OsRng, rs_matter::dm::devices::test::DAC_PRIVKEY);
+    let crypto = default_crypto(UnwrapErr(OsRng), rs_matter::dm::devices::test::DAC_PRIVKEY);
 
     // Step 1: Generate RCAC (Root CA).
     let mut rcac_buf = [0u8; MAX_CERT_TLV_AND_ASN1_LEN];
@@ -464,7 +464,7 @@ mod tests {
     /// this surfaced, passing locally and failing once in CI.
     #[test]
     fn csr_buffer_fits_every_signature_length() {
-        let crypto = default_crypto(OsRng, rs_matter::dm::devices::test::DAC_PRIVKEY);
+        let crypto = default_crypto(UnwrapErr(OsRng), rs_matter::dm::devices::test::DAC_PRIVKEY);
         let mut longest = 0;
         for _ in 0..200 {
             let key = crypto.generate_secret_key().expect("key");

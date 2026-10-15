@@ -36,19 +36,6 @@ pub struct PairingInfo {
     pub filter: CommissionableFilter,
 }
 
-/// How to reach the device for phase 2, once AddNOC has been accepted.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CasePath {
-    /// The address PASE used still reaches the device, so CASE runs against
-    /// it directly. True of anything commissioned over IP.
-    SameAddress,
-    /// Resolve the device's operational address over mDNS first. Required
-    /// after Bluetooth commissioning: the device joins its network during
-    /// commissioning, so the address it will answer on is not known until it
-    /// announces itself operationally.
-    Operational,
-}
-
 /// Credentials for the network a device should be told to join.
 ///
 /// Both kinds are carried rather than one, because which one applies is a
@@ -88,7 +75,6 @@ impl NetworkCredentials {
 /// finish once the device holds its operational certificate — and splitting
 /// them across separate parameters made the signature unreadable.
 pub struct Completion<'a> {
-    pub case_path: CasePath,
     /// The network to hand the device, for one that does not have one yet.
     pub credentials: Option<&'a NetworkCredentials>,
 }
@@ -204,10 +190,7 @@ pub async fn commission_at_address<C: Crypto>(
         provision_network(matter, crypto, peer_addr, passcode, credentials).await?;
     }
 
-    match completion.case_path {
-        CasePath::SameAddress => commissioner.complete_via_case(peer_addr, &phase1).await,
-        CasePath::Operational => commissioner.complete_via_case_operational(&phase1).await,
-    }
+    commissioner.complete_via_case(&phase1).await
     .map_err(|e| {
         ApiError::commission_failed(format!(
             "Commissioning could not be completed over CASE: {:?}",

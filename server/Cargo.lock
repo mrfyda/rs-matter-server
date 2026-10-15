@@ -2586,7 +2586,7 @@ dependencies = [
  "libc",
  "log",
  "nix 0.30.1",
- "rand_core 0.6.4",
+ "rand_core 0.10.1",
  "rs-matter",
  "serde",
  "serde_json",

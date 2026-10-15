@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use async_io::Async;
 use futures_lite::future::block_on;
 
-use rand_core::OsRng;
+use rand_core_10::{OsRng, UnwrapErr};
 use rs_matter::crypto::{default_crypto, Crypto};
 use rs_matter::dm::devices::test::DAC_PRIVKEY;
 #[cfg(all(feature = "bluetooth", target_os = "linux"))]
@@ -86,7 +86,7 @@ pub async fn run(
         Async::<TcpListener>::bind(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, matter_port, 0, 0))
             .with_context(|| format!("binding the Matter port {} for TCP", matter_port))?,
     );
-    let crypto = default_crypto(OsRng, DAC_PRIVKEY);
+    let crypto = default_crypto(UnwrapErr(OsRng), DAC_PRIVKEY);
 
     let (handle, requests) = actor::channel();
     let monitor_config = config.monitor;

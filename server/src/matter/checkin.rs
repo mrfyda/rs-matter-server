@@ -105,20 +105,20 @@ impl<C: Crypto> CheckInReceiver<C> {
 mod tests {
     use super::*;
     use crate::api::tests_support::test_context;
-    use rand_core::OsRng;
+    use rand_core_10::{OsRng, UnwrapErr};
     use rs_matter::crypto::default_crypto;
     use rs_matter::dm::devices::test::DAC_PRIVKEY;
 
     const KEY_LEN: usize = 16;
 
     fn receiver(context: Arc<ServerContext>) -> CheckInReceiver<impl Crypto> {
-        CheckInReceiver::new(context, default_crypto(OsRng, DAC_PRIVKEY))
+        CheckInReceiver::new(context, default_crypto(UnwrapErr(OsRng), DAC_PRIVKEY))
     }
 
     /// A check-in as the device would send it: encrypted with the key that
     /// device was registered with.
     fn check_in(key: &[u8], counter: u32) -> Vec<u8> {
-        let crypto = default_crypto(OsRng, DAC_PRIVKEY);
+        let crypto = default_crypto(UnwrapErr(OsRng), DAC_PRIVKEY);
         let key = CanonAeadKeyRef::try_new(key).unwrap();
         let mut payload = vec![0u8; 64];
         let written = CheckIn::new(key)
