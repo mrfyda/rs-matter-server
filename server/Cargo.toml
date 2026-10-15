@@ -78,10 +78,10 @@ bluetooth = ["rs-matter/zbus"]
 # container — the built-in responder is used, and pulling in `astro-dnssd`
 # there would mean linking against Avahi's compatibility library for no reason.
 [target.'cfg(target_os = "macos")'.dependencies]
-rs-matter = { version = "0.3", features = ["std", "async-io", "astro-dnssd", "max-sessions-32", "max-fabrics-8"] }
+rs-matter = { version = "0.4.1", features = ["std", "async-io", "astro-dnssd", "max-sessions-32", "max-fabrics-8"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-rs-matter = { version = "0.3", features = ["std", "async-io", "max-sessions-32", "max-fabrics-8"] }
+rs-matter = { version = "0.4.1", features = ["std", "async-io", "max-sessions-32", "max-fabrics-8"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
