@@ -32,7 +32,7 @@ use crate::protocol::model::{AttributesData, CommissionableNodeData};
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
 
-use super::commissioning::{commission_at_address, CasePath, Completion, NetworkCredentials};
+use super::commissioning::{commission_at_address, Completion, NetworkCredentials};
 use super::controller::persist_fabric;
 use super::interaction;
 use super::ota_provider;
@@ -805,7 +805,6 @@ async fn commission<C: Crypto + Clone>(
         node_id,
         Completion {
             // The device answered at this address over IP and still will.
-            case_path: CasePath::SameAddress,
             // It is already on a network; nothing to provision.
             credentials: None,
         },
@@ -871,7 +870,6 @@ async fn commission_over_ble<C: Crypto + Clone>(
                 passcode,
                 node_id,
                 Completion {
-                    case_path: CasePath::Operational,
                     credentials: credentials.as_ref(),
                 },
             )
@@ -897,7 +895,7 @@ async fn commission_over_ble<C: Crypto + Clone>(
     // and the caller stores what it gets here as the node's `ip_addresses` —
     // where `get_node_ip_addresses` and `ping_node` would then use it. The
     // device's operational address is resolved inside rs-matter during
-    // `complete_via_case_operational` and not exposed, so an empty answer is
+    // `complete_via_case` and not exposed, so an empty answer is
     // the honest one until an operational mDNS lookup exists.
     Ok(MatterOutcome::Commissioned {
         node_id: result.node_id,
