@@ -2583,6 +2583,7 @@ dependencies = [
  "flate2",
  "futures-lite",
  "futures-util",
+ "getrandom 0.4.3",
  "libc",
  "log",
  "nix 0.30.1",

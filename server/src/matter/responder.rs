@@ -42,7 +42,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rand_core_10::{OsRng, UnwrapErr};
+use rand_core_10::UnwrapErr;
 use rs_matter::bdx::{Bdx, BdxBuffer, PROTO_ID_BDX};
 use rs_matter::crypto::Crypto;
 use rs_matter::dm::clusters::app::webrtc_req;
@@ -145,21 +145,29 @@ pub async fn run<'a, C: Crypto + Clone>(
                 endpoint == ota_provider::OTA_PROVIDER_ENDPOINT
                     && cluster == DescHandler::CLUSTER.id
             },
-            Async(DescHandler::new(Dataver::new_rand(&mut UnwrapErr(OsRng))).adapt()),
+            Async(DescHandler::new(Dataver::new_rand(&mut UnwrapErr(getrandom::SysRng))).adapt()),
         )
         .chain(
             |endpoint, cluster| {
                 endpoint == ota_provider::OTA_PROVIDER_ENDPOINT
                     && cluster == ota_prov::FULL_CLUSTER.id
             },
-            OtaProviderHandler::new(Dataver::new_rand(&mut UnwrapErr(OsRng)), &images).adapt(),
+            OtaProviderHandler::new(
+                Dataver::new_rand(&mut UnwrapErr(getrandom::SysRng)),
+                &images,
+            )
+            .adapt(),
         )
         .chain(
             |endpoint, cluster| {
                 endpoint == webrtc::WEBRTC_REQUESTOR_ENDPOINT
                     && cluster == webrtc_req::FULL_CLUSTER.id
             },
-            WebRtcRequestor::new(webrtc_context, Dataver::new_rand(&mut UnwrapErr(OsRng))).adapt(),
+            WebRtcRequestor::new(
+                webrtc_context,
+                Dataver::new_rand(&mut UnwrapErr(getrandom::SysRng)),
+            )
+            .adapt(),
         );
 
     let data_model = InteractionModel::new_with_reports(
