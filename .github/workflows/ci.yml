@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, upgrade/rs-matter-0.4.1]
   pull_request:
   workflow_dispatch:
 
