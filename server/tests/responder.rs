@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use async_io::Async;
 use futures_lite::future::{block_on, or};
-use rand_core::OsRng;
+use rand_core_10::UnwrapErr;
 use rs_matter::crypto::default_crypto;
 use rs_matter::dm::devices::test::DAC_PRIVKEY;
 use rs_matter::sc::{GeneralCode, OpCode, StatusReport, PROTO_ID_SECURE_CHANNEL};
@@ -101,7 +101,7 @@ fn serve(storage: String, socket: UdpSocket, listener: TcpListener) {
         .expect("a fabric");
         let socket = Async::new(socket).expect("a non-blocking socket");
         let tcp = TcpNetwork::<2>::new(Async::new(listener).expect("a non-blocking listener"));
-        let crypto = default_crypto(OsRng, DAC_PRIVKEY);
+        let crypto = default_crypto(UnwrapErr(getrandom::SysRng), DAC_PRIVKEY);
         let send = ChainedNetwork::new(Address::is_tcp, &tcp, &socket);
         let recv = ChainedNetwork::new(Address::is_tcp, &tcp, &socket);
         block_on(or(
@@ -145,7 +145,7 @@ fn probe_over(address: impl Fn(u16) -> Address) {
     let client_tcp =
         TcpNetwork::<2>::new(Async::new(client_listener).expect("a non-blocking listener"));
 
-    let crypto = default_crypto(OsRng, DAC_PRIVKEY);
+    let crypto = default_crypto(UnwrapErr(getrandom::SysRng), DAC_PRIVKEY);
     let peer = address(port);
 
     let probe = async {
