@@ -60,7 +60,10 @@ fn generate(with_icac: bool) -> Material {
 }
 
 fn generate_once(with_icac: bool) -> Result<Material, String> {
-    let crypto = default_crypto(rand_core::OsRng, rs_matter::dm::devices::test::DAC_PRIVKEY);
+    let crypto = default_crypto(
+        rand_core_10::UnwrapErr(getrandom::SysRng),
+        rs_matter::dm::devices::test::DAC_PRIVKEY,
+    );
 
     let mut rcac_buf = [0u8; MAX_CERT_TLV_AND_ASN1_LEN];
     let mut rcac_gen = RcacGenerator::new(&mut rcac_buf);
