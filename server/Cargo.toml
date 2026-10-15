@@ -25,7 +25,7 @@ embassy-sync = "0.8"
 
 # WebSocket server
 async-tungstenite = "0.5"
-tungstenite = "0.24"
+tungstenite = "0.30"
 futures-util = "0.3"
 
 # JSON for the matterjs-server protocol
