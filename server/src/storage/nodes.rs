@@ -469,9 +469,9 @@ pub struct InterviewDiff {
 ///
 /// Holds the store weakly, so it never keeps one alive; a store dropped with
 /// changes pending writes them itself, in `Drop`.
-fn writer_loop(store: Weak<NodeStore>) {
+fn writer_loop(weak_store: Weak<NodeStore>) {
     loop {
-        let Some(store) = store.upgrade() else {
+        let Some(store) = weak_store.upgrade() else {
             return;
         };
         let mut writer = store.writer.lock().unwrap();
@@ -489,10 +489,17 @@ fn writer_loop(store: Weak<NodeStore>) {
             .map(|last| last + WRITE_INTERVAL)
             .unwrap_or_else(Instant::now);
         drop(writer);
+        // Do not keep the store alive while waiting for the write interval.
+        // If its owner drops it here, NodeStore::drop flushes the pending
+        // changes and this worker exits when it next tries to upgrade.
+        drop(store);
         let now = Instant::now();
         if due > now {
             thread::sleep(due - now);
         }
+        let Some(store) = weak_store.upgrade() else {
+            return;
+        };
         if let Err(error) = store.save() {
             log::warn!("Could not persist node state: {}", error);
         }
@@ -760,10 +767,13 @@ mod tests {
         assert!(store.is_dirty());
 
         let deadline = Instant::now() + Duration::from_secs(10);
-        while store.is_dirty() && Instant::now() < deadline {
+        while store.write_count() < 1 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
-        assert!(!store.is_dirty(), "the writer never wrote");
+        assert!(
+            !store.is_dirty(),
+            "the writer never cleared the pending save"
+        );
         assert_eq!(store.write_count(), 1);
 
         let reloaded = NodeStore::load(&path).unwrap();
@@ -788,7 +798,7 @@ mod tests {
         assert_eq!(store.write_count(), 1);
 
         let deadline = Instant::now() + Duration::from_secs(10);
-        while store.is_dirty() && Instant::now() < deadline {
+        while store.write_count() < 2 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(store.write_count(), 2);
