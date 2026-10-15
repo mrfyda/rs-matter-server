@@ -141,15 +141,24 @@ pub async fn run<'a, C: Crypto + Clone>(
     // device invokes `QueryImage` on.
     let handlers = EmptyHandler
         .chain(
-            |endpoint, cluster| endpoint == ota_provider::OTA_PROVIDER_ENDPOINT && cluster == DescHandler::CLUSTER.id,
+            |endpoint, cluster| {
+                endpoint == ota_provider::OTA_PROVIDER_ENDPOINT
+                    && cluster == DescHandler::CLUSTER.id
+            },
             Async(DescHandler::new(Dataver::new_rand(&mut UnwrapErr(OsRng))).adapt()),
         )
         .chain(
-            |endpoint, cluster| endpoint == ota_provider::OTA_PROVIDER_ENDPOINT && cluster == ota_prov::FULL_CLUSTER.id,
+            |endpoint, cluster| {
+                endpoint == ota_provider::OTA_PROVIDER_ENDPOINT
+                    && cluster == ota_prov::FULL_CLUSTER.id
+            },
             OtaProviderHandler::new(Dataver::new_rand(&mut UnwrapErr(OsRng)), &images).adapt(),
         )
         .chain(
-            |endpoint, cluster| endpoint == webrtc::WEBRTC_REQUESTOR_ENDPOINT && cluster == webrtc_req::FULL_CLUSTER.id,
+            |endpoint, cluster| {
+                endpoint == webrtc::WEBRTC_REQUESTOR_ENDPOINT
+                    && cluster == webrtc_req::FULL_CLUSTER.id
+            },
             WebRtcRequestor::new(webrtc_context, Dataver::new_rand(&mut UnwrapErr(OsRng))).adapt(),
         );
 

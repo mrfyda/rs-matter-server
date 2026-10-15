@@ -190,8 +190,7 @@ pub async fn commission_at_address<C: Crypto>(
         provision_network(matter, crypto, peer_addr, passcode, credentials).await?;
     }
 
-    commissioner.complete_via_case(&phase1).await
-    .map_err(|e| {
+    commissioner.complete_via_case(&phase1).await.map_err(|e| {
         ApiError::commission_failed(format!(
             "Commissioning could not be completed over CASE: {:?}",
             e.code()
