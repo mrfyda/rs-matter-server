@@ -239,7 +239,8 @@ pub fn collect_attributes(
                 let path = format_path(data.path.endpoint.unwrap_or(0), cluster, attribute);
                 let value = tlv_json::attribute_to_json(cluster, attribute, &data.data)
                     .map_err(|e| im_error("attribute value", e))?;
-                attributes.insert(path, value);
+                let list_index = data.path.list_index.as_ref().map(|idx| idx.as_opt_ref().copied());
+                apply_attribute_entry(attributes, path, list_index, value);
             }
             AttrResp::Status(status) => {
                 first_status.get_or_insert(status.status.status);
@@ -247,6 +248,41 @@ pub fn collect_attributes(
         }
     }
     Ok(())
+}
+
+/// Apply one decoded `AttributeDataIB` entry, assembling chunked Matter lists
+/// when `list_index` is present (`Some(None)` = append, `Some(Some(i))` = index).
+fn apply_attribute_entry(
+    attributes: &mut AttributesData,
+    path: String,
+    list_index: Option<Option<u16>>,
+    value: Value,
+) {
+    match list_index {
+        None => {
+            attributes.insert(path, value);
+        }
+        Some(None) => match attributes.get_mut(&path) {
+            Some(Value::Array(items)) => items.push(value),
+            _ => {
+                attributes.insert(path, Value::Array(vec![value]));
+            }
+        },
+        Some(Some(idx)) => {
+            let idx = idx as usize;
+            match attributes.get_mut(&path) {
+                Some(Value::Array(items)) if idx < items.len() => {
+                    items[idx] = value;
+                }
+                Some(Value::Array(items)) => {
+                    items.push(value);
+                }
+                _ => {
+                    attributes.insert(path, Value::Array(vec![value]));
+                }
+            }
+        }
+    }
 }
 
 /// Write one attribute, returning the Interaction Model status the node
@@ -567,5 +603,26 @@ mod tests {
     #[test]
     fn a_successful_write_reports_status_zero() {
         assert_eq!(STATUS_SUCCESS, 0);
+    }
+
+    #[test]
+    fn chunked_list_entries_assemble_in_order() {
+        let mut attributes = AttributesData::new();
+        apply_attribute_entry(&mut attributes, "1/4/65531".into(), None, Value::Array(vec![]));
+        apply_attribute_entry(&mut attributes, "1/4/65531".into(), Some(None), Value::from(0));
+        apply_attribute_entry(&mut attributes, "1/4/65531".into(), Some(None), Value::from(65533));
+        assert_eq!(attributes.get("1/4/65531"), Some(&serde_json::json!([0, 65533])));
+
+        apply_attribute_entry(
+            &mut attributes,
+            "1/4/65531".into(),
+            Some(Some(1)),
+            Value::from(65532),
+        );
+        assert_eq!(attributes.get("1/4/65531"), Some(&serde_json::json!([0, 65532])));
+
+        // Replacing the whole attribute with `list_index: None` resets the list.
+        apply_attribute_entry(&mut attributes, "1/4/65531".into(), None, serde_json::json!([1, 2]));
+        assert_eq!(attributes.get("1/4/65531"), Some(&serde_json::json!([1, 2])));
     }
 }
